@@ -89,6 +89,7 @@ export default defineConfig({
         workerLoaders: { LOADER: {} },
         // Where a blueprint's content is published to and read back from.
         r2Buckets: ['BLUEPRINT_CONTENT'],
+        kvNamespaces: ['BLUEPRINTS'],
         durableObjects: {
           TEST_OVERSEER: { className: 'OverseerDurableObject', useSQLite: true },
           TEST_USER: { className: 'UserDurableObject', useSQLite: true },
@@ -99,6 +100,7 @@ export default defineConfig({
           TEST_USER_DIRECTORY: { className: 'UserDirectoryDurableObject', useSQLite: true },
           // Likewise only reached through `ctx.exports`, by the overseer deleting a blueprint.
           TEST_ADMIN_SETTINGS: { className: 'AdminSettings', useSQLite: true },
+          TEST_GATEKEEPER_USER_PICKER: { className: 'GatekeeperUserPickerTestHooks', useSQLite: true },
         },
       },
     }),

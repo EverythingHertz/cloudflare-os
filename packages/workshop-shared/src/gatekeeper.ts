@@ -80,11 +80,105 @@ export type VendorDescription = {
 }
 
 /**
- * Per-open context the Workshop passes to GatekeeperUser.startAppUi(). `isAdmin` is supplied fresh
- * each time rather than baked into the account, since a user's admin status can change over time.
+ * Presentation-only snapshot of a Workshop user, taken when they were selected in the Workshop's
+ * person picker (GatekeeperUserSelection) and again when the selection was redeemed
+ * (RedeemedGatekeeperUserSelection). It carries no authority and is never an identity: it is not
+ * unique, not verified, and can change from one snapshot to the next. Use the paired
+ * `GatekeeperUserVerifier` for vendor-specific authorization and routing, and treat the name as a
+ * label to display, not as identity data.
+ */
+export type GatekeeperUserProfileSnapshot = {
+  /** The user's Workshop display name at the time of the snapshot. */
+  displayName: string;
+};
+
+/**
+ * One person selected in the Workshop-owned person picker, as delivered to the gatekeeper's
+ * management UI (see GatekeeperUserSelectionReceiver). The Workshop hands this to the iframe, not
+ * to the gatekeeper's server: the UI decides whether to send the ticket to its backend right away
+ * or to hold it in local form state and submit it later (within the ticket's lifetime).
+ */
+export type GatekeeperUserSelection = {
+  /**
+   * Opaque, short-lived, single-use bearer ticket for the selected person. It conveys nothing on
+   * its own: it can only be redeemed through the `GatekeeperUserSelectionExchange` the Workshop
+   * gave the account whose UI opened the picker (AppUiContext.userSelectionExchange), and only
+   * once. Treat it as a secret while it lives; do not log it.
+   */
+  ticket: string;
+
+  /** Snapshot for rendering the selection immediately; see GatekeeperUserProfileSnapshot. */
+  profile: GatekeeperUserProfileSnapshot;
+};
+
+/**
+ * One connected account belonging to the selected Workshop user and vendor,
+ * rebuilt from Workshop-owned state when their ticket is redeemed. An exchange
+ * returns one such result per eligible account; the gatekeeper decides how to
+ * handle zero, one, or multiple results.
+ */
+export type RedeemedGatekeeperUserSelection = {
+  /**
+   * This account's vendor-specific identity capability (GatekeeperUser.getVerifier), exactly as
+   * `Gatekeeper.addObserver()` receives one. May be stored. No other vendor's accounts are returned.
+   */
+  verifier: Fetcher<GatekeeperUserVerifier>;
+
+  /** Presentation snapshot read afresh during redemption; see GatekeeperUserProfileSnapshot. */
+  profile: GatekeeperUserProfileSnapshot;
+};
+
+/**
+ * Workshop-owned capability through which a gatekeeper account redeems the
+ * tickets its management UI received from the user picker. It is scoped to one
+ * selecting user and one UI-providing account (the one `startAppUi` was called
+ * on), so it can only resolve tickets that the Workshop minted for that scope.
+ */
+export interface GatekeeperUserSelectionExchange extends WorkerEntrypoint {
+  /**
+   * Redeem one person's selection ticket for all their eligible accounts with this
+   * vendor. Returns an empty array if there are none; multiple accounts are returned without
+   * choosing one. Only accounts with valid credentials and enabled deployment policy are included.
+   * The gatekeeper decides what zero or multiple accounts mean for its operation.
+   *
+   * The ticket names a Workshop person, not a particular connected account: the returned accounts
+   * and profile snapshots may have changed since selection. Single-use even when the result is
+   * empty. An invalid, spent, expired, or wrong-scope ticket throws; so does a selecting app account
+   * that no longer exists or is no longer offered. An empty array is not a ticket error.
+   */
+  redeem(ticket: string): Promise<RedeemedGatekeeperUserSelection[]>;
+}
+
+/**
+ * The capability a gatekeeper's management UI passes to the Workshop host's `selectUsers()` to
+ * receive picker selections. Called once for each person the user picks, while the picker is
+ * still open.
+ */
+export interface GatekeeperUserSelectionReceiver extends RpcTarget {
+  /**
+   * One person was picked. The receiver may act immediately (e.g. send the ticket to the
+   * gatekeeper's backend for redemption) or retain the selection and submit it later, while the
+   * ticket is valid. The picker marks the person as added only once this resolves; a rejection's
+   * message is shown to the user beside the person's name, so throw an Error with a user-facing
+   * message.
+   */
+  selected(selection: GatekeeperUserSelection): Promise<void>;
+}
+
+/**
+ * Per-open context the Workshop passes to GatekeeperUser.startAppUi(). Supplied fresh each time
+ * rather than baked into the account: a user's admin status can change over time, and the exchange
+ * is scoped to the account whose UI is being opened.
  */
 export type AppUiContext = {
+  /** Whether the opening user is currently a deployment admin. */
   isAdmin: boolean;
+
+  /**
+   * Redeems the tickets this account's UI receives from the Workshop person picker (via the host's
+   * `selectUsers()`); see GatekeeperUserSelectionExchange.
+   */
+  userSelectionExchange: Fetcher<GatekeeperUserSelectionExchange>;
 }
 
 // The agent catalog is bounded discovery metadata a gatekeeper exposes via
@@ -760,8 +854,10 @@ export interface GatekeeperUser extends WorkerEntrypoint {
   getSingletonGatekeeperClass?(): Promise<DurableObjectClass<Gatekeeper<any>>>;
 
   /**
-   * The account's full-page management UI (iframe HTML + ui capability). `context.isAdmin` is passed
-   * fresh per open (not baked into the account) so admin-gated features reflect current status.
+   * The account's full-page management UI (iframe HTML + ui capability). `context` is passed fresh
+   * per open (not baked into the account): `isAdmin` so admin-gated features reflect current
+   * status, and `userSelectionExchange` scoped to this account, through which the account redeems
+   * the tickets its UI receives from the Workshop person picker (GatekeeperUserSelection).
    */
   startAppUi?(context: AppUiContext): Promise<GatekeeperUiFrame>;
 
@@ -773,6 +869,8 @@ export interface GatekeeperUser extends WorkerEntrypoint {
  * Opaque object representing one of a user's accounts. Minted by `GatekeeperUser`, and then passed
  * to `Gatekeeper.addObserver()`, to verify whether the user is able to access a particular
  * Gatekeeper, and to `Gatekeeper.applyCreation()`, to create a resource with the account's authority.
+ * Also returned from `GatekeeperUserSelectionExchange.redeem()` for the selected person's eligible
+ * accounts with the same vendor.
  *
  * At present, this interface has no methods, because it is merely meant to be passed back to the
  * Gatekeeper that created it.

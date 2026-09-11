@@ -56,6 +56,18 @@ export type PendingConnectFlow = {
   expiresAt: Date;
 };
 
+/**
+ * A user selected on behalf of a gatekeeper app awaiting redemption by that account. Keyed by the
+ * SHA-256 of the single-use ticket and swept by the User DO alarm after `expiresAt`.
+ */
+type PendingGatekeeperUserSelection = {
+  ticketHash: string;
+  appAccountId: number;
+  vendorId: string;
+  selectedUserId: string;
+  expiresAt: Date;
+};
+
 export type UserAiModelRecord = {
   profile: AiChatAuthorInfo;
   config: AiModelConfig;
@@ -164,6 +176,9 @@ export function makeUserStorage(storage: DurableObjectStorage) {
       }),
       pendingDeviceHandoffs: collection<PendingDeviceHandoffRecord>()({
         primaryKey: "stateHash",
+      }),
+      pendingUserSelections: collection<PendingGatekeeperUserSelection>()({
+        primaryKey: "ticketHash",
       }),
       blueprints: collection<BlueprintUserRecord>()({
         primaryKey: "id",
