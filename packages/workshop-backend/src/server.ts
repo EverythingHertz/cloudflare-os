@@ -174,7 +174,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return retryOnDoReset(() => this.#user.listModels());
   }
   listClassifierModels(): Promise<AiChatAuthorInfo[]> {
-    return retryOnDoReset(() => this.#user.listClassifierModels());
+    return retryOnDoReset(() => this.#user.listModels("classifier"));
   }
   addModel(profile: AiChatAuthorInfo, config: RedactedAiModelConfig,
            copySecretsFrom?: string): Promise<void> {
