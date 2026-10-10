@@ -26,7 +26,8 @@ import type {
   ApprovalQueue, HookController, HookInitiator, HookTargetMetadata,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
-  GitHubApiError, withAccountApi, type GitHubApi, type GitHubWebhookDeliveryResponse, type PinnedRepo,
+  GitHubApiError, withAccountApi,
+  type GitHubApi, type GitHubRepoWebhookResponse, type GitHubWebhookDeliveryResponse, type PinnedRepo,
 } from "./github-api";
 import { getBasePath, webhookOrigin, type Env } from "./github-env";
 import { parseWebhookEvent, type GitHubWebhookEvent, type WebhookPayload } from "./github-webhook-events";
@@ -366,9 +367,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
       }
     });
     const events = webhookEvents(this.#registrations(repo).map(([, registration]) => registration));
-    const intact = read !== undefined && read.found.active === true && read.found.config.url === url
-      && read.found.config.content_type === "json" && String(read.found.config.insecure_ssl) === "0"
-      && sameEvents(read.found.events ?? [], events)
+    const intact = read !== undefined && deliversHere(read.found, url) && sameEvents(read.found.events ?? [], events)
       // By each delivery's latest attempt, so a 401 since redelivered successfully doesn't count.
       && !undelivered(read.deliveries).some(({ status_code }) => status_code === 401);
     if (!intact) {
@@ -412,35 +411,39 @@ export class GitHubHookDriver extends DurableObject<Env> {
     }
     const config = { url, secret, events: webhookEvents(registrations) };
     const recorded = kv.get<Webhook>(webhookKey(repo.id));
-    let id: number;
+    // `repaired` when it didn't deliver here until this restored it, as the hourly check would have.
+    let made: { id: number; repaired: boolean };
     try {
-      id = await this.#api(account, repo, async api => {
+      made = await this.#api(account, repo, async api => {
         if (recorded) {
           try {
-            return (await api.updateRepoWebhook(repo.id, recorded.id, config)).id;
+            const repaired = !deliversHere(await api.getRepoWebhook(repo.id, recorded.id), url);
+            return { id: (await api.updateRepoWebhook(repo.id, recorded.id, config)).id, repaired };
           } catch (error) {
             if (!(error instanceof GitHubApiError && error.status === 404)) throw error;
           }
         }
         try {
-          return (await api.createRepoWebhook(repo.id, config)).id;
+          return { id: (await api.createRepoWebhook(repo.id, config)).id, repaired: false };
         } catch (error) {
           if (!(error instanceof GitHubApiError && error.status === 422)) throw error;
           const existing = (await api.listRepoWebhooks(repo.id))
             .find(webhook => webhook.config.url === url);
           if (!existing) throw error;
-          return (await api.updateRepoWebhook(repo.id, existing.id, config)).id;
+          return { id: (await api.updateRepoWebhook(repo.id, existing.id, config)).id, repaired: !deliversHere(existing, url) };
         }
       });
     } catch (error) {
       throw webhookRefusal(repo, error);
     }
+    const { id } = made;
     if (kv.get("revoked")) {
       // Disconnected meanwhile, so revoke() could not see this webhook to delete it.
       await this.#removeWebhook(account, { id, repo });
       throw new Error(DISCONNECTED);
     }
     kv.put<Webhook>(webhookKey(repo.id), { id, repo });
+    if (made.repaired) kv.put(repairedKey(repo.id), Date.now());
   }
 
   /**
@@ -526,9 +529,19 @@ const sameEvents = (actual: readonly string[], expected: readonly string[]) =>
 const delivered = ({ status_code }: GitHubWebhookDeliveryResponse) => status_code >= 200 && status_code < 300;
 
 /**
+ * Whether `webhook` delivers here as the driver configures it: active, to this deployment, as JSON,
+ * verifying its certificate. What it refused while it didn't may have been refused for that alone.
+ */
+function deliversHere(webhook: GitHubRepoWebhookResponse, url: string): boolean {
+  return webhook.active === true && webhook.config.url === url && webhook.config.content_type === "json"
+    && String(webhook.config.insecure_ssl) === "0";
+}
+
+/**
  * What to ask GitHub to redeliver, oldest first: each delivery whose latest attempt failed, unless
- * the worker refused it for good. A refusal made before `repairedAt`, when the check last restored
- * the webhook's configuration, may have been the misconfiguration's -- a form-encoded payload's
+ * the worker refused it for good. A refusal made before `repairedAt`, when the webhook's
+ * configuration was last restored, by the hourly check or by enabling or disabling a hook there,
+ * may have been the misconfiguration's -- a form-encoded payload's
  * 400, or another receiver's 404 -- so it is redelivered with the rest until it leaves the
  * lookback, since GitHub sends, encodes and signs a redelivery as the webhook is configured now.
  * `deliveries` are newest first. A redelivery of something already received is harmless: ingest()

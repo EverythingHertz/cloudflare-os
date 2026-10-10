@@ -967,6 +967,40 @@ it("restores its webhook's payload encoding, and has GitHub redeliver what it re
   expect((await triage.read()).received).toEqual([expect.objectContaining({ info: expect.objectContaining({ id: "42" }) })]);
 });
 
+it.each<[string, (account: string) => Promise<() => Promise<unknown>>]>([
+  ["enabling another hook there", async account => {
+    const other = binding(account);
+    await other.subscribe();
+    return () => other.enable();
+  }],
+  ["disabling one of two there", async account => {
+    const other = binding(account);
+    await other.subscribe();
+    await other.enable();
+    return () => other.disable();
+  }],
+])("has GitHub redeliver what it refused before %s restored its webhook", async (_case, prepare) => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const change = await prepare(account);
+  const [webhook] = github.webhooks.values();
+
+  // Signed, but form-encoded, so refused as malformed; the change restores it before the check can.
+  webhook!.contentType = "form";
+  expect(await github.deliver("issues", issues("opened", 42))).toEqual([400]);
+  await change();
+  expect(github.webhooks.get(webhook!.id)).toMatchObject({ contentType: "json" });
+  await after(HOUR, account);
+
+  expect(github.pendingRedeliveries()).toEqual({ [REPO]: 1 });
+  expect(await github.redeliver()).toEqual([204]);
+  await settled(account);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({ info: expect.objectContaining({ id: "42" }) })]);
+});
+
 it("goes on redelivering what was refused before the webhook's repair, until all of it is delivered", async () => {
   const github = new FakeGitHub();
   const account = await connectAccount();
