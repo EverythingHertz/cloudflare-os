@@ -15,13 +15,34 @@ import type {
   ChatListMessagesOptions, ChatMessageInfo, ChatNewMessageEntry, ChatSession, ChatSpace, ChatThread,
 } from "../../src/chat-types";
 import type { ChatMessageRaw } from "../../src/chat-api";
-import type { ChatHookParams } from "../../src/chat-hooks";
-import type { GmailHookParams } from "../../src/gmail-hooks";
+import { ChatHookDriver as GoogleChatHookDriver, type ChatHookParams } from "../../src/chat-hooks";
+import { GmailHookDriver as GoogleGmailHookDriver, type GmailHookParams } from "../../src/gmail-hooks";
 
 export { default } from "../../src/google";
-export { ChatHookController, ChatHookDriver } from "../../src/chat-hooks";
-export { GmailHookController, GmailHookDriver } from "../../src/gmail-hooks";
+export { ChatHookController } from "../../src/chat-hooks";
+export { GmailHookController } from "../../src/gmail-hooks";
 export { GmailGatekeeperImpl, GoogleChatGatekeeperImpl, GoogleVerifier };
+
+const UNREACHABLE = "The test hook driver can't be reached.";
+
+/**
+ * The mailbox's driver, whose forgetAccount() fails while its storage has `test:unreachable`, as
+ * when a disconnect can't reach it.
+ */
+export class GmailHookDriver extends GoogleGmailHookDriver {
+  override async forgetAccount(userObjectId: string): Promise<void> {
+    if (this.ctx.storage.kv.get("test:unreachable")) throw new Error(UNREACHABLE);
+    await super.forgetAccount(userObjectId);
+  }
+}
+
+/** The space's driver, unreachable as GmailHookDriver above is. */
+export class ChatHookDriver extends GoogleChatHookDriver {
+  override async forgetAccount(userObjectId: string): Promise<void> {
+    if (this.ctx.storage.kv.get("test:unreachable")) throw new Error(UNREACHABLE);
+    await super.forgetAccount(userObjectId);
+  }
+}
 
 /**
  * The account, with trackHookDriver() held while its storage has `test:holdTracking`, so that a

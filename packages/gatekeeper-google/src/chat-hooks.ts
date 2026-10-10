@@ -80,6 +80,11 @@ export class ChatHookController extends WorkerEntrypoint<Env, ChatHookProps>
 const RENEW_INTERVAL_MS = 3 * HOUR_MS;
 /** Leaves several retries of a failed renewal within the hour before the subscription lapses. */
 const RENEW_RETRY_MS = 15 * MINUTE_MS;
+/**
+ * How often each account with hooks here is asked again whether it knows of this driver: hooks its
+ * disconnect failed to drop stay until then, when it answers no.
+ */
+const TRACKING_RECHECK_MS = 24 * HOUR_MS;
 
 type Registration = Omit<ChatHookProps, "key" | "delivery">;
 type Capabilities = {
@@ -91,7 +96,7 @@ type Subscription = { name: string; expireTime: number; renewAt: number };
 const registrationKey = (key: string) => `reg:${key}`;
 const capabilitiesKey = (key: string) => `caps:${key}`;
 const subscriptionKey = (authority: string) => `sub:${authority}`;
-/** Set once the account knows this driver holds hooks of its (see UserAccount.trackHookDriver()). */
+/** When the account last confirmed it knows this driver holds hooks of its (see UserAccount.trackHookDriver()). */
 const trackedKey = (userObjectId: string) => `tracked:${userObjectId}`;
 /** Set when a disconnected account's hooks are dropped, so that an enable it was making is refused. */
 const forgottenKey = (userObjectId: string) => `forgotten:${userObjectId}`;
@@ -199,24 +204,25 @@ export class ChatHookDriver extends DurableObject<Env> {
   async #track(userObjectId: string, spaceName: string): Promise<void> {
     const tracked = await this.#account(userObjectId).trackHookDriver({ kind: "chat", name: spaceName });
     if (!tracked || this.ctx.storage.kv.get(forgottenKey(userObjectId)) !== undefined) throw new Error(DISCONNECTED);
-    this.ctx.storage.kv.put(trackedKey(userObjectId), true);
+    this.ctx.storage.kv.put(trackedKey(userObjectId), Date.now());
   }
 
   /**
-   * Tell each account with hooks here that this driver holds them, as register() does. A hook
-   * registered before accounts kept track has no record of it, which disconnecting its account
-   * needs to reach it; failing, it is told at the next alarm. An account disconnected before it
-   * could be told has its hooks dropped now.
+   * Tell each account with hooks here that this driver holds them, as register() does, and again
+   * each TRACKING_RECHECK_MS. A hook registered before accounts kept track has no record of it,
+   * which disconnecting its account needs to reach it; failing, it is told at the next alarm. An
+   * account disconnected without dropping its hooks here, before it could be told or by a
+   * disconnect that couldn't reach this driver, has them dropped now.
    */
   async #trackAccounts(): Promise<void> {
     const kv = this.ctx.storage.kv;
-    const untracked = new Map([...this.#registrations()]
-      .filter(([, { userObjectId }]) => !kv.get(trackedKey(userObjectId)))
+    const due = new Map([...this.#registrations()]
+      .filter(([, { userObjectId }]) => (kv.get<number>(trackedKey(userObjectId)) ?? 0) <= Date.now() - TRACKING_RECHECK_MS)
       .map(([, { userObjectId, spaceName }]) => [userObjectId, spaceName]));
-    for (const [userObjectId, spaceName] of untracked) {
+    for (const [userObjectId, spaceName] of due) {
       try {
         if (await this.#account(userObjectId).trackHookDriver({ kind: "chat", name: spaceName })) {
-          kv.put(trackedKey(userObjectId), true);
+          kv.put(trackedKey(userObjectId), Date.now());
         } else {
           await this.forgetAccount(userObjectId);
         }

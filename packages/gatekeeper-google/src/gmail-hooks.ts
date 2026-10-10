@@ -90,6 +90,11 @@ const SYNC_RETRY_MS = 5 * MINUTE_MS;
 /** Bounds one alarm's history read; the next alarm, set for at once, continues it. */
 const MAX_HISTORY_PAGES_PER_SYNC = 10;
 /**
+ * How often each account with hooks here is asked again whether it knows of this driver: hooks its
+ * disconnect failed to drop stay until then, when it answers no.
+ */
+const TRACKING_RECHECK_MS = 24 * HOUR_MS;
+/**
  * Labels whose mail no hook is delivered: the account's own mail, spam and trash, even on a label
  * binding to SPAM or TRASH, which lists them.
  */
@@ -109,7 +114,7 @@ type AddedMessage = { id: string; threadId: string; labelIds?: string[] };
 
 const registrationKey = (key: string) => `reg:${key}`;
 const capabilitiesKey = (key: string) => `caps:${key}`;
-/** Set once the account knows this driver holds hooks of its (see UserAccount.trackHookDriver()). */
+/** When the account last confirmed it knows this driver holds hooks of its (see UserAccount.trackHookDriver()). */
 const trackedKey = (userObjectId: string) => `tracked:${userObjectId}`;
 /** Set when a disconnected account's hooks are dropped, so that an enable it was making is refused. */
 const forgottenKey = (userObjectId: string) => `forgotten:${userObjectId}`;
@@ -346,24 +351,25 @@ export class GmailHookDriver extends DurableObject<Env> {
   async #track(userObjectId: string, mailbox: string): Promise<void> {
     const tracked = await this.#account(userObjectId).trackHookDriver({ kind: "gmail", name: mailbox });
     if (!tracked || this.ctx.storage.kv.get(forgottenKey(userObjectId)) !== undefined) throw new Error(DISCONNECTED);
-    this.ctx.storage.kv.put(trackedKey(userObjectId), true);
+    this.ctx.storage.kv.put(trackedKey(userObjectId), Date.now());
   }
 
   /**
-   * Tell each account with hooks here that this driver holds them, as register() does. A hook
-   * registered before accounts kept track has no record of it, which disconnecting its account
-   * needs to reach it; failing, it is told at the next alarm. An account disconnected before it
-   * could be told has its hooks dropped now.
+   * Tell each account with hooks here that this driver holds them, as register() does, and again
+   * each TRACKING_RECHECK_MS. A hook registered before accounts kept track has no record of it,
+   * which disconnecting its account needs to reach it; failing, it is told at the next alarm. An
+   * account disconnected without dropping its hooks here, before it could be told or by a
+   * disconnect that couldn't reach this driver, has them dropped now.
    */
   async #trackAccounts(): Promise<void> {
     const kv = this.ctx.storage.kv;
-    const untracked = new Map(this.#registrations()
-      .filter(([, { userObjectId }]) => !kv.get(trackedKey(userObjectId)))
+    const due = new Map(this.#registrations()
+      .filter(([, { userObjectId }]) => (kv.get<number>(trackedKey(userObjectId)) ?? 0) <= Date.now() - TRACKING_RECHECK_MS)
       .map(([, { userObjectId, mailbox }]) => [userObjectId, mailbox]));
-    for (const [userObjectId, mailbox] of untracked) {
+    for (const [userObjectId, mailbox] of due) {
       try {
         if (await this.#account(userObjectId).trackHookDriver({ kind: "gmail", name: mailbox })) {
-          kv.put(trackedKey(userObjectId), true);
+          kv.put(trackedKey(userObjectId), Date.now());
         } else {
           await this.forgetAccount(userObjectId);
         }

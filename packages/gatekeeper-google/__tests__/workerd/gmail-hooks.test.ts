@@ -268,6 +268,16 @@ const disconnect = (connection: {props: {userObjectId: string}}) =>
   (testEnv.UserAccount.get(testEnv.UserAccount.idFromString(connection.props.userObjectId)) as unknown as
     {revoke(): Promise<void>}).revoke();
 
+/** Disconnect a connection's Google account while the driver can't be reached (see the test worker's). */
+async function disconnectUnreached(connection: {props: {userObjectId: string}}): Promise<void> {
+  await runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) => state.storage.kv.put("test:unreachable", true));
+  try {
+    await disconnect(connection);
+  } finally {
+    await runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) => state.storage.kv.delete("test:unreachable"));
+  }
+}
+
 /** The Google account a connection reads the mailbox as. */
 const accountOf = (connection: {props: {userObjectId: string}}) =>
   testEnv.UserAccount.get(testEnv.UserAccount.idFromString(connection.props.userObjectId));
@@ -507,6 +517,22 @@ it("drops on disconnect a hook registered before accounts kept track, once its d
 
   await disconnect(ada);
   expect(await driverHooks()).toEqual({registered: 0, pending: 0});
+});
+
+it("drops at its daily check the hooks of an account whose disconnect couldn't reach it, while another account's go on", async () => {
+  const gmail = mockGmail();
+  const ada = await connect();
+  const bob = await connect();
+  await enable(ada);
+  await enable(bob);
+  await disconnectUnreached(ada);
+  expect(await driverHooks()).toEqual({registered: 2, pending: 0});
+
+  const message = arrive(gmail);
+  await later(24 * HOUR);
+  expect(await receivedIds(bob)).toEqual([message]);
+  expect(await receivedIds(ada)).toEqual([]);
+  expect(await driverHooks()).toEqual({registered: 1, pending: 0});
 });
 
 it("offers a hook what a history read took in while its enable waited on the account", async () => {

@@ -107,6 +107,12 @@ async function hmac(secret: string, body: string): Promise<string> {
 class FakeGitHub {
   /** Who the account's token belongs to. */
   viewer = ADA;
+  /**
+   * While set, a read of who the account is that GitHub answers as this user stalls, counted in
+   * `stalledViewerReads`. Polled, as `stallDeletes` is.
+   */
+  stallViewerReadsAs: typeof ADA | undefined;
+  stalledViewerReads = 0;
   admin = true;
   /** Whether the account can still read the repository at all. */
   readable = true;
@@ -144,7 +150,14 @@ class FakeGitHub {
     const { pathname, searchParams } = new URL(request.url);
     const { method } = request;
     this.requests.push(`${method} ${pathname}`);
-    if (pathname === "/user") return Response.json(this.viewer);
+    if (pathname === "/user") {
+      const { viewer } = this;
+      if (this.stallViewerReadsAs === viewer) {
+        this.stalledViewerReads++;
+        while (this.stallViewerReadsAs === viewer) await scheduler.wait(1);
+      }
+      return Response.json(viewer);
+    }
     if (pathname === "/applications/test-client/token" && method === "DELETE") {
       return new Response(null, { status: 204 });
     }
@@ -989,6 +1002,36 @@ it.each<[string, (github: FakeGitHub, account: string) => Promise<unknown>]>([
   // Reconnected, now as Bob.
   github.viewer = BOB;
   await learn(github, account);
+  await github.deliver("issue_comment", comment(42, "From Bob, whom the account is now.", { sender: BOB }));
+  await github.deliver("issue_comment", comment(42, "From Ada, someone else now.", { sender: ADA }));
+  await settled(account);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({
+    kind: "comment", comment: expect.objectContaining({ bodyMarkdown: "From Ada, someone else now." }),
+  })]);
+});
+
+it("skips the comments of the GitHub user its account reconnected as while GitHub was slow to say who it was", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe({ events: ["comment"] });
+  await triage.enable();
+
+  // The hourly check asks who the account is, and GitHub is slow to answer Ada...
+  github.stallViewerReadsAs = ADA;
+  const checking = after(HOUR, account);
+  await vi.waitFor(() => expect(github.stalledViewerReads).toBe(1));
+  // ...until the account has reconnected as Bob.
+  github.viewer = BOB;
+  const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
+  const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
+    state.storage.kv, { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] }, Date.now()));
+  const reconnecting = userAccount.commitReconnect(stageId);
+  // Time for the reconnect's own read to be answered first, were it made alongside the check's.
+  await scheduler.wait(300);
+  github.stallViewerReadsAs = undefined;
+  await Promise.all([checking, reconnecting]);
+
   await github.deliver("issue_comment", comment(42, "From Bob, whom the account is now.", { sender: BOB }));
   await github.deliver("issue_comment", comment(42, "From Ada, someone else now.", { sender: ADA }));
   await settled(account);

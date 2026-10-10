@@ -157,6 +157,12 @@ export class GitHubHookDriver extends DurableObject<Env> {
    * a removal still in flight would otherwise delete the webhook an addition just adopted.
    */
   #webhookChanges = new SerialTaskQueue();
+  /**
+   * Reads of who the account is, which run one at a time so that a reconnect's, made as the new
+   * user, is written last: a read still waiting on GitHub as the old one would otherwise land after
+   * it.
+   */
+  #viewerReads = new SerialTaskQueue();
   #queue = new HookDeliveryQueue<GitHubWebhookEvent>(this.ctx.storage.kv, () => {
     logger.warn("dropped a GitHub event after repeated delivery failures", { event: "hooks.delivery.dropped" });
   });
@@ -485,9 +491,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
 
   /** Read the GitHub user the account now is, whose own comments and reviews its hooks skip. */
   async #readViewer(account: string): Promise<void> {
-    const { UserAccount } = this.ctx.exports;
-    const { user } = await withAccountApi(UserAccount.get(UserAccount.idFromString(account)), api => api.getViewer());
-    this.ctx.storage.kv.put("viewer", user.id);
+    await this.#viewerReads.run(async () => {
+      const { UserAccount } = this.ctx.exports;
+      const { user } = await withAccountApi(UserAccount.get(UserAccount.idFromString(account)), api => api.getViewer());
+      this.ctx.storage.kv.put("viewer", user.id);
+    });
   }
 
   #api<T>(account: string, repo: PinnedRepo, fn: (api: GitHubApi) => Promise<T>): Promise<T> {
