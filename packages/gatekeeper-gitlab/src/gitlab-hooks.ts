@@ -73,7 +73,10 @@ export type GitLabHookProps = GitLabHookParams & {
   userObjectId: string;
   project: GitLabProjectPin;
   events: GitLabEventKind[];
-  /** The connected account's GitLab user id: its own comments and reviews are not delivered. */
+  /**
+   * The connected account's GitLab user id when the hook was subscribed, whose own comments and
+   * reviews are not delivered, should the account be unable to say who it is now.
+   */
   viewerId: number;
   delivery: RpcStub<GitLabHookDelivery>;
 };
@@ -163,8 +166,9 @@ const secretKey = (projectId: number) => `secret:${projectId}`;
 /**
  * One per connected account, named by its `UserAccount` id. Storage: `account` (that id), and per
  * project `webhook:` and `secret:` (the signing token its webhook signs deliveries with), `checkAt`
- * (when to next check them on GitLab), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows,
- * and `revoked` once the account is disconnected, which refuses everything for good.
+ * (when to next check them on GitLab), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows
+ * and `queue:` indexes, and `revoked` once the account is disconnected, which refuses everything
+ * for good.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
@@ -290,10 +294,14 @@ export class GitLabHookDriver extends DurableObject<Env> {
     const parsed = parseWebhookEvent(delivery.event, delivery.id, projectId, payload, instanceUrl(this.env));
     if (!parsed) return 204;
     const { event, senderId } = parsed;
+    // The account's own comments and reviews are skipped as whoever it is now, after a reconnect as
+    // another GitLab user too.
+    const viewerId = event.kind === "comment" || event.kind === "review"
+      ? await this.#viewerId(kv.get<string>("account")!) : undefined;
     const now = Date.now();
     let queued = false;
     for (const [regKey, registration] of this.#registrations({ id: projectId })) {
-      if (!watches(registration, event, senderId)) continue;
+      if (!watches(registration, event, senderId, viewerId ?? registration.viewerId)) continue;
       this.#queue.enqueue(regKey.slice("reg:".length), delivery.id, event, now);
       queued = true;
     }
@@ -486,6 +494,20 @@ export class GitLabHookDriver extends DurableObject<Env> {
     }
   }
 
+  /**
+   * The GitLab user the account now is, whose own comments and reviews its hooks skip, which the
+   * account reads afresh once reconnected; undefined if it can't say.
+   */
+  async #viewerId(account: string): Promise<number | undefined> {
+    const { UserAccount } = this.ctx.exports;
+    try {
+      return (await UserAccount.get(UserAccount.idFromString(account)).getUser()).id;
+    } catch (error) {
+      logger.warn("failed to read who a GitLab account is", { event: "hooks.viewer.read.failed", error });
+      return undefined;
+    }
+  }
+
   #api<T>(account: string, fn: (api: GitLabApi) => Promise<T>): Promise<T> {
     const { UserAccount } = this.ctx.exports;
     return withAccountApi(this.env, UserAccount.get(UserAccount.idFromString(account)), fn);
@@ -535,11 +557,11 @@ export class GitLabHookDriver extends DurableObject<Env> {
 }
 
 /**
- * Whether a hook on the event's project watches for it. The facet re-checks the binding's scope
- * at delivery.
+ * Whether a hook on the event's project watches for it, the account being GitLab user `viewerId`.
+ * The facet re-checks the binding's scope at delivery.
  */
-function watches({ target, events, viewerId }: Registration, event: GitLabWebhookEvent,
-                 senderId: number | undefined): boolean {
+function watches({ target, events }: Registration, event: GitLabWebhookEvent,
+                 senderId: number | undefined, viewerId: number): boolean {
   if (!events.includes(event.kind)) return false;
   if (target !== undefined &&
       !("target" in event && event.target.kind === target.kind && event.target.iid === target.iid)) {

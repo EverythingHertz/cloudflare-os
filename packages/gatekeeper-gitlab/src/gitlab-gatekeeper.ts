@@ -1593,17 +1593,17 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
    * The comment a comment event names, as GitLab has it now: a custom template lets the project's
    * Maintainers have GitLab sign any payload, so a payload's words and author prove nothing.
    * Undefined if GitLab no longer has it, or it is not a person's, is internal, or is the account's
-   * own, which a hook would answer.
+   * own, which a hook would answer: whoever the account is now, which a reconnect can change.
    */
   async #readNote({ target, noteId, discussionId }: Extract<GitLabWebhookEvent, { kind: "comment" }>):
       Promise<GitLabNoteResponse | undefined> {
-    const [discussion, viewer] = await Promise.all([
+    const [discussion, user] = await Promise.all([
       this.#withApi(api => api.getDiscussion(this.#projectPath(), target.kind === "issue" ? "issues" : "merge_requests",
         target.iid, discussionId)),
-      this.#getViewer(),
+      this.#userAccount().getUser(),
     ]);
     const note = discussion.notes.find(found => found.id === noteId);
-    if (!note || note.system || note.internal || note.author?.id === viewer.id) {
+    if (!note || note.system || note.internal || note.author?.id === user.id) {
       logger.info("dropped a GitLab comment event that GitLab's record of the comment does not bear out", {
         event: "hooks.delivery.unconfirmed",
       });

@@ -8,7 +8,9 @@ import type { HookDescription } from "@gadgets/workshop-shared/gatekeeper";
 import { afterEach, expect, it, vi } from "vitest";
 import * as fx from "../fixtures/gitlab-docs.js";
 import type { GitLabSubscribeOptions } from "../../src/types.js";
-import { FakeGitLab, type FakeRequest, WEB, json, seedAccount, unwrap } from "./fake-gitlab.js";
+import {
+  FakeGitLab, type FakeRequest, WEB, hooks, json, seedAccount, stageReconnect, tokenResponse, unwrap,
+} from "./fake-gitlab.js";
 import type { GatekeeperProps } from "./worker.js";
 
 const PROJECT = "group/sub/project";
@@ -571,6 +573,30 @@ it("adds the webhook once a hook is enabled, and delivers the events it watches 
     description: `Receive issue #42 in ${PROJECT}, opened by \`@bob\`: its title, description, author, ` +
       "assignees, and labels.",
   }]);
+});
+
+it("skips the comments of the GitLab user its account is now, after reconnecting as another", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe({ events: ["comment"] });
+  await triage.enable();
+
+  // Reconnected, now as Bob.
+  gitlab.gitlab
+    .on("POST", /^\/oauth\/token$/, () => json(tokenResponse(1)))
+    .on("GET", /^\/api\/v4\/user$/, () => json({ ...BOB, web_url: `${WEB}/bob`, confirmed_at: CREATED }));
+  await hooks().installCallback(account);
+  await runInDurableObject(env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account)), async instance => {
+    await instance.commitReconnect(await stageReconnect(instance, "code-1"));
+  });
+
+  await gitlab.deliver("Note Hook", noteHook("Issue", 42, "From Bob, whom the account is now.", { id: 1, sender: BOB }));
+  await gitlab.deliver("Note Hook", noteHook("Issue", 42, "From Ada, someone else now.", { id: 2, sender: ADA }));
+  await settled(account);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({
+    kind: "comment", comment: expect.objectContaining({ bodyMarkdown: "From Ada, someone else now." }),
+  })]);
 });
 
 it("queues a hook's writes on its firing, and never hands the account its own comments or reviews", async () => {
