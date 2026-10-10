@@ -382,6 +382,43 @@ it("drops on disconnect a hook registered before accounts kept track, once its d
     [...state.storage.kv.list({prefix: "reg:"})].length)).toBe(0);
 });
 
+/** Disconnect a connection's Google account while the driver can't be reached (see the test worker's). */
+async function disconnectUnreached(connection: {props: {userObjectId: string}}): Promise<void> {
+  await runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) => state.storage.kv.put("test:unreachable", true));
+  try {
+    await (testEnv.UserAccount.get(testEnv.UserAccount.idFromString(connection.props.userObjectId)) as unknown as
+      {revoke(): Promise<void>}).revoke();
+  } finally {
+    await runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) => state.storage.kv.delete("test:unreachable"));
+  }
+}
+
+/** Whose hooks the space's driver holds, by account. */
+const registeredAccounts = () => runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) =>
+  [...state.storage.kv.list<{userObjectId: string}>({prefix: "reg:"})].map(([, registration]) => registration.userObjectId));
+
+it("drops at its daily check the hooks of an account whose disconnect couldn't reach it, while another account's go on", async () => {
+  mockGoogle();
+  const ada = await connect("ada");
+  const bob = await connect("bob");
+  await ada.hooks.chatEnableHook();
+  await bob.hooks.chatEnableHook();
+  await disconnectUnreached(ada);
+  expect((await registeredAccounts()).toSorted()).toEqual([ada.props.userObjectId, bob.props.userObjectId].toSorted());
+
+  // The runtime won't wake the driver for the faked clock.
+  vi.setSystemTime(Date.now() + 24 * 3_600_000);
+  try {
+    await runDurableObjectAlarm(driver());
+  } finally {
+    vi.useRealTimers();
+  }
+  expect(await registeredAccounts()).toEqual([bob.props.userObjectId]);
+  expect(await push("bob", [chatMessage("carol")])).toBe(204);
+  await deliver();
+  expect((await bob.hooks.readHook()).received).toHaveLength(1);
+});
+
 /** Hold the account's trackHookDriver() (see the test worker's UserAccount) while `run` acts. */
 async function whileTracking(connection: {props: {userObjectId: string}}, run: () => Promise<unknown>) {
   const account = testEnv.UserAccount.get(testEnv.UserAccount.idFromString(connection.props.userObjectId));

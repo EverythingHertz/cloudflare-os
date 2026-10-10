@@ -758,7 +758,8 @@ export class UserAccount extends DurableObject<Env> {
    * Have every driver holding this account's hooks drop them. Their records are about to go with
    * the credentials, and a driver would otherwise go on reading and renewing for them, failing
    * every time. Best effort: a driver that can't be reached is logged rather than block the
-   * disconnect.
+   * disconnect, and drops them itself within a day, when it next asks whether the account knows of
+   * it (see trackHookDriver()).
    */
   async #forgetHooks(): Promise<void> {
     const userObjectId = this.ctx.id.toString();
