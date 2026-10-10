@@ -107,9 +107,17 @@ describe.skipIf(!token || !projectPath)("GitLab, as the GitLab gatekeeper's hook
     return issue;
   }
 
-  /** Every attempt logged for webhook `hookId`, newest first. */
+  /** Every attempt logged for webhook `hookId`, newest first, read twenty a page, GitLab's most. */
   async function logged(hookId: number): Promise<LoggedEvent[]> {
-    return (await gitlab<LoggedEvent[]>("GET", `/projects/${project.id}/hooks/${hookId}/events?per_page=100`)).data!;
+    const events: LoggedEvent[] = [];
+    // As many pages as the gatekeeper's own reading of the log takes.
+    for (let page = 1; page <= 10; page++) {
+      const { data = [] } = await gitlab<LoggedEvent[]>(
+        "GET", `/projects/${project.id}/hooks/${hookId}/events?per_page=20&page=${page}`);
+      events.push(...data);
+      if (data.length < 20) break;
+    }
+    return events;
   }
 
   /** The first attempt logged for webhook `hookId` whose `X-Gitlab-Event` is `event` and that `matches`. */
