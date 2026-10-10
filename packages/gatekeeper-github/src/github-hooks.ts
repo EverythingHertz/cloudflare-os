@@ -144,9 +144,9 @@ const repairedKey = (repoId: number) => `repaired:${repoId}`;
  * (the GitHub user id the account last read as), `secret` (the HMAC key its webhooks sign
  * deliveries with), per repository `webhook:` and `repaired:` (when its configuration was last
  * restored), `checkAt` (when to next check them on GitHub), `redeliverFrom` (the repository the
- * next check's redeliveries start with),
- * `reg:`/`caps:` per hook, the delivery queue's `msg:` rows, and `revoked` once the account is
- * disconnected, which refuses everything for good.
+ * next check's redeliveries start with), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows
+ * and `queue:` indexes, and `revoked` once the account is disconnected, which refuses everything
+ * for good.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
