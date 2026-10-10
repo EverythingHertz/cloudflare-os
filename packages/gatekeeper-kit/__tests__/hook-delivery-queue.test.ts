@@ -5,6 +5,10 @@ import {
 import { fakeKv, type FakeKv } from "./fake-kv";
 
 const MINUTE = 60_000;
+/** Set once the queue has indexed its rows (see the module's storage notes). */
+const INDEXED = "queue:indexed";
+/** What a finished `m1` leaves: its row, and the index entry that forgets it a day later. */
+const FINISHED_M1 = ["msg:hook:m1", expect.stringMatching(/^queue:expires:\d{15}:hook:m1$/), INDEXED];
 
 describe("HookDeliveryQueue", () => {
   beforeEach(() => {
@@ -63,13 +67,14 @@ describe("HookDeliveryQueue", () => {
     expect(deliver.mock.calls).toEqual([["b", "for b"]]);
   });
 
-  it.each<[string, "succeeds" | "fails", (queue: HookDeliveryQueue<string>, kv: FakeKv) => void, string[]]>([
-    // Disabling the hook: its row is finished, so a duplicate push still collapses.
-    ["cancelled", "fails", queue => queue.cancel("hook"), ["msg:hook:m1"]],
-    ["cancelled", "succeeds", queue => queue.cancel("hook"), ["msg:hook:m1"]],
-    // Its driver forgetting every hook, as disconnecting the account does.
-    ["deleted", "fails", (_queue, kv) => kv.delete("msg:hook:m1"), []],
-    ["deleted", "succeeds", (_queue, kv) => kv.delete("msg:hook:m1"), []],
+  it.each<[string, "succeeds" | "fails", (queue: HookDeliveryQueue<string>, kv: FakeKv) => void, unknown[]]>([
+    // Disabling the hook: its row is finished, and indexed for forgetting, so a duplicate push
+    // still collapses.
+    ["cancelled", "fails", queue => queue.cancel("hook"), FINISHED_M1],
+    ["cancelled", "succeeds", queue => queue.cancel("hook"), FINISHED_M1],
+    // Its driver forgetting every hook, as disconnecting the account does: its index entry goes too.
+    ["deleted", "fails", (_queue, kv) => kv.delete("msg:hook:m1"), [INDEXED]],
+    ["deleted", "succeeds", (_queue, kv) => kv.delete("msg:hook:m1"), [INDEXED]],
   ])("neither retries nor revives a message whose row is %s while its attempt %s", async (_, outcome, end, kept) => {
     const kv = fakeKv();
     const queue = new HookDeliveryQueue<string>(kv, () => {});
@@ -129,8 +134,50 @@ describe("HookDeliveryQueue", () => {
     vi.setSystemTime(Date.now() + DELIVERED_RETENTION_MS);
     await queue.run(Date.now(), async () => {});
 
-    expect(kv.keys()).toEqual([]);
+    expect(kv.keys()).toEqual([INDEXED]);
     expect(queue.nextDue()).toBeUndefined();
+  });
+
+  it("goes by a row as it is now, not an index entry its row has outlived", async () => {
+    const kv = fakeKv();
+    const queue = new HookDeliveryQueue<string>(kv, () => {});
+    queue.enqueue("hook", "m1", "first", Date.now());
+    // Deleted alone, then queued again under the same key, due an hour later.
+    kv.delete("msg:hook:m1");
+    queue.enqueue("hook", "m1", "second", Date.now() + 60 * MINUTE);
+    const deliver = vi.fn(async () => {});
+
+    await queue.run(Date.now(), deliver);
+    expect(deliver).not.toHaveBeenCalled();
+    vi.setSystemTime(Date.now() + 60 * MINUTE);
+    await queue.run(Date.now(), deliver);
+    expect(deliver.mock.calls).toEqual([["hook", "second"]]);
+  });
+
+  it("reads only what has come due on a run, not the day of finished messages it remembers", async () => {
+    const kv = fakeKv();
+    const queue = new HookDeliveryQueue<string>(kv, () => {});
+    for (let i = 0; i < 1000; i++) queue.enqueue("hook", `old${i}`, "delivered", Date.now());
+    while (queue.nextDue()! <= Date.now()) await queue.run(Date.now(), async () => {});
+    queue.enqueue("hook", "new", "message", Date.now());
+    let read = 0;
+    const counted: FakeKv = {
+      ...kv,
+      get: <T>(key: string) => {
+        read++;
+        return kv.get<T>(key);
+      },
+      list: <T>(options: Parameters<FakeKv["list"]>[0]) => {
+        const found = [...kv.list<T>(options)];
+        read += found.length;
+        return found;
+      },
+    };
+    const deliver = vi.fn(async () => {});
+
+    await new HookDeliveryQueue<string>(counted, () => {}).run(Date.now(), deliver);
+    expect(deliver.mock.calls).toEqual([["hook", "message"]]);
+    expect(read).toBeLessThan(10);
   });
 });
 

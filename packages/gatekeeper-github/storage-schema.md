@@ -184,20 +184,29 @@ Cache invalidation strategy:
 One per connected account, named by its `UserAccount` id; see `src/github-hooks.ts`.
 
 - `account` -> the `UserAccount` id, whose token adds and deletes the webhooks.
+- `viewer` -> the GitHub user id the account last read as, whose own comments and reviews no hook
+  is handed: read when a hook is enabled, when the account reconnects, and at each hourly check.
 - `secret` -> the HMAC key every webhook of this driver signs its deliveries with.
 - `webhook:<repoId>` -> `{ id, repo: { owner, repo, id } }`, the webhook this driver added to the
-  repository, from when its first hook is enabled until its last is disabled.
-- `repaired:<repoId>` -> when the hourly check last restored that webhook's configuration: what
-  GitHub failed to deliver before then is redelivered whatever the refusal, which may have been the
-  misconfiguration's. Deleted with the webhook.
+  repository, from when its first hook is enabled until its last is disabled. Reached by the
+  repository's id, which survives a rename.
+- `repaired:<repoId>` -> when that webhook's configuration was last restored, by the hourly check
+  or by enabling or disabling a hook there: what GitHub failed to deliver before then is
+  redelivered whatever the refusal, which may have been the misconfiguration's. Deleted with the
+  webhook.
 - `checkAt` -> when to next check the webhooks on GitHub, hourly while there are any.
+- `redeliverFrom` -> the repository id the next check's share of redeliveries starts with: the one
+  after the last the previous check served.
 - `reg:<hookKey>` -> what one enabled hook watches: its repository, the issue or pull request it
-  is narrowed to, its event kinds, and the account's GitHub user id.
+  is narrowed to, its event kinds, and the account's GitHub user id when it was subscribed, which
+  `viewer` supersedes.
 - `caps:<hookKey>` -> `{ delivery, initiator }`: the facet's persistent delivery stub and the
   Workshop's `HookInitiator`.
 - `msg:<hookKey>:<eventId>` -> the kit's `HookDeliveryQueue` rows, named by the digest of the
   event's payload: an event pending delivery to one hook, or a finished one kept for a day to
   collapse redeliveries.
+- `queue:due:<time>:<hookKey>:<eventId>`, `queue:expires:<time>:<hookKey>:<eventId>` and
+  `queue:indexed` -> the queue's indexes of those rows, by when each is next due or forgotten.
 - `revoked` -> set, with every other key deleted, once the account is disconnected.
 
 ## Simulation model

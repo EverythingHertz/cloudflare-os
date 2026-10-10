@@ -79,8 +79,8 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
 
   /** A webhook made as the gatekeeper makes one, deleted after the checks. */
   async function webhook(events: string[], secret = newSecret(), url = receiver) {
-    const made = await api.createRepoWebhook(owner, name, { url, secret, events });
-    cleanups.push(() => api.deleteRepoWebhook(owner, name, made.id));
+    const made = await api.createRepoWebhook(repository.id, { url, secret, events });
+    cleanups.push(() => api.deleteRepoWebhook(repository.id, made.id));
     return { id: made.id, secret };
   }
 
@@ -177,16 +177,16 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
       name: "web", active: true, events: ["issues"],
       config: { url: was.url, secret: was.secret, content_type: "form", insecure_ssl: "0" },
     });
-    cleanups.push(() => api.deleteRepoWebhook(owner, name, form.id));
+    cleanups.push(() => api.deleteRepoWebhook(repository.id, form.id));
     const issue = await openIssue();
     const jsonFirst = await delivery(json.id, "issues", ofIssue(issue, "opened"));
     const formFirst = await delivery(form.id, "issues", ofIssue(issue, "opened"));
     expect(header(formFirst, "Content-Type")).toBe("application/x-www-form-urlencoded");
 
     // Repaired as the gatekeeper's hourly check repairs a webhook, then redelivered.
-    for (const id of [json.id, form.id]) await api.updateRepoWebhook(owner, name, id, { ...now, events: ["issues"] });
-    await api.redeliverRepoWebhookDelivery(owner, name, json.id, jsonFirst.id);
-    await api.redeliverRepoWebhookDelivery(owner, name, form.id, formFirst.id);
+    for (const id of [json.id, form.id]) await api.updateRepoWebhook(repository.id, id, { ...now, events: ["issues"] });
+    await api.redeliverRepoWebhookDelivery(repository.id, json.id, jsonFirst.id);
+    await api.redeliverRepoWebhookDelivery(repository.id, form.id, formFirst.id);
     const jsonAgain = await delivery(json.id, "issues", found => found.guid === jsonFirst.guid, true);
     const formAgain = await delivery(form.id, "issues", found => found.guid === formFirst.guid, true);
     expect([jsonAgain.url, formAgain.url]).toEqual([now.url, now.url]);
@@ -207,10 +207,10 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
     await api.updateIssue(owner, name, issue.number, { state: "open" });
     const opened = await delivery(hook.id, "issues", ofIssue(issue, "opened"));
     await delivery(hook.id, "issues", ofIssue(issue, "reopened"));
-    await api.redeliverRepoWebhookDelivery(owner, name, hook.id, opened.id);
+    await api.redeliverRepoWebhookDelivery(repository.id, hook.id, opened.id);
     const again = await delivery(hook.id, "issues", found => found.guid === opened.guid, true);
 
-    const listed = await api.listRepoWebhookDeliveries(owner, name, hook.id, 0);
+    const listed = await api.listRepoWebhookDeliveries(repository.id, hook.id, 0);
     const times = listed.map(entry => Date.parse(entry.delivered_at));
     expect(times).toEqual(times.toSorted((a, b) => b - a));
     expect(listed.map(entry => entry.id)).toEqual(expect.arrayContaining([opened.id, again.id]));
