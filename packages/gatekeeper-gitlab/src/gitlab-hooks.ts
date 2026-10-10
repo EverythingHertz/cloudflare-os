@@ -166,9 +166,9 @@ const secretKey = (projectId: number) => `secret:${projectId}`;
 /**
  * One per connected account, named by its `UserAccount` id. Storage: `account` (that id), and per
  * project `webhook:` and `secret:` (the signing token its webhook signs deliveries with), `checkAt`
- * (when to next check them on GitLab), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows
- * and `queue:` indexes, and `revoked` once the account is disconnected, which refuses everything
- * for good.
+ * (when to next check them on GitLab), `resendFrom` (the project the next check's resends start
+ * with), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows and `queue:` indexes, and
+ * `revoked` once the account is disconnected, which refuses everything for good.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
@@ -357,8 +357,12 @@ export class GitLabHookDriver extends DurableObject<Env> {
         logger.warn("failed to check a GitLab webhook", { event: "hooks.webhook.check.failed", error });
       }
     }
-    const shares = fairShares(checked.map(({ failed }) => Math.min(failed.length, MAX_RESENDS_PER_PROJECT)),
-      MAX_RESENDS_PER_CHECK);
+    // Started where the last check's split stopped: when more projects need resends than a check
+    // makes, those one check leaves out go first in the next.
+    const from = Math.max(0, checked.findIndex(({ webhook }) => webhook.project.id === kv.get<number>("resendFrom")));
+    const { shares, next } = fairShares(
+      checked.map(({ failed }) => Math.min(failed.length, MAX_RESENDS_PER_PROJECT)), MAX_RESENDS_PER_CHECK, from);
+    if (checked.length > 0) kv.put("resendFrom", checked[next]!.webhook.project.id);
     for (const [i, { webhook: { id, project }, failed }] of checked.entries()) {
       if (shares[i] === 0) continue;
       try {
@@ -603,22 +607,25 @@ function undelivered(events: GitLabWebhookEventResponse[]): GitLabWebhookEventRe
 }
 
 /**
- * Split `budget` among `demands` max-min fairly: one each in turn while any wants more, so one that
- * wants many can't crowd out one that wants a few.
+ * Split `budget` among `demands` max-min fairly: one each in turn from `start` while any wants
+ * more, so one that wants many can't crowd out one that wants a few.
+ * @returns Each share, and `next`, the demand after the last one given a share: where the next
+ *   split starts, so that what this one left out comes first then.
  */
-function fairShares(demands: number[], budget: number): number[] {
+function fairShares(demands: number[], budget: number, start = 0): { shares: number[]; next: number } {
   const shares = demands.map(() => 0);
-  for (let left = budget, gave = true; gave && left > 0;) {
-    gave = false;
-    for (const [i, demand] of demands.entries()) {
-      if (left > 0 && shares[i] < demand) {
-        shares[i]++;
-        left--;
-        gave = true;
-      }
+  let next = start;
+  for (let left = budget, i = start, idle = 0; left > 0 && idle < demands.length; i = (i + 1) % demands.length) {
+    if (shares[i]! < demands[i]!) {
+      shares[i]!++;
+      left--;
+      idle = 0;
+      next = (i + 1) % demands.length;
+    } else {
+      idle++;
     }
   }
-  return shares;
+  return { shares, next };
 }
 
 /** Why GitLab refused to add a webhook, in terms the user can act on. */

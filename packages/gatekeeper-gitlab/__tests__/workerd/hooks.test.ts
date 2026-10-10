@@ -1129,6 +1129,37 @@ it("shares a check's resends among the account's projects, the rest waiting for 
   for (const [i, hook] of hooks.entries()) expect((await hook.read()).received).toHaveLength(failures[paths[i]]);
 });
 
+it("starts each check's resends where the last check's stopped, when more projects need them than one makes", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  // One more project than a check makes resends, twenty.
+  const paths = Object.keys(PROJECT_IDS);
+  for (let i = paths.length; i < 21; i++) {
+    const path = `group/spare${i}`;
+    PROJECT_IDS[path] ??= 100 + i;
+    paths.push(path);
+  }
+  for (const projectPath of paths) {
+    const hook = binding(account, { projectPath });
+    await hook.subscribe();
+    await hook.enable();
+  }
+  const { at, alarm } = clock(account);
+
+  // One failed delivery to each, which GitLab then fails again each time it is resent.
+  gitlab.failDeliveriesWith = 503;
+  await at(0, async () => {
+    for (const path of paths) await gitlab.deliver("Issue Hook", { ...issueHook("open", 42), project: projectPayloadOf(path) });
+  });
+  await at(HOUR, alarm);
+  const first = gitlab.resentTo();
+  expect(Object.values(first)).toEqual(Array(20).fill(1));
+  const [left] = paths.filter(path => !(path in first));
+
+  await at(2 * HOUR, alarm);
+  expect(gitlab.resentTo()).toMatchObject({ [left!]: 1 });
+});
+
 it("resends at the next check what GitLab refused to resend", async () => {
   const gitlab = new FakeGitLabHooks();
   const account = await connectAccount();
