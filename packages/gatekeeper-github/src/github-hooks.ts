@@ -143,7 +143,8 @@ const repairedKey = (repoId: number) => `repaired:${repoId}`;
  * One per connected account, named by its `UserAccount` id. Storage: `account` (that id), `viewer`
  * (the GitHub user id the account last read as), `secret` (the HMAC key its webhooks sign
  * deliveries with), per repository `webhook:` and `repaired:` (when its configuration was last
- * restored), `checkAt` (when to next check them on GitHub),
+ * restored), `checkAt` (when to next check them on GitHub), `redeliverFrom` (the repository the
+ * next check's redeliveries start with),
  * `reg:`/`caps:` per hook, the delivery queue's `msg:` rows, and `revoked` once the account is
  * disconnected, which refuses everything for good.
  *
@@ -350,7 +351,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
         logger.warn("failed to check a GitHub webhook", { event: "hooks.webhook.check.failed", error });
       }
     }
-    const shares = fairShares(checked.map(({ failed }) => failed.length), MAX_REDELIVERIES_PER_CHECK);
+    // Started where the last check's split stopped: when more repositories need redeliveries than
+    // a check makes, those one check leaves out go first in the next.
+    const from = Math.max(0, checked.findIndex(({ webhook }) => webhook.repo.id === kv.get<number>("redeliverFrom")));
+    const { shares, next } = fairShares(checked.map(({ failed }) => failed.length), MAX_REDELIVERIES_PER_CHECK, from);
+    if (checked.length > 0) kv.put("redeliverFrom", checked[next]!.webhook.repo.id);
     for (const [i, { webhook: { id, repo }, failed }] of checked.entries()) {
       if (shares[i] === 0) continue;
       try {
@@ -585,22 +590,25 @@ function undelivered(deliveries: GitHubWebhookDeliveryResponse[], repairedAt = -
 }
 
 /**
- * Split `budget` among `demands` max-min fairly: one each in turn while any wants more, so one that
- * wants many can't crowd out one that wants a few.
+ * Split `budget` among `demands` max-min fairly: one each in turn from `start` while any wants
+ * more, so one that wants many can't crowd out one that wants a few.
+ * @returns Each share, and `next`, the demand after the last one given a share: where the next
+ *   split starts, so that what this one left out comes first then.
  */
-function fairShares(demands: number[], budget: number): number[] {
+function fairShares(demands: number[], budget: number, start = 0): { shares: number[]; next: number } {
   const shares = demands.map(() => 0);
-  for (let left = budget, gave = true; gave && left > 0;) {
-    gave = false;
-    for (const [i, demand] of demands.entries()) {
-      if (left > 0 && shares[i] < demand) {
-        shares[i]++;
-        left--;
-        gave = true;
-      }
+  let next = start;
+  for (let left = budget, i = start, idle = 0; left > 0 && idle < demands.length; i = (i + 1) % demands.length) {
+    if (shares[i]! < demands[i]!) {
+      shares[i]!++;
+      left--;
+      idle = 0;
+      next = (i + 1) % demands.length;
+    } else {
+      idle++;
     }
   }
-  return shares;
+  return { shares, next };
 }
 
 /** Why GitHub refused to add a webhook, in terms the user can act on. */

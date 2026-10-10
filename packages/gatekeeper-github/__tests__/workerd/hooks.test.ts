@@ -1165,6 +1165,40 @@ it("shares a check's redeliveries among the account's repositories, the rest wai
   expect((await quiet.read()).received).toHaveLength(3);
 });
 
+it("starts each check's redeliveries where the last check's stopped, when more repositories need them than one makes", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  // One more repository than a check makes redeliveries, twenty.
+  const names = [REPO, "gizmos"];
+  for (let i = names.length; i < 21; i++) {
+    const name = `spare${i}`;
+    REPOSITORIES[name] ??= {
+      ...repository, id: 7000 + i, name, full_name: `${OWNER}/${name}`, html_url: `https://github.com/${OWNER}/${name}`,
+    };
+    names.push(name);
+  }
+  for (const name of names) {
+    const hook = binding(account, { repo: name });
+    await hook.subscribe();
+    await hook.enable();
+  }
+  const { at, alarm } = clock(account);
+
+  // One failed delivery on each, which GitHub then fails again each time it is redelivered.
+  github.failDeliveriesWith = 503;
+  await at(0, async () => {
+    for (const name of names) await github.deliver("issues", { ...issues("opened", 42), repository: REPOSITORIES[name] });
+  });
+  await at(HOUR, alarm);
+  const first = github.pendingRedeliveries();
+  expect(Object.values(first)).toEqual(Array(20).fill(1));
+  const [left] = names.filter(name => !(name in first));
+  await github.redeliver();
+
+  await at(2 * HOUR, alarm);
+  expect(github.pendingRedeliveries()).toMatchObject({ [left!]: 1 });
+});
+
 it("asks again at the next check for the redeliveries GitHub refused to make", async () => {
   const github = new FakeGitHub();
   const account = await connectAccount();
