@@ -740,9 +740,18 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  /** Note that `driver` holds hooks of this account, so that disconnecting it reaches them. */
-  async trackHookDriver(driver: HookDriverRef): Promise<void> {
-    this.ctx.storage.kv.put(`hookDriver:${driver.kind}:${driver.name}`, driver);
+  /**
+   * Note that `driver` holds hooks of this account, so that disconnecting it reaches them; false,
+   * noting nothing, once the account is disconnected, when no hook of it may be registered.
+   */
+  async trackHookDriver(driver: HookDriverRef): Promise<boolean> {
+    // Serialized with disconnecting, so that a driver is either noted before the account's drivers
+    // are told to drop its hooks, or refused once its credentials are gone.
+    return await this.#credentials.run(async () => {
+      if (!this.ctx.storage.kv.get<string>("refreshToken")) return false;
+      this.ctx.storage.kv.put(`hookDriver:${driver.kind}:${driver.name}`, driver);
+      return true;
+    });
   }
 
   /**

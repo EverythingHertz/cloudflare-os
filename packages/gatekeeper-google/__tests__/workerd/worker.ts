@@ -2,7 +2,7 @@ import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint, restore } from "cl
 import { GmailForwardSnapshotStore } from "../../src/gmail-state";
 import { GmailGatekeeperImpl, type GmailGatekeeperImplProps } from "../../src/gmail";
 import { GoogleChatGatekeeperImpl, type GoogleChatGatekeeperImplProps } from "../../src/chat";
-import { UserAccount, GoogleVerifier } from "../../src/google";
+import { GoogleVerifier, UserAccount as GoogleUserAccount, type HookDriverRef } from "../../src/google";
 import type {
   ActionKind, HookController, ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
@@ -21,7 +21,23 @@ import type { GmailHookParams } from "../../src/gmail-hooks";
 export { default } from "../../src/google";
 export { ChatHookController, ChatHookDriver } from "../../src/chat-hooks";
 export { GmailHookController, GmailHookDriver } from "../../src/gmail-hooks";
-export { GmailGatekeeperImpl, GoogleChatGatekeeperImpl, UserAccount, GoogleVerifier };
+export { GmailGatekeeperImpl, GoogleChatGatekeeperImpl, GoogleVerifier };
+
+/**
+ * The account, with trackHookDriver() held while its storage has `test:holdTracking`, so that a
+ * test can act while an enable waits on it; `test:trackingHeld` says one is waiting.
+ */
+export class UserAccount extends GoogleUserAccount {
+  override async trackHookDriver(driver: HookDriverRef): Promise<boolean> {
+    const kv = this.ctx.storage.kv;
+    if (kv.get("test:holdTracking")) {
+      kv.put("test:trackingHeld", true);
+      while (kv.get("test:holdTracking")) await scheduler.wait(1);
+      kv.delete("test:trackingHeld");
+    }
+    return await super.trackHookDriver(driver);
+  }
+}
 
 type StorageOperation =
   | {kind: "put"; key: string; value: unknown}

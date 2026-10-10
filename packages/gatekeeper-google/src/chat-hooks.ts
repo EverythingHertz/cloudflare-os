@@ -93,6 +93,10 @@ const capabilitiesKey = (key: string) => `caps:${key}`;
 const subscriptionKey = (authority: string) => `sub:${authority}`;
 /** Set once the account knows this driver holds hooks of its (see UserAccount.trackHookDriver()). */
 const trackedKey = (userObjectId: string) => `tracked:${userObjectId}`;
+/** Set when a disconnected account's hooks are dropped, so that an enable it was making is refused. */
+const forgottenKey = (userObjectId: string) => `forgotten:${userObjectId}`;
+
+const DISCONNECTED = "This Google account has been disconnected.";
 
 export class ChatHookDriver extends DurableObject<Env> {
   /** Subscription creations in flight, by account, which concurrent enables and renewals join. */
@@ -104,9 +108,8 @@ export class ChatHookDriver extends DurableObject<Env> {
   async register(key: string, registration: Registration, capabilities: Capabilities): Promise<void> {
     const subscription = this.ctx.storage.kv.get<Subscription>(subscriptionKey(registration.authority));
     if (!subscription || subscription.expireTime <= Date.now()) await this.#subscribe(registration);
-    // Recorded first, so that disconnecting the account reaches every hook it registers.
-    await this.#account(registration.userObjectId).trackHookDriver({ kind: "chat", name: registration.spaceName });
-    this.ctx.storage.kv.put(trackedKey(registration.userObjectId), true);
+    // Nothing from here to the registration awaits, so a disconnect can't come between them.
+    await this.#track(registration.userObjectId, registration.spaceName);
     const replaced = this.ctx.storage.kv.get<Capabilities>(capabilitiesKey(key));
     this.ctx.storage.kv.put(registrationKey(key), registration);
     this.ctx.storage.kv.put(capabilitiesKey(key), capabilities);
@@ -127,6 +130,7 @@ export class ChatHookDriver extends DurableObject<Env> {
    * hook uses then lapses, as on disabling.
    */
   async forgetAccount(userObjectId: string): Promise<void> {
+    this.ctx.storage.kv.put(forgottenKey(userObjectId), Date.now());
     // Listed up front, as unregistering deletes from the listing.
     const registrations = [...this.#registrations()];
     for (const [regKey, registration] of registrations) {
@@ -189,9 +193,20 @@ export class ChatHookDriver extends DurableObject<Env> {
   }
 
   /**
+   * Tell the account that this driver holds hooks of its, so that disconnecting it reaches them.
+   * Refuses an account disconnected already, or meanwhile: its hooks were dropped then.
+   */
+  async #track(userObjectId: string, spaceName: string): Promise<void> {
+    const tracked = await this.#account(userObjectId).trackHookDriver({ kind: "chat", name: spaceName });
+    if (!tracked || this.ctx.storage.kv.get(forgottenKey(userObjectId)) !== undefined) throw new Error(DISCONNECTED);
+    this.ctx.storage.kv.put(trackedKey(userObjectId), true);
+  }
+
+  /**
    * Tell each account with hooks here that this driver holds them, as register() does. A hook
    * registered before accounts kept track has no record of it, which disconnecting its account
-   * needs to reach it; failing, it is told at the next alarm.
+   * needs to reach it; failing, it is told at the next alarm. An account disconnected before it
+   * could be told has its hooks dropped now.
    */
   async #trackAccounts(): Promise<void> {
     const kv = this.ctx.storage.kv;
@@ -200,8 +215,11 @@ export class ChatHookDriver extends DurableObject<Env> {
       .map(([, { userObjectId, spaceName }]) => [userObjectId, spaceName]));
     for (const [userObjectId, spaceName] of untracked) {
       try {
-        await this.#account(userObjectId).trackHookDriver({ kind: "chat", name: spaceName });
-        kv.put(trackedKey(userObjectId), true);
+        if (await this.#account(userObjectId).trackHookDriver({ kind: "chat", name: spaceName })) {
+          kv.put(trackedKey(userObjectId), true);
+        } else {
+          await this.forgetAccount(userObjectId);
+        }
       } catch (error) {
         logger.warn("failed to note a Chat hook driver with its account", { event: "chat.hooks.track.failed", error });
       }

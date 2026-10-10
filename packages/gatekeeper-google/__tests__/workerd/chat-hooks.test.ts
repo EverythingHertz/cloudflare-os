@@ -382,6 +382,46 @@ it("drops on disconnect a hook registered before accounts kept track, once its d
     [...state.storage.kv.list({prefix: "reg:"})].length)).toBe(0);
 });
 
+/** Hold the account's trackHookDriver() (see the test worker's UserAccount) while `run` acts. */
+async function whileTracking(connection: {props: {userObjectId: string}}, run: () => Promise<unknown>) {
+  const account = testEnv.UserAccount.get(testEnv.UserAccount.idFromString(connection.props.userObjectId));
+  await runInDurableObject(account, (_instance: unknown, state: DurableObjectState) => {
+    state.storage.kv.put("test:holdTracking", true);
+  });
+  return {
+    account,
+    waitedFor: async () => {
+      await vi.waitFor(() => runInDurableObject(account, (_instance: unknown, state: DurableObjectState) => {
+        if (!state.storage.kv.get("test:trackingHeld")) throw new Error("No enable is waiting on the account yet.");
+      }), {timeout: 5_000});
+      await run();
+      await runInDurableObject(account, (_instance: unknown, state: DurableObjectState) => {
+        state.storage.kv.delete("test:holdTracking");
+      });
+    },
+  };
+}
+
+it.each([
+  ["its account is disconnected during", (account: DurableObjectStub, _userObjectId: string) =>
+    (account as unknown as {revoke(): Promise<void>}).revoke()],
+  // As when the account is disconnected just after noting this driver, before the enable goes on.
+  ["its account's hooks are dropped while it waits on the account", (_account: DurableObjectStub, userObjectId: string) =>
+    (driver() as unknown as {forgetAccount(userObjectId: string): Promise<void>}).forgetAccount(userObjectId)],
+])("refuses an enable that %s, registering nothing", async (_case, interrupt) => {
+  mockGoogle();
+  const ada = await connect("ada");
+  let account: DurableObjectStub | undefined;
+  const tracking = await whileTracking(ada, () => interrupt(account!, ada.props.userObjectId));
+  account = tracking.account;
+  // Expected at once, as the enable is refused while the test is still acting.
+  const refused = expect(Promise.resolve(ada.hooks.chatEnableHook())).rejects.toThrow("This Google account has been disconnected.");
+  await tracking.waitedFor();
+  await refused;
+  expect(await runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) =>
+    [...state.storage.kv.list({prefix: "reg:"})].length)).toBe(0);
+});
+
 it("retries a failed subscription renewal before the subscription lapses", async () => {
   const google = mockGoogle();
   const ada = await connect("ada");
