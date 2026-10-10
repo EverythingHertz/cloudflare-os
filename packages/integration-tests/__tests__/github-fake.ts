@@ -122,14 +122,14 @@ export class FakeGitHub {
       this.revokedTokens.push(String((await request.json() as Row).access_token));
       return new Response(null, { status: 204 });
     }
-    const byId = /^\/repositories\/(\d+)$/.exec(url.pathname);
-    if (byId) {
-      const repository = [...this.#repositories.values()].find(({ id }) => id === Number(byId[1]));
-      return repository ? this.#repository(repository, headers) : notFound();
-    }
-    const [, name = "", rest = ""] = /^\/repos\/acme\/([^/]+)(\/.*)?$/.exec(url.pathname) ?? [];
-    const repository = this.#repositories.get(name);
-    if (!repository) return null;
+    // A repository by its id, where GitHub serves every route for it, or by its name.
+    const byId = /^\/repositories\/(\d+)(\/.*)?$/.exec(url.pathname);
+    const byName = /^\/repos\/acme\/([^/]+)(\/.*)?$/.exec(url.pathname);
+    const repository = byId ? [...this.#repositories.values()].find(({ id }) => id === Number(byId[1]))
+      : byName ? this.#repositories.get(byName[1]!) : undefined;
+    if (!repository) return byId ? notFound() : null;
+    const { name } = repository;
+    const rest = (byId ?? byName)![2] ?? "";
     if (rest === "") return this.#repository(repository, headers);
     if (!this.readable) return notFound();
     const own = [...this.webhooks.values()].filter(webhook => webhook.repo === name);

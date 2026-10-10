@@ -11,7 +11,8 @@ import type { GatekeeperProps, Outcome } from "./worker";
 const OWNER = "acme";
 const REPO = "widgets";
 const REPO_ID = 1296269;
-const API = `/repos/${OWNER}/${REPO}`;
+/** Where the driver reaches the repository's webhooks: by its id, which a rename doesn't change. */
+const API = `/repositories/${REPO_ID}`;
 const HEAD = "b".repeat(40);
 const BASE = "a".repeat(40);
 const ZERO = "0".repeat(40);
@@ -51,6 +52,8 @@ const gizmos = {
   ...repository, id: 4242, name: "gizmos", full_name: `${OWNER}/gizmos`, html_url: `https://github.com/${OWNER}/gizmos`,
 };
 const REPOSITORIES: Record<string, typeof repository> = { [REPO]: repository, gizmos };
+/** What the fake keys a webhook by when it is on the repository that took `REPO`'s name (`nameReusedBy`). */
+const REUSED = "the repository named widgets since";
 
 function issue(number: number, overrides: Row = {}): Row {
   return {
@@ -142,16 +145,10 @@ class FakeGitHub {
     if (pathname === "/applications/test-client/token" && method === "DELETE") {
       return new Response(null, { status: 204 });
     }
-    const byId = /^\/repositories\/(\d+)$/.exec(pathname);
-    if (byId) {
-      const repo = Object.values(REPOSITORIES).find(({ id }) => id === Number(byId[1]));
-      if (!repo) throw new Error(`test: unexpected fetch ${method} ${request.url}`);
-      return this.#repository(request, repo);
-    }
-    const [, name = "", rest = ""] = new RegExp(`^/repos/${OWNER}/([^/]+)(/.*)?$`).exec(pathname) ?? [];
-    const repo = REPOSITORIES[name];
-    if (!repo) throw new Error(`test: unexpected fetch ${method} ${request.url}`);
-    if (rest === "") return this.#repository(request, name === REPO && this.nameReusedBy || repo);
+    const target = this.#target(pathname);
+    if (!target) throw new Error(`test: unexpected fetch ${method} ${request.url}`);
+    const { repo, key: name, rest } = target;
+    if (rest === "") return this.#repository(request, repo);
     if (rest === "/issues/42") return Response.json(issue(42));
     if (rest.startsWith("/hooks") && !this.admin) {
       return Response.json({ message: "Not Found" }, { status: 404 });
@@ -217,6 +214,24 @@ class FakeGitHub {
       return Response.json({}, { status: 202 });
     }
     throw new Error(`test: unexpected fetch ${method} ${request.url}`);
+  }
+
+  /**
+   * The repository a request names, as `/repositories/<id>` or `/repos/acme/<name>`, where a name
+   * taken over by `nameReusedBy` names that one; and the key its webhooks are held under.
+   */
+  #target(pathname: string): { repo: typeof repository; key: string; rest: string } | undefined {
+    const byId = /^\/repositories\/(\d+)(\/.*)?$/.exec(pathname);
+    if (byId) {
+      const id = Number(byId[1]);
+      if (id === this.nameReusedBy?.id) return { repo: this.nameReusedBy, key: REUSED, rest: byId[2] ?? "" };
+      const [key, repo] = Object.entries(REPOSITORIES).find(([, candidate]) => candidate.id === id) ?? [];
+      return key === undefined || repo === undefined ? undefined : { repo, key, rest: byId[2] ?? "" };
+    }
+    const [, name = "", rest = ""] = new RegExp(`^/repos/${OWNER}/([^/]+)(/.*)?$`).exec(pathname) ?? [];
+    if (name === REPO && this.nameReusedBy) return { repo: this.nameReusedBy, key: REUSED, rest };
+    const repo = REPOSITORIES[name];
+    return repo === undefined ? undefined : { repo, key: name, rest };
   }
 
   /** A read of `repo`, conditional on its ETag. */
@@ -1192,6 +1207,23 @@ it("asks after the repository by its id, which outlives a rename, not by a name 
   await settled(account);
 
   expect(await triage.read()).toMatchObject({ received: [], observations: [] });
+});
+
+it("keeps its webhook on the repository it watches, once another the account administers has taken its name", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const [webhook] = github.webhooks.values();
+
+  // Renamed, while its old name now names another repository the account may add webhooks to.
+  github.nameReusedBy = { ...gizmos, id: 999, name: REPO, full_name: `${OWNER}/${REPO}` };
+  await after(HOUR, account);
+  expect([...github.webhooks.values()].map(({ id, repo }) => [id, repo])).toEqual([[webhook!.id, REPO]]);
+  await triage.disable();
+  expect(github.deleted).toEqual([webhook!.id]);
+  expect(github.webhooks.size).toBe(0);
 });
 
 it("changes nothing while WEBHOOK_ORIGIN is unset: subscribe() refuses, and the webhook route is inert", async () => {

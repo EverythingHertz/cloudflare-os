@@ -335,7 +335,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
       try {
         await this.#api(account, repo, async api => {
           for (const { id: deliveryId } of failed.slice(0, shares[i])) {
-            await api.redeliverRepoWebhookDelivery(repo.owner, repo.repo, id, deliveryId);
+            await api.redeliverRepoWebhookDelivery(repo.id, id, deliveryId);
           }
         });
       } catch (error) {
@@ -356,9 +356,9 @@ export class GitHubHookDriver extends DurableObject<Env> {
   async #checkWebhook(account: string, url: string, { id, repo }: Webhook): Promise<GitHubWebhookDeliveryResponse[]> {
     const read = await this.#api(account, repo, async api => {
       try {
-        const found = await api.getRepoWebhook(repo.owner, repo.repo, id);
+        const found = await api.getRepoWebhook(repo.id, id);
         const since = Date.now() - DELIVERY_LOOKBACK_MS;
-        return { found, deliveries: await api.listRepoWebhookDeliveries(repo.owner, repo.repo, id, since) };
+        return { found, deliveries: await api.listRepoWebhookDeliveries(repo.id, id, since) };
       } catch (error) {
         // Deleted, and its deliveries with it.
         if (error instanceof GitHubApiError && error.status === 404) return undefined;
@@ -417,19 +417,19 @@ export class GitHubHookDriver extends DurableObject<Env> {
       id = await this.#api(account, repo, async api => {
         if (recorded) {
           try {
-            return (await api.updateRepoWebhook(repo.owner, repo.repo, recorded.id, config)).id;
+            return (await api.updateRepoWebhook(repo.id, recorded.id, config)).id;
           } catch (error) {
             if (!(error instanceof GitHubApiError && error.status === 404)) throw error;
           }
         }
         try {
-          return (await api.createRepoWebhook(repo.owner, repo.repo, config)).id;
+          return (await api.createRepoWebhook(repo.id, config)).id;
         } catch (error) {
           if (!(error instanceof GitHubApiError && error.status === 422)) throw error;
-          const existing = (await api.listRepoWebhooks(repo.owner, repo.repo))
+          const existing = (await api.listRepoWebhooks(repo.id))
             .find(webhook => webhook.config.url === url);
           if (!existing) throw error;
-          return (await api.updateRepoWebhook(repo.owner, repo.repo, existing.id, config)).id;
+          return (await api.updateRepoWebhook(repo.id, existing.id, config)).id;
         }
       });
     } catch (error) {
@@ -449,7 +449,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
    */
   async #removeWebhook(account: string, { id, repo }: Webhook): Promise<void> {
     try {
-      await this.#api(account, repo, api => api.deleteRepoWebhook(repo.owner, repo.repo, id));
+      await this.#api(account, repo, api => api.deleteRepoWebhook(repo.id, id));
     } catch (error) {
       logger.warn("failed to delete a GitHub webhook", { event: "hooks.webhook.delete.failed", error });
     }
