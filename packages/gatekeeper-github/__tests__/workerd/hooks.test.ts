@@ -3,6 +3,7 @@
 // fetch mock below, and its signed webhook deliveries arrive through the worker's own fetch handler.
 
 import { SELF, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import type { HookDescription } from "@gadgets/workshop-shared/gatekeeper";
 import { afterEach, expect, it, vi } from "vitest";
 import type { GitHubSubscribeOptions } from "../../src/types";
@@ -104,6 +105,8 @@ async function hmac(secret: string, body: string): Promise<string> {
 
 /** GitHub, as far as hooks use it: the repository and who administers it, the viewer, webhooks. */
 class FakeGitHub {
+  /** Who the account's token belongs to. */
+  viewer = ADA;
   admin = true;
   /** Whether the account can still read the repository at all. */
   readable = true;
@@ -141,7 +144,7 @@ class FakeGitHub {
     const { pathname, searchParams } = new URL(request.url);
     const { method } = request;
     this.requests.push(`${method} ${pathname}`);
-    if (pathname === "/user") return Response.json(ADA);
+    if (pathname === "/user") return Response.json(this.viewer);
     if (pathname === "/applications/test-client/token" && method === "DELETE") {
       return new Response(null, { status: 204 });
     }
@@ -965,6 +968,33 @@ it("restores its webhook's payload encoding, and has GitHub redeliver what it re
   expect(await github.redeliver()).toEqual([204]);
   await settled(account);
   expect((await triage.read()).received).toEqual([expect.objectContaining({ info: expect.objectContaining({ id: "42" }) })]);
+});
+
+it.each<[string, (github: FakeGitHub, account: string) => Promise<unknown>]>([
+  ["told of the reconnect", async (_github, account) => {
+    const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
+    const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
+      state.storage.kv, { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] }, Date.now()));
+    await userAccount.commitReconnect(stageId);
+  }],
+  // As when the reconnect's notice to the driver was lost.
+  ["at the hourly check", (_github, account) => after(HOUR, account)],
+])("skips the comments of the GitHub user its account is now, after reconnecting as another, %s", async (_case, learn) => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe({ events: ["comment"] });
+  await triage.enable();
+
+  // Reconnected, now as Bob.
+  github.viewer = BOB;
+  await learn(github, account);
+  await github.deliver("issue_comment", comment(42, "From Bob, whom the account is now.", { sender: BOB }));
+  await github.deliver("issue_comment", comment(42, "From Ada, someone else now.", { sender: ADA }));
+  await settled(account);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({
+    kind: "comment", comment: expect.objectContaining({ bodyMarkdown: "From Ada, someone else now." }),
+  })]);
 });
 
 it.each<[string, (account: string) => Promise<() => Promise<unknown>>]>([

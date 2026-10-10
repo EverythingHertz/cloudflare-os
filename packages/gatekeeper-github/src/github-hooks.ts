@@ -62,7 +62,10 @@ export type GitHubHookProps = GitHubHookParams & {
   userObjectId: string;
   repo: PinnedRepo;
   events: GitHubEventKind[];
-  /** The connected account's GitHub user id: its own comments and reviews are not delivered. */
+  /**
+   * The connected account's GitHub user id when the hook was subscribed, whose own comments and
+   * reviews are not delivered, until the driver has read who the account is now.
+   */
   viewerId: number;
   delivery: RpcStub<GitHubHookDelivery>;
 };
@@ -137,9 +140,10 @@ const webhookKey = (repoId: number) => `webhook:${repoId}`;
 const repairedKey = (repoId: number) => `repaired:${repoId}`;
 
 /**
- * One per connected account, named by its `UserAccount` id. Storage: `account` (that id), `secret`
- * (the HMAC key its webhooks sign deliveries with), per repository `webhook:` and `repaired:` (when
- * the check last restored its configuration), `checkAt` (when to next check them on GitHub),
+ * One per connected account, named by its `UserAccount` id. Storage: `account` (that id), `viewer`
+ * (the GitHub user id the account last read as), `secret` (the HMAC key its webhooks sign
+ * deliveries with), per repository `webhook:` and `repaired:` (when its configuration was last
+ * restored), `checkAt` (when to next check them on GitHub),
  * `reg:`/`caps:` per hook, the delivery queue's `msg:` rows, and `revoked` once the account is
  * disconnected, which refuses everything for good.
  *
@@ -165,6 +169,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
     await this.#webhookChanges.run(async () => {
       // Disconnected while an earlier change ran.
       if (kv.get("revoked")) throw new Error(DISCONNECTED);
+      await this.#readViewer(userObjectId);
       const others = this.#registrations(repo).filter(([regKey]) => regKey !== registrationKey(key));
       await this.#ensureWebhook(repo, [registration, ...others.map(([, other]) => other)]);
       // Recorded in the same change, so a removal queued after it sees this hook.
@@ -230,6 +235,16 @@ export class GitHubHookDriver extends DurableObject<Env> {
   }
 
   /**
+   * The account's credentials were replaced, perhaps by another GitHub user's, whose own comments
+   * and reviews are then the ones its hooks skip (see UserAccount.commitReconnect()).
+   */
+  async reconnected(): Promise<void> {
+    const account = this.ctx.storage.kv.get<string>("account");
+    if (account === undefined || this.ctx.storage.kv.get("revoked")) return;
+    await this.#readViewer(account);
+  }
+
+  /**
    * Verify one webhook delivery and queue its event for each hook that watches for it.
    * @returns The HTTP status to answer GitHub with.
    */
@@ -273,9 +288,10 @@ export class GitHubHookDriver extends DurableObject<Env> {
     }
     if (parsed.at < now - DELIVERED_RETENTION_MS) return 204;
     const { event, senderId } = parsed;
+    const viewerId = kv.get<number>("viewer");
     let queued = false;
     for (const [regKey, registration] of this.#registrations({ id: repoId })) {
-      if (!watches(registration, event, senderId)) continue;
+      if (!watches(registration, event, senderId, viewerId ?? registration.viewerId)) continue;
       this.#queue.enqueue(regKey.slice("reg:".length), id, event, now);
       queued = true;
     }
@@ -321,6 +337,10 @@ export class GitHubHookDriver extends DurableObject<Env> {
     const account = kv.get<string>("account");
     const url = this.#webhookUrl();
     if (account === undefined || url === undefined) return;
+    // In case a reconnect's notice to this driver was lost.
+    await this.#readViewer(account).catch((error: unknown) => {
+      logger.warn("failed to read who a GitHub account is", { event: "hooks.viewer.read.failed", error });
+    });
     const checked: { webhook: Webhook; failed: GitHubWebhookDeliveryResponse[] }[] = [];
     for (const webhook of this.#webhooks()) {
       try {
@@ -458,6 +478,13 @@ export class GitHubHookDriver extends DurableObject<Env> {
     }
   }
 
+  /** Read the GitHub user the account now is, whose own comments and reviews its hooks skip. */
+  async #readViewer(account: string): Promise<void> {
+    const { UserAccount } = this.ctx.exports;
+    const { user } = await withAccountApi(UserAccount.get(UserAccount.idFromString(account)), api => api.getViewer());
+    this.ctx.storage.kv.put("viewer", user.id);
+  }
+
   #api<T>(account: string, repo: PinnedRepo, fn: (api: GitHubApi) => Promise<T>): Promise<T> {
     const { UserAccount } = this.ctx.exports;
     return withAccountApi(UserAccount.get(UserAccount.idFromString(account)), fn, { repo });
@@ -507,11 +534,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
 }
 
 /**
- * Whether a hook on the event's repository watches for it. The facet re-checks the binding's
- * scope at delivery.
+ * Whether a hook on the event's repository watches for it, the account being GitHub user
+ * `viewerId`. The facet re-checks the binding's scope at delivery.
  */
-function watches({ number, events, viewerId }: Registration, event: GitHubWebhookEvent,
-                 senderId: number | undefined): boolean {
+function watches({ number, events }: Registration, event: GitHubWebhookEvent,
+                 senderId: number | undefined, viewerId: number): boolean {
   if (!events.includes(event.kind)) return false;
   if (number !== undefined && !("number" in event && event.number === number)) return false;
   // Never hand the account's own comments and reviews back to it, which a hook would answer.

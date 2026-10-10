@@ -1515,6 +1515,12 @@ export class UserAccount extends DurableObject<Env> {
     const grant = commitStagedCredentials<GitHubOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#creds.connect(grant);
+    // Perhaps as another GitHub user, whose own comments and reviews the account's hooks then
+    // skip. Should this be lost, the driver's hourly check reads it too.
+    await this.ctx.exports.GitHubHookDriver.getByName(this.ctx.id.toString()).reconnected()
+      .catch((error: unknown) => {
+        logger.warn("failed to tell the hook driver of a reconnect", { event: "hooks.account.reconnect.failed", error });
+      });
   }
 
   /**
