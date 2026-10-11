@@ -1608,6 +1608,34 @@ it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promis
   expect(github.webhooks.size).toBe(0);
 });
 
+it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promise<unknown>, number]>([
+  ["as the account is disconnected", (account, triage) => unwrap(triage.hooks.revokeAccount(account)), 0],
+  // Keeping the webhook the hook delivers through now.
+  ["at the next hourly check", account => after(HOUR, account), 1],
+])("deletes %s a webhook an unanswered enable left at a URL the deployment has since moved from", async (_, cleanUp, kept) => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  github.loseCreateAnswers = true;
+  await expect(triage.enable()).rejects.toThrow("Network connection lost.");
+  github.loseCreateAnswers = false;
+
+  // Enabled again once the deployment's origin has changed, as a development tunnel's does.
+  const shared = env as { WEBHOOK_ORIGIN?: string };
+  const origin = shared.WEBHOOK_ORIGIN;
+  shared.WEBHOOK_ORIGIN = "https://moved.gadgets.test";
+  try {
+    await triage.enable();
+    expect(github.webhooks.size).toBe(2);
+    await cleanUp(account, triage);
+  } finally {
+    shared.WEBHOOK_ORIGIN = origin;
+  }
+  expect([...github.webhooks.values()].filter(webhook => webhook.url.startsWith("https://moved.gadgets.test/"))).toHaveLength(kept);
+  expect(github.webhooks.size).toBe(kept);
+});
+
 it("keeps on record the webhook an enable added as its account was disconnected, until GitHub has deleted it", async () => {
   const github = new FakeGitHub();
   const account = await connectAccount();
