@@ -143,6 +143,8 @@ class FakeGitHub {
   /** While set, adding a webhook stalls, counted in `stalledCreates`, polled as `stallDeletes` is. */
   stallCreates = false;
   stalledCreates = 0;
+  /** While set, GitHub adds a webhook but its answer is lost, as when the connection drops. */
+  loseCreateAnswers = false;
   /** How many repository reads GitHub answered 304, as it does a conditional read of an unchanged one. */
   notModified = 0;
   /** While set, the repository whose name this one had, renamed since, now names. */
@@ -196,6 +198,7 @@ class FakeGitHub {
       }
       const id = this.#nextId++;
       this.webhooks.set(id, this.#configured(id, name, await request.json<WebhookBody>()));
+      if (this.loseCreateAnswers) throw new TypeError("Network connection lost.");
       return Response.json({ id, config: { url: this.webhooks.get(id)!.url } }, { status: 201 });
     }
     const id = Number(/^\/hooks\/(\d+)/.exec(rest)?.[1]);
@@ -1576,6 +1579,23 @@ it.each<[string, (github: FakeGitHub) => () => number, number]>([
   expect(github.requests.filter(request => request === `POST ${API}/hooks`)).toHaveLength(added);
   expect(github.webhooks.size).toBe(0);
   expect(github.requests).toContain("DELETE /applications/test-client/token");
+});
+
+it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promise<unknown>]>([
+  ["as the account is disconnected", (account, triage) => unwrap(triage.hooks.revokeAccount(account))],
+  ["at the next hourly check", account => after(HOUR, account)],
+])("deletes %s a webhook GitHub added for an enable whose answer was lost", async (_, cleanUp) => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+
+  github.loseCreateAnswers = true;
+  await expect(triage.enable()).rejects.toThrow("Network connection lost.");
+  expect(github.webhooks.size).toBe(1);
+  github.loseCreateAnswers = false;
+  await cleanUp(account, triage);
+  expect(github.webhooks.size).toBe(0);
 });
 
 it("keeps on record the webhook an enable added as its account was disconnected, until GitHub has deleted it", async () => {
