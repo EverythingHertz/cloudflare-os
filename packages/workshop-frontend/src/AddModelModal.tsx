@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Dialog, Button, Input, Select, Collapsible, useKumoToastManager } from '@cloudflare/kumo'
-import { AiChatAuthorInfo, AiModelProvider, AiGatewayInfo, RedactedAiModelConfig, SUGGESTED_MODELS, isClassifierModel } from '@gadgets/workshop-shared/api'
+import { AiChatAuthorInfo, AiModelProvider, AiGatewayInfo, RedactedAiModelConfig, SUGGESTED_MODELS, modelKind } from '@gadgets/workshop-shared/api'
 import { RpcStub } from 'capnweb'
 import { AuthenticatedApi } from '@gadgets/workshop-shared/api'
 import { ExtraHeadersEditor } from './features/ai-models/ExtraHeadersEditor'
@@ -25,7 +25,7 @@ interface AddModelModalProps {
   authenticatedApi: RpcStub<AuthenticatedApi>
   aiConfig: AiGatewayInfo | null
   mode?: ModelModalMode
-  /** Leave classifier models out, for callers choosing the user's chat model. */
+  /** Leave decision models out, for callers choosing the user's chat model. */
   chatModelsOnly?: boolean
 }
 
@@ -89,7 +89,7 @@ function buildOptions(gatewayMode: boolean, enabledProviders: Set<string> | null
     // In gateway mode, suggested models are already built-in, so don't list them.
     if (!gatewayMode) {
       for (const [modelId, model] of Object.entries(SUGGESTED_MODELS[provider])) {
-        if (model.hidden || (chatModelsOnly && model.classifier)) continue
+        if (model.hidden || (chatModelsOnly && model.kind === 'decision')) continue
         options.push({
           value: encodeSelection(provider, modelId),
           label: model.name,
@@ -199,9 +199,9 @@ export default function AddModelModal({ visible, onCancel, onSuccess, authentica
 
     if (selection?.type === 'custom') {
       if (!modelId.trim()) newErrors.modelId = 'Please enter the model ID'
-      // The caller lists only chat models, so a classifier saved here would never show up there.
-      else if (chatModelsOnly && isClassifierModel(selection.provider, modelId.trim())) {
-        newErrors.modelId = "This is a classifier model, which can't chat. Add it from AI Providers instead."
+      // The caller lists only language models, so a decision model saved here would never show up there.
+      else if (chatModelsOnly && modelKind(selection.provider, modelId.trim()) === 'decision') {
+        newErrors.modelId = "This is a decision model, which can't chat. Add it from AI Providers instead."
       }
       if (!displayName.trim()) newErrors.displayName = 'Please enter a display name'
     }

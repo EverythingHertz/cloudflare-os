@@ -9,6 +9,7 @@ import type {
   AiChatAuthorInfo,
   AuthenticatedApi,
   BlueprintPublicInfo,
+  ModelKind,
   PublicApi,
 } from '@gadgets/workshop-shared/api'
 
@@ -48,10 +49,10 @@ const MODEL: AiChatAuthorInfo = {
   name: 'Model one',
 }
 
-const CLASSIFIER_MODEL: AiChatAuthorInfo = {
+const DECISION_MODEL: AiChatAuthorInfo = {
   type: 'agent',
-  id: 'classifier-one',
-  name: 'Classifier one',
+  id: 'decision-one',
+  name: 'Decision one',
 }
 
 const BLUEPRINT: BlueprintPublicInfo = {
@@ -81,8 +82,7 @@ function subscription() {
 
 function authenticatedApi(): RpcStub<AuthenticatedApi> {
   return {
-    listModels: async () => [MODEL],
-    listClassifierModels: async () => [CLASSIFIER_MODEL],
+    listModels: async (kind?: ModelKind) => kind === 'decision' ? [DECISION_MODEL] : [MODEL],
     listGatekeeperVendors: async () => [],
     subscribeConnectedAccounts: subscription,
     getAdminApi: async () => null,
@@ -147,14 +147,14 @@ describe('BlueprintLandingPage model configuration', () => {
   })
 
   it.each([
-    { kind: 'model', classifier: undefined, options: ['Model one'] },
-    { kind: 'classifier', classifier: true as const, options: ['Classifier one'] },
-  ])('offers a $kind binding only models of its kind', async ({ classifier, options }) => {
+    { kind: 'language', modelKind: undefined, options: ['Model one'] },
+    { kind: 'decision', modelKind: 'decision' as const, options: ['Decision one'] },
+  ])('offers a $kind model binding only models of its kind', async ({ modelKind, options }) => {
     await openModelPicker({
       ...BLUEPRINT,
       metadata: {
         ...BLUEPRINT.metadata,
-        bindings: { AI: { type: 'aiModel', title: 'Model', description: '', classifier } },
+        bindings: { AI: { type: 'aiModel', title: 'Model', description: '', modelKind } },
       },
     })
 

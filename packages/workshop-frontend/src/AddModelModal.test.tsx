@@ -100,8 +100,8 @@ describe('AddModelModal', () => {
     return { updateModel, addModel }
   }
 
-  // Onboarding picks the user's chat model, which a classifier can't be; the Providers page adds both.
-  it.each([false, true])('offers classifier models only without chatModelsOnly (chatModelsOnly: %s)', async (chatModelsOnly) => {
+  // Onboarding picks the user's chat model, which a decision model can't be; the Providers page adds both.
+  it.each([false, true])('offers decision models only without chatModelsOnly (chatModelsOnly: %s)', async (chatModelsOnly) => {
     await render({ type: 'add' }, chatModelsOnly)
     await click(document.body.querySelector<HTMLElement>('[role="combobox"]')!)
 
@@ -110,7 +110,7 @@ describe('AddModelModal', () => {
     expect(options.includes('Clef (Workers AI)')).toBe(!chatModelsOnly)
   })
 
-  it.each([false, true])('adds a classifier typed as a custom model only without chatModelsOnly (chatModelsOnly: %s)', async (chatModelsOnly) => {
+  it.each([false, true])('adds a decision model typed as a custom model only without chatModelsOnly (chatModelsOnly: %s)', async (chatModelsOnly) => {
     const { addModel } = await render({ type: 'add' }, chatModelsOnly)
     await choose('Other Cloudflare Workers AI...')
     await type(labeledInput('Model ID'), '@cf/cloudflare/clef')

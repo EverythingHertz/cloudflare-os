@@ -5,7 +5,7 @@ import { ConnectionConfigField } from './ConnectionConfigField'
 
 export interface AiModelConnectionConfigProps {
   chatModels: AiChatAuthorInfo[]
-  classifierModels: AiChatAuthorInfo[]
+  decisionModels: AiChatAuthorInfo[]
   selectedModelId: string | undefined
   onSelectedModelIdChange: (id: string | undefined) => void
   selectContainer?: PortalContainer
@@ -13,21 +13,21 @@ export interface AiModelConnectionConfigProps {
 
 export function AiModelConnectionConfig({
   chatModels,
-  classifierModels,
+  decisionModels,
   selectedModelId,
   onSelectedModelIdChange,
   selectContainer,
 }: AiModelConnectionConfigProps) {
   const groups = [
-    { label: 'Chat models', models: chatModels },
-    { label: 'Classifier models', models: classifierModels },
+    { label: 'Language models', models: chatModels },
+    { label: 'Decision models', models: decisionModels },
   ].filter(group => group.models.length > 0)
 
   return (
     <section className="grid gap-3">
       <ConnectionConfigField
         label="Model"
-        description="Chat models write text. Classifier models answer questions with probabilities."
+        description="Language models write text. Decision models answer questions with probabilities."
       >
         <Select
           aria-label="Select an AI model"
@@ -36,7 +36,7 @@ export function AiModelConnectionConfig({
           placeholder="Select an AI model"
           value={selectedModelId}
           onValueChange={(v) => onSelectedModelIdChange(v as string | undefined)}
-          renderValue={(id) => [...chatModels, ...classifierModels].find((m) => m.id === id)?.name ?? id}
+          renderValue={(id) => [...chatModels, ...decisionModels].find((m) => m.id === id)?.name ?? id}
         >
           {groups.map((group, index) => (
             <Fragment key={group.label}>

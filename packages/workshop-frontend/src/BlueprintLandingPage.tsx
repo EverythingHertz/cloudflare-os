@@ -68,7 +68,7 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
   const [bindingForm, setBindingForm] = useState<BindingFormState>({})
   const [draftAssignments, setDraftAssignments] = useState<Record<string, BlueprintBindingAssignment>>({})
   const [models, setModels] = useState<AiChatAuthorInfo[]>([])
-  const [classifierModels, setClassifierModels] = useState<AiChatAuthorInfo[]>([])
+  const [decisionModels, setDecisionModels] = useState<AiChatAuthorInfo[]>([])
   const [creating, setCreating] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [showLogin, setShowLogin] = useState(false)
@@ -146,12 +146,12 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
       authenticatedApi.listModels()
         .then(setModels)
         .catch(err => logRpcFailure('Failed to load models:', err))
-      authenticatedApi.listClassifierModels()
-        .then(setClassifierModels)
-        .catch(err => logRpcFailure('Failed to load classifier models:', err))
+      authenticatedApi.listModels('decision')
+        .then(setDecisionModels)
+        .catch(err => logRpcFailure('Failed to load decision models:', err))
     } else {
       setModels([])
-      setClassifierModels([])
+      setDecisionModels([])
     }
   }, [isAuthenticated, authenticatedApi])
 
@@ -388,10 +388,10 @@ export default function BlueprintLandingPage({ rpcStub }: Props) {
     )
   }, [accounts])
 
-  // A classifier binding takes a classifier model; every other model binding takes a chat model.
+  // A decision model binding takes a decision model; every other model binding takes a language model.
   const modelsFor = useCallback((binding: BlueprintBinding) =>
-    binding.type === 'aiModel' && binding.classifier ? classifierModels : models,
-  [models, classifierModels])
+    binding.type === 'aiModel' && binding.modelKind === 'decision' ? decisionModels : models,
+  [models, decisionModels])
 
   const getFirstUnresolvedBindingName = useCallback((assignments = draftAssignments) => {
     if (!blueprint) return null
@@ -1419,8 +1419,8 @@ function BindingField({
         </Select>
         {models.length === 0 && (
           <p className="text-xs text-kumo-subtle mt-1">
-            {binding.classifier
-              ? 'No classifier models are available yet. Add one (e.g. Clef) from AI Providers first.'
+            {binding.modelKind === 'decision'
+              ? 'No decision models are available yet. Add one (e.g. Clef) from AI Providers first.'
               : 'No AI models are available yet. Add a model from AI Providers first.'}
           </p>
         )}

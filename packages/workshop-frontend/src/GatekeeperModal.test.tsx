@@ -5,7 +5,7 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { RpcStub } from 'capnweb'
-import type { AiChatAuthorInfo, AuthenticatedApi, ConnectedAccountsSubscriber } from '@gadgets/workshop-shared/api'
+import type { AiChatAuthorInfo, AuthenticatedApi, ConnectedAccountsSubscriber, ModelKind } from '@gadgets/workshop-shared/api'
 
 const testState = vi.hoisted(() => ({
   authenticatedApi: null as RpcStub<AuthenticatedApi> | null,
@@ -68,13 +68,12 @@ function subscription() {
 }
 
 const CHAT_MODEL: AiChatAuthorInfo = { type: 'agent', id: 'chat-model', name: 'Chat model' }
-const CLASSIFIER_MODEL: AiChatAuthorInfo = { type: 'agent', id: 'classifier-model', name: 'Classifier model' }
+const DECISION_MODEL: AiChatAuthorInfo = { type: 'agent', id: 'decision-model', name: 'Decision model' }
 
 function authenticatedApi(): RpcStub<AuthenticatedApi> {
   const vendor = { displayName: 'Service catalog', url: 'https://catalog.example.com/' }
   return {
-    listModels: async () => [CHAT_MODEL],
-    listClassifierModels: async () => [CLASSIFIER_MODEL],
+    listModels: async (kind?: ModelKind) => kind === 'decision' ? [DECISION_MODEL] : [CHAT_MODEL],
     listGatekeeperVendors: async () => [{
       id: 'catalog',
       description: vendor,
@@ -141,11 +140,11 @@ describe('GatekeeperModal configurator readiness', () => {
 })
 
 describe('GatekeeperModal model pickers', () => {
-  // A classifier can back an AI Model binding but can't run an agent. The AI Model picker labels
+  // A decision model can back an AI Model binding but can't run an agent. The AI Model picker labels
   // each model with its kind.
   it.each([
     { groupKey: 'platform:ai-model', picker: 'Select an AI model',
-      options: ['Chat models: Chat model', 'Classifier models: Classifier model'] },
+      options: ['Language models: Chat model', 'Decision models: Decision model'] },
     { groupKey: 'platform:agent-spawner', picker: 'Agent model', options: ['None (no agent)', 'Chat model'] },
   ])('offers $options in the $groupKey picker', async ({ groupKey, picker, options }) => {
     await renderModal()

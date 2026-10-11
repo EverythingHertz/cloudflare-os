@@ -5,11 +5,12 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type * as Kumo from '@cloudflare/kumo'
-import type { AiChatAuthorInfo } from '@gadgets/workshop-shared/api'
+import type { AiChatAuthorInfo, ModelKind } from '@gadgets/workshop-shared/api'
 
 const api = vi.hoisted(() => ({
-  listModels: vi.fn<() => Promise<AiChatAuthorInfo[]>>(async () => [{ type: 'agent', id: 'chat-model', name: 'Chat model' }]),
-  listClassifierModels: async () => [{ type: 'agent', id: 'classifier-model', name: 'Classifier model' }],
+  listModels: vi.fn<(kind?: ModelKind) => Promise<AiChatAuthorInfo[]>>(async (kind) => kind === 'decision'
+    ? [{ type: 'agent', id: 'decision-model', name: 'Decision model' }]
+    : [{ type: 'agent', id: 'chat-model', name: 'Chat model' }]),
   getQuickModel: async () => null,
   getAiConfig: async () => ({ enabled: false }),
   setQuickModel: vi.fn<(modelId: string | null) => Promise<void>>(async () => {}),
@@ -59,27 +60,27 @@ describe('ProvidersPage quick model', () => {
     document.body.appendChild(container)
     root = createRoot(container)
     await act(async () => root!.render(<ProvidersPage />))
-    await vi.waitFor(() => expect(document.body.textContent).toContain('Classifier model'))
+    await vi.waitFor(() => expect(document.body.textContent).toContain('Decision model'))
   }
 
-  // A classifier quick model would fail every title and binding-name request it was given.
-  it('can be any chat model but never a classifier', async () => {
+  // A decision model as quick model would fail every title and binding-name request it was given.
+  it('can be any language model but never a decision model', async () => {
     await renderPage()
     expect(document.body.textContent).toContain('Quick model:')
 
-    expect(nameOf('Classifier model').closest('[role="button"]')).toBeNull()
-    await act(async () => nameOf('Classifier model').click())
+    expect(nameOf('Decision model').closest('[role="button"]')).toBeNull()
+    await act(async () => nameOf('Decision model').click())
     expect(api.setQuickModel).not.toHaveBeenCalled()
     await act(async () => nameOf('Chat model').closest<HTMLElement>('[role="button"]')!.click())
     expect(api.setQuickModel).toHaveBeenCalledWith('chat-model')
 
-    const [chatMenu, classifierMenu] = document.body.querySelectorAll<HTMLElement>('[aria-label="Provider actions"]')
+    const [chatMenu, decisionMenu] = document.body.querySelectorAll<HTMLElement>('[aria-label="Provider actions"]')
     expect(await menuItems(chatMenu)).toContain('Clear quick model')
-    expect(await menuItems(classifierMenu)).not.toContainEqual(expect.stringContaining('quick model'))
+    expect(await menuItems(decisionMenu)).not.toContainEqual(expect.stringContaining('quick model'))
   })
 
   // Reachable by finishing onboarding without a model, then adding Clef for a blueprint.
-  it('offers no quick model when only classifiers are configured', async () => {
+  it('offers no quick model when only decision models are configured', async () => {
     api.listModels.mockResolvedValueOnce([])
     await renderPage()
     expect(document.body.textContent).not.toContain('Quick model:')

@@ -27,7 +27,7 @@ const PRIMARY_BTN =
 
 // Rows mirror the Blueprints list: a clickable row (here, clicking sets/clears the quick model)
 // plus a kebab for the rest. The whole row is the primary affordance, so it shows a pointer. A
-// classifier model can't be the quick model, so its row has no primary affordance.
+// decision model can't be the quick model, so its row has no primary affordance.
 function ModelRow({
   model,
   isQuick,
@@ -153,7 +153,7 @@ function ProvidersPage() {
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
   const [chatModels, setChatModels] = useState<AiChatAuthorInfo[]>([])
-  const [classifierModels, setClassifierModels] = useState<AiChatAuthorInfo[]>([])
+  const [decisionModels, setDecisionModels] = useState<AiChatAuthorInfo[]>([])
   const [quickModel, setQuickModel] = useState<string | null>(null)
   const [aiConfig, setAiConfig] = useState<AiGatewayInfo | null>(null)
   const [search, setSearch] = useState('')
@@ -167,14 +167,14 @@ function ProvidersPage() {
   const fetchAll = async () => {
     setLoadError(false)
     try {
-      const [chatList, classifierList, qm, cfg] = await Promise.all([
+      const [chatList, decisionList, qm, cfg] = await Promise.all([
         authenticatedApi.listModels(),
-        authenticatedApi.listClassifierModels(),
+        authenticatedApi.listModels('decision'),
         authenticatedApi.getQuickModel(),
         authenticatedApi.getAiConfig(),
       ])
       setChatModels(chatList)
-      setClassifierModels(classifierList)
+      setDecisionModels(decisionList)
       setQuickModel(qm)
       setAiConfig(cfg)
       // Each dialog saves a model of the user's own, so none stays open, or opens late, once the
@@ -197,7 +197,7 @@ function ProvidersPage() {
   const gatewayMode = aiConfig?.enabled === true
   // False only on an AI Gateway deployment whose administrator turned adding models off.
   const canAddModels = aiConfig?.enabled !== true || aiConfig.userModelsEnabled
-  const models = [...chatModels, ...classifierModels]
+  const models = [...chatModels, ...decisionModels]
   // Only a chat model can be the quick model, so the quick-model notice needs one.
   const hasChatModel = chatModels.length > 0
 
@@ -386,7 +386,7 @@ function ProvidersPage() {
                 onEdit={() => openWithSource('edit', model)}
                 onClone={() => openWithSource('clone', model)}
                 onDelete={() => handleDelete(model)}
-                onSetQuick={classifierModels.includes(model) ? undefined : () => handleSetQuick(model.id)}
+                onSetQuick={decisionModels.includes(model) ? undefined : () => handleSetQuick(model.id)}
               />
             </div>
           ))
