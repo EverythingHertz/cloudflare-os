@@ -40,6 +40,7 @@ One per connected account, named by its `UserAccount` id; see `src/gitlab-hooks.
 |---|---|---|
 | `account` | `string` | The `UserAccount` id, whose token adds and deletes the webhooks; kept, once the account is disconnected, until the last of them is gone. |
 | `webhook:<projectId>` | `{ id, project: { id, path } }` | The webhook this driver added to the project, keyed by the project's numeric id, from when its first hook is enabled until GitLab has deleted it, once its last is disabled or the account disconnected, or can't: the hourly check, and another disconnect, try again meanwhile. Kept through the replacement of one GitLab disabled for good, until the new one takes its place. |
+| `unrecorded:<projectId>` | `{ project: { id, path }, url }` | Written as GitLab is asked to add or change the project's webhook, and deleted once its id is recorded: should GitLab's answer be lost, the webhooks at `url` are found by it and deleted, as the account is disconnected or, while no hook needs them, at the hourly check. |
 | `secret:<projectId>` | `string` | The signing token the project's webhook signs its deliveries with: `whsec_` and the base64 of a 32-byte key (Standard Webhooks). Each project's is its own, so a delivery is verified as from the project it names. Recorded before the webhook is added, and deleted as the project's last hook is disabled. |
 | `checkAt` | `number` | When to next check the webhooks on GitLab, hourly while there are any. |
 | `resendFrom` | `number` | The project id the next check's share of resends starts with: the one after the last the previous check served. |
@@ -47,4 +48,4 @@ One per connected account, named by its `UserAccount` id; see `src/gitlab-hooks.
 | `caps:<hookKey>` | `{ delivery, initiator }` | The facet's persistent delivery stub and the Workshop's `HookInitiator`. |
 | `msg:<hookKey>:<webhookId>` | kit `HookDeliveryQueue` row | An event pending delivery to one hook, or a finished one kept for a day, named by the delivery's signed `webhook-id`, so GitLab's retries and resends of it collapse. |
 | `queue:due:…`, `queue:finished:…`, `queue:indexed` | kit `HookDeliveryQueue` indexes | Those rows by when each pending one is next due and when each finished one finished, which the dedupe window counts from: all a run reads. |
-| `revoked` | `true` | Set, with every key but `account` and `webhook:` deleted, once the account is disconnected. |
+| `revoked` | `true` | Set, with every key but `account`, `webhook:` and `unrecorded:` deleted, once the account is disconnected. |

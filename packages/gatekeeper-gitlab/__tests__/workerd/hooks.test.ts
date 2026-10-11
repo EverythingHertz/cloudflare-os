@@ -239,6 +239,8 @@ class FakeGitLabHooks {
   /** While set, adding a webhook stalls, counted in `stalledCreates`, polled as `stallDeletes` is. */
   stallCreates = false;
   stalledCreates = 0;
+  /** While set, GitLab adds a webhook but its answer is lost, as when the connection drops. */
+  loseCreateAnswers = false;
   #nextId = 100;
 
   constructor() {
@@ -289,6 +291,7 @@ class FakeGitLabHooks {
         if (this.failCreatesWith !== undefined) return json({ message: "Server Error" }, { status: this.failCreatesWith });
         const webhook = this.#configured(hookIds(request).projectId, this.#nextId++, request.body!);
         this.webhooks.set(webhook.id, webhook);
+        if (this.loseCreateAnswers) throw new TypeError("Network connection lost.");
         return json(this.#reported(webhook), { status: 201 });
       })
       .on("GET", new RegExp(`${ANY_HOOKS}/(\\d+)$`), request => {
@@ -1750,6 +1753,24 @@ it.each<[string, number | undefined]>([
   }
   expect(gitlab.webhooks.size).toBe(0);
   expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
+});
+
+it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promise<unknown>]>([
+  ["as the account is disconnected", async (account, triage) => unwrap(await triage.hooks.revokeAccount(account))],
+  ["at the next hourly check", account => after(HOUR, account)],
+])("deletes %s a webhook GitLab added for an enable whose answer was lost", async (_, cleanUp) => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+
+  gitlab.loseCreateAnswers = true;
+  await expect(triage.enable()).rejects.toThrow("Network connection lost.");
+  expect(gitlab.webhooks.size).toBe(1);
+  gitlab.loseCreateAnswers = false;
+  await cleanUp(account, triage);
+  expect(gitlab.webhooks.size).toBe(0);
 });
 
 it("deletes a disconnected account's webhooks and delivers nothing more", async () => {
