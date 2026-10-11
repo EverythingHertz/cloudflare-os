@@ -43,7 +43,7 @@ One per connected account, named by its `UserAccount` id; see `src/gitlab-hooks.
 | `secret:<projectId>` | `string` | The signing token the project's webhook signs its deliveries with: `whsec_` and the base64 of a 32-byte key (Standard Webhooks). Each project's is its own, so a delivery is verified as from the project it names. Recorded before the webhook is added, and deleted as the project's last hook is disabled. |
 | `checkAt` | `number` | When to next check the webhooks on GitLab, hourly while there are any. |
 | `resendFrom` | `number` | The project id the next check's share of resends starts with: the one after the last the previous check served. |
-| `reg:<hookKey>` | `{ project, target?, events, viewerId }` | What one enabled hook watches: its project, the issue or merge request it is narrowed to, its event kinds, and the account's GitLab user id when it was subscribed, used only when the account can't say who it is now. |
+| `reg:<hookKey>` | `{ project, target?, events }` | What one enabled hook watches: its project, the issue or merge request it is narrowed to, and its event kinds. |
 | `caps:<hookKey>` | `{ delivery, initiator }` | The facet's persistent delivery stub and the Workshop's `HookInitiator`. |
 | `msg:<hookKey>:<webhookId>` | kit `HookDeliveryQueue` row | An event pending delivery to one hook, or a finished one kept for a day, named by the delivery's signed `webhook-id`, so GitLab's retries and resends of it collapse. |
 | `queue:due:…`, `queue:finished:…`, `queue:indexed` | kit `HookDeliveryQueue` indexes | Those rows by when each pending one is next due and when each finished one finished, which the dedupe window counts from: all a run reads. |

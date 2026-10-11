@@ -74,11 +74,6 @@ export type GitLabHookProps = GitLabHookParams & {
   userObjectId: string;
   project: GitLabProjectPin;
   events: GitLabEventKind[];
-  /**
-   * The connected account's GitLab user id when the hook was subscribed, whose own comments and
-   * reviews are not delivered, should the account be unable to say who it is now.
-   */
-  viewerId: number;
   delivery: RpcStub<GitLabHookDelivery>;
 };
 
@@ -305,13 +300,23 @@ export class GitLabHookDriver extends DurableObject<Env> {
     if (!parsed) return 204;
     const { event, senderId } = parsed;
     // The account's own comments and reviews are skipped as whoever it is now, after a reconnect as
-    // another GitLab user too.
-    const viewerId = event.kind === "comment" || event.kind === "review"
-      ? await this.#viewerId(kv.get<string>("account")!) : undefined;
+    // another GitLab user too, which the account is asked only when a hook watches for them.
+    let viewerId: number | undefined;
+    if ((event.kind === "comment" || event.kind === "review") &&
+        this.#registrations({ id: projectId }).some(([, registration]) => registration.events.includes(event.kind))) {
+      const { UserAccount } = this.ctx.exports;
+      try {
+        viewerId = (await UserAccount.get(UserAccount.idFromString(kv.get<string>("account")!)).getUser()).id;
+      } catch (error) {
+        // Refused, for the hourly check to have GitLab resend it once the account can say.
+        logger.warn("failed to read who a GitLab account is", { event: "hooks.viewer.read.failed", error });
+        return 503;
+      }
+    }
     const now = Date.now();
     let queued = false;
     for (const [regKey, registration] of this.#registrations({ id: projectId })) {
-      if (!watches(registration, event, senderId, viewerId ?? registration.viewerId)) continue;
+      if (!watches(registration, event, senderId, viewerId)) continue;
       this.#queue.enqueue(regKey.slice("reg:".length), delivery.id, event, now);
       queued = true;
     }
@@ -528,20 +533,6 @@ export class GitLabHookDriver extends DurableObject<Env> {
     if (this.ctx.storage.kv.get<Webhook>(webhookKey(project.id))?.id === id) this.ctx.storage.kv.delete(webhookKey(project.id));
   }
 
-  /**
-   * The GitLab user the account now is, whose own comments and reviews its hooks skip, which the
-   * account reads afresh once reconnected; undefined if it can't say.
-   */
-  async #viewerId(account: string): Promise<number | undefined> {
-    const { UserAccount } = this.ctx.exports;
-    try {
-      return (await UserAccount.get(UserAccount.idFromString(account)).getUser()).id;
-    } catch (error) {
-      logger.warn("failed to read who a GitLab account is", { event: "hooks.viewer.read.failed", error });
-      return undefined;
-    }
-  }
-
   #api<T>(account: string, fn: (api: GitLabApi) => Promise<T>): Promise<T> {
     const { UserAccount } = this.ctx.exports;
     return withAccountApi(this.env, UserAccount.get(UserAccount.idFromString(account)), fn);
@@ -591,18 +582,18 @@ export class GitLabHookDriver extends DurableObject<Env> {
 }
 
 /**
- * Whether a hook on the event's project watches for it, the account being GitLab user `viewerId`.
- * The facet re-checks the binding's scope at delivery.
+ * Whether a hook on the event's project watches for it, the account being GitLab user `viewerId`,
+ * which a comment or review needs. The facet re-checks the binding's scope at delivery.
  */
 function watches({ target, events }: Registration, event: GitLabWebhookEvent,
-                 senderId: number | undefined, viewerId: number): boolean {
+                 senderId: number | undefined, viewerId: number | undefined): boolean {
   if (!events.includes(event.kind)) return false;
   if (target !== undefined &&
       !("target" in event && event.target.kind === target.kind && event.target.iid === target.iid)) {
     return false;
   }
   // Never hand the account's own comments and reviews back to it, which a hook would answer.
-  return !((event.kind === "comment" || event.kind === "review") && senderId === viewerId);
+  return !((event.kind === "comment" || event.kind === "review") && senderId !== undefined && senderId === viewerId);
 }
 
 /** The webhook triggers GitLab must deliver for `registrations`. */

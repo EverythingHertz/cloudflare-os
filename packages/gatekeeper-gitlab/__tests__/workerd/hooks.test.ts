@@ -620,6 +620,37 @@ it("skips the comments of the GitLab user its account is now, after reconnecting
   })]);
 });
 
+it("refuses an approval while its reconnected account can't say who it is, and takes GitLab's resend once it can", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe({ events: ["review"] });
+  await triage.enable();
+  const { at, alarm } = clock(account);
+
+  // Reconnected, now as Bob, whom GitLab fails to name for a while.
+  let named = false;
+  gitlab.gitlab
+    .on("POST", /^\/oauth\/token$/, () => json(tokenResponse(1)))
+    .on("GET", /^\/api\/v4\/user$/, () => named
+      ? json({ ...BOB, web_url: `${WEB}/bob`, confirmed_at: CREATED })
+      : json({ message: "500 Internal Server Error" }, { status: 500 }));
+  await hooks().installCallback(account);
+  await runInDurableObject(env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account)), async instance => {
+    await instance.commitReconnect(await stageReconnect(instance, "code-1"));
+  });
+
+  // Bob's own approval, which the hook mustn't be handed, and Ada's, which it is.
+  await at(0, async () => {
+    expect(await gitlab.deliver("Merge Request Hook", mergeRequestHook("approval", 7, {}, {}, BOB))).toEqual([503]);
+    expect(await gitlab.deliver("Merge Request Hook", mergeRequestHook("approval", 7, {}, {}, ADA))).toEqual([503]);
+  });
+  named = true;
+  await at(HOUR, alarm);
+  expect(gitlab.resends).toHaveLength(2);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({ kind: "review", actor: expect.objectContaining({ username: "ada" }) })]);
+});
+
 it("queues a hook's writes on its firing, and never hands the account its own comments or reviews", async () => {
   const gitlab = new FakeGitLabHooks();
   const account = await connectAccount();

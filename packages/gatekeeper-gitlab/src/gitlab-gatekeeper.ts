@@ -1386,8 +1386,7 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       }
       watched = { kind: target.kind, iid };
     }
-    const [version, projectId, viewer] = await Promise.all([
-      this.#getVersion(), this.#getProjectId(), this.#getViewer()]);
+    const [version, projectId] = await Promise.all([this.#getVersion(), this.#getProjectId()]);
     if (!supportsSigningTokens(version)) {
       throw new Error(`GitLab hooks need GitLab 19.0 or later, which signs webhook deliveries, and ${this.#instanceUrl()} ` +
         `runs ${version}.`);
@@ -1409,7 +1408,6 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       userObjectId: this.#props().userObjectId,
       project: { id: projectId, path },
       events,
-      viewerId: viewer.id,
       delivery,
     } });
     const where = watched === undefined
