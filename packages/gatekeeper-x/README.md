@@ -78,7 +78,8 @@ They are off until the deployment sets both of these on the worker, outside the 
 
 - `WEBHOOK_ORIGIN`: the deployment's public https origin, with no port (X refuses ports). Behind
   Cloudflare Access, add a bypass for `/gatekeeper/x/webhook`, which X calls directly; every
-  delivery is verified against the app's client secret.
+  delivery is verified against the app's client secret, and a challenge that would pass as a
+  delivery is refused, since X's challenge answer is the same signature.
 - `X_APP_BEARER_TOKEN` (a secret): the X app's app-only bearer token, from the Developer Console's
   "Keys and tokens". X's webhook endpoints take only that token, and it subscribes to watched users'
   public posts.

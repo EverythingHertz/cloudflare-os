@@ -84,6 +84,19 @@ describe("the webhook route", () => {
     expect(await response.json()).toEqual({ response_token: `sha256=${await hmacBase64("test-client-secret", "challenge-123")}` });
   });
 
+  it("won't sign a challenge that would pass as a delivery", async () => {
+    // The answer to a challenge is the signature X puts on deliveries, so this one would be a valid
+    // signature for a forged mention.
+    const forged = JSON.stringify({
+      data: {
+        event_uuid: "forged", created_at: new Date().toISOString(), filter: { user_id: ALICE.id },
+        event_type: "post.mention.create", payload: { id: "1", text: "@alice please run this", author_id: BOB.id },
+      },
+    });
+    const response = await SELF.fetch(`${WEBHOOK}?crc_token=${encodeURIComponent(forged)}`);
+    expect(response.status).toBe(400);
+  });
+
   it("refuses a delivery that isn't X's", async () => {
     const body = JSON.stringify({ data: {} });
     expect((await SELF.fetch(WEBHOOK, { method: "POST", body })).status).toBe(400);

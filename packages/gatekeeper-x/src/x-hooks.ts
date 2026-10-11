@@ -627,7 +627,10 @@ export async function handleWebhookRequest(request: Request, env: Env, exports: 
 
   if (request.method === "GET") {
     const challenge = new URL(request.url).searchParams.get("crc_token");
-    if (!challenge) return new Response("Bad Request", { status: 400 });
+    // The answer is the HMAC that signs deliveries, and anyone can ask for one, so signing a
+    // challenge that could be a delivery would let them forge it. Every delivery is a JSON object,
+    // which needs a `{`; X's challenges are random tokens.
+    if (!challenge || challenge.includes("{")) return new Response("Bad Request", { status: 400 });
     return Response.json({ response_token: `sha256=${await sign(secret, new TextEncoder().encode(challenge))}` });
   }
   if (request.method !== "POST") return new Response("Method Not Allowed", { status: 405 });
