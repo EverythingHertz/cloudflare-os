@@ -131,6 +131,8 @@ What this relies on GitHub for is checked against GitHub itself by `pnpm test:co
 repository:
 - a reader without access gets a 404, whatever ETag it sends;
 - a redelivery uses the webhook's current URL, encoding and secret;
+- a second webhook at a URL one delivers to is refused, so the worker adopts one an earlier attempt
+  left there;
 - the delivery log is newest first;
 - the account is the sender of what it does;
 - each event's payload parses.

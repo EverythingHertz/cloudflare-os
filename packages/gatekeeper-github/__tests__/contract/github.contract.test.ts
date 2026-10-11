@@ -7,8 +7,9 @@
 //
 // CONTRACT_GITHUB_OUTSIDER_TOKEN, a token that can't read the repository (the workflow passes its
 // own), adds the access check. CONTRACT_GITHUB_WEBHOOK_URL is where the webhooks deliver,
-// https://example.com/webhook unless set: nothing has to answer, since GitHub's delivery log
-// records each request whatever the answer. CONTRACT_GITHUB_PAYLOADS_DIR, if set, receives each
+// https://example.com/webhook unless set, each with a query of its own, as GitHub refuses a second
+// webhook at one URL: nothing has to answer, since GitHub's delivery log records each request
+// whatever the answer. CONTRACT_GITHUB_PAYLOADS_DIR, if set, receives each
 // payload GitHub sent, with the account's and repository's names replaced, for fixtures.
 
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
@@ -36,6 +37,8 @@ type Delivery = DeliverySummary & {
 
 const sign = (secret: string, body: string) => `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
 const newSecret = () => randomBytes(32).toString("hex");
+/** A URL for one webhook alone, as GitHub refuses a second webhook at a URL one delivers to. */
+const newUrl = () => `${receiver}?contract=${randomUUID()}`;
 const header = (delivery: Delivery, name: string) => Object.entries(delivery.request.headers)
   .find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
 
@@ -78,7 +81,7 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
   let viewer: GitHubSimpleUser;
 
   /** A webhook made as the gatekeeper makes one, deleted after the checks. */
-  async function webhook(events: string[], secret = newSecret(), url = receiver) {
+  async function webhook(events: string[], secret = newSecret(), url = newUrl()) {
     const made = await api.createRepoWebhook(repository.id, { url, secret, events });
     cleanups.push(() => api.deleteRepoWebhook(repository.id, made.id));
     return { id: made.id, secret };
@@ -169,13 +172,13 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
   });
 
   it("redelivers with the webhook's URL, encoding and secret as they are now, not as they were", async () => {
-    const was = { secret: newSecret(), url: `${receiver}?contract=was` };
-    const now = { secret: newSecret(), url: `${receiver}?contract=now` };
+    const secrets = { was: newSecret(), now: newSecret() };
+    const urls = { json: { was: newUrl(), now: newUrl() }, form: { was: newUrl(), now: newUrl() } };
     // One webhook sending JSON, and one sending forms, as someone may have switched it to.
-    const json = await webhook(["issues"], was.secret, was.url);
+    const json = await webhook(["issues"], secrets.was, urls.json.was);
     const form = await github<{ id: number }>("POST", `${repoPath}/hooks`, {
       name: "web", active: true, events: ["issues"],
-      config: { url: was.url, secret: was.secret, content_type: "form", insecure_ssl: "0" },
+      config: { url: urls.form.was, secret: secrets.was, content_type: "form", insecure_ssl: "0" },
     });
     cleanups.push(() => api.deleteRepoWebhook(repository.id, form.id));
     const issue = await openIssue();
@@ -184,20 +187,29 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
     expect(header(formFirst, "Content-Type")).toBe("application/x-www-form-urlencoded");
 
     // Repaired as the gatekeeper's hourly check repairs a webhook, then redelivered.
-    for (const id of [json.id, form.id]) await api.updateRepoWebhook(repository.id, id, { ...now, events: ["issues"] });
+    await api.updateRepoWebhook(repository.id, json.id, { url: urls.json.now, secret: secrets.now, events: ["issues"] });
+    await api.updateRepoWebhook(repository.id, form.id, { url: urls.form.now, secret: secrets.now, events: ["issues"] });
     await api.redeliverRepoWebhookDelivery(repository.id, json.id, jsonFirst.id);
     await api.redeliverRepoWebhookDelivery(repository.id, form.id, formFirst.id);
     const jsonAgain = await delivery(json.id, "issues", found => found.guid === jsonFirst.guid, true);
     const formAgain = await delivery(form.id, "issues", found => found.guid === formFirst.guid, true);
-    expect([jsonAgain.url, formAgain.url]).toEqual([now.url, now.url]);
+    expect([jsonAgain.url, formAgain.url]).toEqual([urls.json.now, urls.form.now]);
     expect(header(formAgain, "Content-Type")).toBe("application/json");
     // The same payload under the same secret would carry the same signature.
     const signature = header(jsonFirst, "X-Hub-Signature-256");
     expect(header(jsonAgain, "X-Hub-Signature-256")).not.toBe(signature);
     // Where the log's payload re-serializes to the bytes GitHub signed, the new secret can be named.
-    if (signature === sign(was.secret, JSON.stringify(jsonFirst.request.payload))) {
-      expect(header(jsonAgain, "X-Hub-Signature-256")).toBe(sign(now.secret, JSON.stringify(jsonAgain.request.payload)));
+    if (signature === sign(secrets.was, JSON.stringify(jsonFirst.request.payload))) {
+      expect(header(jsonAgain, "X-Hub-Signature-256")).toBe(sign(secrets.now, JSON.stringify(jsonAgain.request.payload)));
     }
+  });
+
+  it("refuses a second webhook at a URL one delivers to, which the gatekeeper adopts rather than adds", async () => {
+    const url = newUrl();
+    await webhook(["issues"], newSecret(), url);
+    const second = api.createRepoWebhook(repository.id, { url, secret: newSecret(), events: ["issues"] })
+      .then(made => cleanups.push(() => api.deleteRepoWebhook(repository.id, made.id)));
+    await expect(second).rejects.toMatchObject({ status: 422 });
   });
 
   it("lists a webhook's deliveries newest first, the gatekeeper paging through them as it does", async () => {
