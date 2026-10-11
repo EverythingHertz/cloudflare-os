@@ -569,6 +569,33 @@ it("keeps the subscription an enable creates while a renewal of the expired one 
   expect((await ada.hooks.readHook()).received).toHaveLength(1);
 });
 
+it("keeps the subscription an enable makes while the alarm renewing another was to drop the one it replaced", async () => {
+  const google = mockGoogle();
+  const ada = await connect("ada");
+  const bob = await connect("bob");
+  await ada.hooks.chatEnableHook();
+  await bob.hooks.chatEnableHook();
+  await bob.hooks.chatDisableHook();
+  google.stallGet = {started: false, released: false};
+
+  // Ada's subscription is due for renewal, and Bob's, which no hook uses, has expired. Bob enables
+  // again while the alarm's renewal of Ada's waits on Google, before it comes to Bob's.
+  vi.setSystemTime(Date.now() + 4 * 3_600_000);
+  try {
+    const alarm = runDurableObjectAlarm(driver());
+    await vi.waitFor(() => expect(google.stallGet!.started).toBe(true));
+    await bob.hooks.chatEnableHook();
+    google.stallGet.released = true;
+    await alarm;
+  } finally {
+    vi.useRealTimers();
+  }
+
+  expect(await push("bob", [chatMessage("carol")])).toBe(204);
+  await deliver();
+  expect((await bob.hooks.readHook()).received).toHaveLength(1);
+});
+
 it("renews at once a subscription that a re-enabled hook finds past its renewal time", async () => {
   mockGoogle();
   const ada = await connect("ada");

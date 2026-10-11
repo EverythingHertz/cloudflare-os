@@ -180,13 +180,15 @@ export class ChatHookDriver extends DurableObject<Env> {
     await this.#trackAccounts();
     const now = Date.now();
     await this.#queue.run(now, (hookKey, message) => this.#deliver(hookKey, message));
-    const registrations = [...this.#registrations()].map(([, registration]) => registration);
     // Listed up front: a request handled while a renewal awaits may list too, which would
-    // invalidate a live iterator.
-    const subscriptions = [...this.ctx.storage.kv.list<Subscription>({ prefix: "sub:" })];
-    for (const [key, subscription] of subscriptions) {
+    // invalidate a live iterator. Each is read again in its turn, as an enable handled meanwhile
+    // may have subscribed again, or come to use it.
+    const keys = [...this.ctx.storage.kv.list<Subscription>({ prefix: "sub:" })].map(([key]) => key);
+    for (const key of keys) {
+      const subscription = this.ctx.storage.kv.get<Subscription>(key);
+      if (!subscription) continue;
       const authority = key.slice("sub:".length);
-      const registration = registrations.find(candidate => candidate.authority === authority);
+      const registration = [...this.#registrations()].find(([, candidate]) => candidate.authority === authority)?.[1];
       if (!registration) {
         // Unused subscriptions simply lapse.
         if (subscription.expireTime <= now) this.ctx.storage.kv.delete(key);
