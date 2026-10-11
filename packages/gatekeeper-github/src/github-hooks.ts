@@ -62,11 +62,6 @@ export type GitHubHookProps = GitHubHookParams & {
   userObjectId: string;
   repo: PinnedRepo;
   events: GitHubEventKind[];
-  /**
-   * The connected account's GitHub user id when the hook was subscribed, whose own comments and
-   * reviews are not delivered, until the driver has read who the account is now.
-   */
-  viewerId: number;
   delivery: RpcStub<GitHubHookDelivery>;
 };
 
@@ -295,10 +290,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
     }
     if (parsed.at < now - DELIVERED_RETENTION_MS) return 204;
     const { event, senderId } = parsed;
-    const viewerId = kv.get<number>("viewer");
+    // Read before any hook is registered (see register()), and kept until the account disconnects.
+    const viewerId = kv.get<number>("viewer")!;
     let queued = false;
     for (const [regKey, registration] of this.#registrations({ id: repoId })) {
-      if (!watches(registration, event, senderId, viewerId ?? registration.viewerId)) continue;
+      if (!watches(registration, event, senderId, viewerId)) continue;
       this.#queue.enqueue(regKey.slice("reg:".length), id, event, now);
       queued = true;
     }

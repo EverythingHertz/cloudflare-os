@@ -3766,8 +3766,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     const pin = await this.#pinnedRepo();
     if (!pin) throw new Error(`Failed to look up ${owner}/${repo} on GitHub. Please try again.`);
-    const [{ permissions }, { user: viewer }] = await this.#readApi(api =>
-      Promise.all([api.getRepo(owner, repo), api.getViewer()]));
+    const { permissions } = await this.#readApi(api => api.getRepo(owner, repo));
     if (!permissions?.admin) {
       throw new Error(`GitHub delivers events to a webhook, which only an admin of ${owner}/${repo} ` +
         "can add, and the connected account is not one.");
@@ -3781,7 +3780,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       userObjectId,
       repo: pin,
       events,
-      viewerId: viewer.id,
       delivery,
     } });
     const watched = number === undefined
