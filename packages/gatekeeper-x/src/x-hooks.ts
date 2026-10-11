@@ -454,8 +454,10 @@ export class XActivityRouter extends DurableObject<Env> {
     const kv = this.ctx.storage.kv;
     try {
       if (kv.get<Subscription>(subscriptionKey(eventType)) === undefined) {
+        // Dated when X was asked: a revocation after then may have deleted it before X answered.
+        const at = Date.now();
         const id = await findSubscription(this.env, eventType, userId);
-        if (id !== undefined) kv.put<Subscription>(subscriptionKey(eventType), { id, at: Date.now() });
+        if (id !== undefined) kv.put<Subscription>(subscriptionKey(eventType), { id, at });
       }
       kv.delete(unconfirmedKey(eventType));
     } catch (error) {

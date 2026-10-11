@@ -267,6 +267,42 @@ describe("subscribing", () => {
       expect(state.storage.kv.get("sub:post.mention.create")).toBeDefined());
   });
 
+  it("dates a subscription the alarm recovers by when it asked X, before a revocation landing meanwhile", async () => {
+    const { x, account } = await watchingMentions();
+    // A revocation forgets the subscription, though the hook still watches...
+    const router = env.X_ACTIVITY_ROUTER.getByName(ALICE.id);
+    for (const [id, subscription] of x.subscriptions) if (subscription.by === ALICE.id) x.subscriptions.delete(id);
+    await router.revoked(Date.now());
+    // ...and another hook's new subscription is made with its answer lost, and not listed at first.
+    x.loseAnswer("POST", /^\/2\/activity\/subscriptions$/, request => JSON.parse(request.body!).event_type === "post.mention.create");
+    let listing: "empty" | "held" = "empty";
+    let held = false;
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    x.on("GET", /^\/2\/activity\/subscriptions/, async () => {
+      if (listing === "empty") return json({ data: [] });
+      // The alarm's look: X lists the subscription as it is, but answers after a revocation deleted it.
+      const snapshot = { data: [...x.subscriptions.values()] };
+      held = true;
+      await released;
+      return json(snapshot);
+    });
+    const another = binding({ userObjectId: account, resourceKind: "account" });
+    await another.subscribe([["subscribeMentions"]]);
+    failure(await another.tryEnable());
+    listing = "held";
+    const alarming = runDurableObjectAlarm(router);
+    await vi.waitFor(() => expect(held).toBe(true));
+    for (const [id, subscription] of x.subscriptions) if (subscription.by === ALICE.id) x.subscriptions.delete(id);
+    const revoking = router.revoked(Date.now());
+    await new Promise(resolve => setTimeout(resolve, 20));
+    release();
+    await alarming;
+    await revoking;
+    await runInDurableObject(router, (_instance, state) =>
+      expect(state.storage.kv.get("sub:post.mention.create")).toBeUndefined());
+  });
+
   it("keeps deleting a subscription X failed to delete, though an earlier revocation is delivered again", async () => {
     const { x, hook } = await watchingMentions();
     const revocation = { id: "revoke-1", createdAt: new Date(Date.now() - 1000).toISOString() };
