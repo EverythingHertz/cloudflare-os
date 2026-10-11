@@ -138,6 +138,8 @@ class FakeGitHub {
   /** While set, a webhook DELETE fails with this status; with `deleteDespiteFailure`, once it has deleted the webhook, as when its answer is lost. */
   failDeletesWith: number | undefined;
   deleteDespiteFailure = false;
+  /** Headers a failed DELETE is answered with, such as a rate limit's. */
+  failDeletesHeaders: Record<string, string> = {};
   /** While set, adding a webhook stalls, counted in `stalledCreates`, polled as `stallDeletes` is. */
   stallCreates = false;
   stalledCreates = 0;
@@ -209,7 +211,9 @@ class FakeGitHub {
           this.webhooks.delete(id);
           this.deleted.push(id);
         }
-        if (this.failDeletesWith !== undefined) return Response.json({ message: "Server Error" }, { status: this.failDeletesWith });
+        if (this.failDeletesWith !== undefined) {
+          return Response.json({ message: "Failed" }, { status: this.failDeletesWith, headers: this.failDeletesHeaders });
+        }
         return new Response(null, { status: 204 });
       }
       if (method === "GET") {
@@ -1429,11 +1433,13 @@ it("revokes a disconnected account's token even when its hook driver can't be re
   expect(github.requests).toContain("DELETE /applications/test-client/token");
 });
 
-it.each<[string, boolean]>([
-  ["fails to delete", false],
+it.each<[string, number, Record<string, string>, boolean]>([
+  ["fails to delete", 500, {}, false],
   // Asked again, GitHub has no such webhook.
-  ["loses its answer to deleting", true],
-])("keeps a disconnecting account connected, with its token, until its webhooks are gone, when GitHub %s one", async (_, deleted) => {
+  ["loses its answer to deleting", 500, {}, true],
+  // A 403 as much as a 429, which only its headers tell from a refusal.
+  ["rate-limits deleting", 403, { "x-ratelimit-remaining": "0" }, false],
+])("keeps a disconnecting account connected, with its token, until its webhooks are gone, when GitHub %s one", async (_, status, headers, deleted) => {
   const github = new FakeGitHub();
   const account = await connectAccount();
   const triage = binding(account);
@@ -1441,7 +1447,8 @@ it.each<[string, boolean]>([
   await triage.enable();
   const [webhook] = github.webhooks.values();
 
-  github.failDeletesWith = 500;
+  github.failDeletesWith = status;
+  github.failDeletesHeaders = headers;
   github.deleteDespiteFailure = deleted;
   expect(await triage.hooks.revokeAccount(account)).toEqual({
     error: "GitHub failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
@@ -1456,15 +1463,19 @@ it.each<[string, boolean]>([
   expect(github.requests).toContain("DELETE /applications/test-client/token");
 });
 
-it("lets a disconnect finish without a webhook the account can no longer delete", async () => {
+it.each<[string, (github: FakeGitHub) => void]>([
+  ["is no longer an admin of the repository", github => { github.admin = false; }],
+  // As when the repository's organization has since restricted the account's OAuth app.
+  ["is refused by GitHub", github => { github.failDeletesWith = 403; }],
+])("lets a disconnect finish without a webhook the account can no longer delete, as when it %s", async (_, refuse) => {
   const github = new FakeGitHub();
   const account = await connectAccount();
   const triage = binding(account);
   await triage.subscribe();
   await triage.enable();
 
-  // No longer an admin of the repository, which only its admins can now clean up.
-  github.admin = false;
+  // Which only the repository's admins can now clean up.
+  refuse(github);
   await unwrap(triage.hooks.revokeAccount(account));
   expect(github.webhooks.size).toBe(1);
   expect(github.requests).toContain("DELETE /applications/test-client/token");

@@ -597,7 +597,7 @@ const delivered = ({ status_code }: GitHubWebhookDeliveryResponse) => status_cod
  * answered, rather than refusing it, and the account's token still works.
  */
 function retryable(error: unknown): boolean {
-  if (error instanceof GitHubApiError) return error.status >= 500 || error.status === 429;
+  if (error instanceof GitHubApiError) return error.status >= 500 || error.rateLimited;
   // A confirmed expiry, which withAccountApi() wraps.
   return !isCredentialsExpired((error as { cause?: unknown } | undefined)?.cause);
 }
