@@ -55,9 +55,9 @@ import {
  * disconnecting the account can't reach it.
  */
 export class GitLabHookDriver extends GitLabHookDriverImpl {
-  override async revoke(): Promise<void> {
+  override async revoke(): Promise<boolean> {
     if (this.ctx.storage.kv.get("test:unreachable")) throw new Error("The test hook driver can't be reached.");
-    await super.revoke();
+    return await super.revoke();
   }
 }
 

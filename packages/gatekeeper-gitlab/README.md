@@ -129,7 +129,9 @@ Enabling a hook adds a webhook to the project, delivering to
 `${WEBHOOK_ORIGIN}/gatekeeper/gitlab/webhook/<id>`, so GitLab allows it only if the connected
 account is a Maintainer or Owner of the project. An account's hooks on one project share its
 webhook, which is deleted when the last of them is disabled, or when the account is disconnected.
-Each webhook signs its deliveries with its own signing token, which only GitLab and this deployment
+Should GitLab fail to delete it, the hourly check tries again, and a disconnect that leaves it
+fails, keeping the account connected, with the tokens that can delete it, until disconnecting again
+finds it gone. Each webhook signs its deliveries with its own signing token, which only GitLab and this deployment
 hold (Standard Webhooks, which GitLab added in 19.0; the older secret token is sent in the clear,
 so it is not used): a delivery whose signature or timestamp doesn't check out is refused, as is one
 naming a project other than the one whose webhook signed it, and one GitLab repeats is ignored. A

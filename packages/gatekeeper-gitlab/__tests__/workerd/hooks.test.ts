@@ -231,6 +231,14 @@ class FakeGitLabHooks {
    */
   stallDeletes = false;
   stalledDeletes = 0;
+  /** While set, a webhook DELETE fails with this status; with `deleteDespiteFailure`, once it has deleted the webhook, as when its answer is lost. */
+  failDeletesWith: number | undefined;
+  deleteDespiteFailure = false;
+  /** While set, adding a webhook fails with this status. */
+  failCreatesWith: number | undefined;
+  /** While set, adding a webhook stalls, counted in `stalledCreates`, polled as `stallDeletes` is. */
+  stallCreates = false;
+  stalledCreates = 0;
   #nextId = 100;
 
   constructor() {
@@ -272,8 +280,13 @@ class FakeGitLabHooks {
         ? json([...this.webhooks.values()].filter(webhook => webhook.projectId === hookIds(request).projectId)
           .map(webhook => this.#reported(webhook)))
         : forbidden())
-      .on("POST", new RegExp(`${ANY_HOOKS}$`), request => {
+      .on("POST", new RegExp(`${ANY_HOOKS}$`), async request => {
         if (!this.maintainer) return forbidden();
+        if (this.stallCreates) {
+          this.stalledCreates++;
+          while (this.stallCreates) await scheduler.wait(1);
+        }
+        if (this.failCreatesWith !== undefined) return json({ message: "Server Error" }, { status: this.failCreatesWith });
         const webhook = this.#configured(hookIds(request).projectId, this.#nextId++, request.body!);
         this.webhooks.set(webhook.id, webhook);
         return json(this.#reported(webhook), { status: 201 });
@@ -322,10 +335,14 @@ class FakeGitLabHooks {
           this.stalledDeletes++;
           while (this.stallDeletes) await scheduler.wait(1);
         }
+        if (!this.maintainer) return forbidden();
         const webhook = this.#webhook(request);
         if (!webhook) return notFound();
-        this.webhooks.delete(webhook.id);
-        this.deleted.push(webhook.id);
+        if (this.failDeletesWith === undefined || this.deleteDespiteFailure) {
+          this.webhooks.delete(webhook.id);
+          this.deleted.push(webhook.id);
+        }
+        if (this.failDeletesWith !== undefined) return json({ message: "Server Error" }, { status: this.failDeletesWith });
         return new Response(null, { status: 204 });
       });
     this.gitlab.install();
@@ -1261,6 +1278,26 @@ it("never has GitLab resend what it sent while someone had pointed the webhook e
   expect(gitlab.gitlab.count("POST", /\/resend$/)).toBe(0);
 });
 
+it("replaces a webhook GitLab gave up on at the next check after that one failed to", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const [webhook] = gitlab.webhooks.values();
+  const { at, alarm } = clock(account);
+
+  webhook.alertStatus = "disabled";
+  gitlab.failCreatesWith = 503;
+  await at(HOUR, alarm);
+  expect(gitlab.deleted).toEqual([webhook.id]);
+  expect(gitlab.webhooks.size).toBe(0);
+  gitlab.failCreatesWith = undefined;
+  await at(2 * HOUR, alarm);
+  expect([...gitlab.webhooks.values()]).toEqual([expect.objectContaining({ triggers: webhook.triggers })]);
+  expect(await gitlab.deliver("Issue Hook", issueHook("open", 43))).toEqual([204]);
+});
+
 it("recreates a webhook GitLab gave up on, and leaves one it holds back to GitLab", async () => {
   const gitlab = new FakeGitLabHooks();
   const account = await connectAccount();
@@ -1480,6 +1517,118 @@ it("revokes a disconnected account's tokens even when its hook driver can't be r
 
   // Disconnecting fails, as it should, but not before the tokens are revoked.
   expect(await binding(account).hooks.revokeAccount(account)).toEqual({ error: "The test hook driver can't be reached." });
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
+});
+
+it.each<[string, boolean]>([
+  ["fails to delete", false],
+  // Asked again, GitLab has no such webhook.
+  ["loses its answer to deleting", true],
+])("keeps a disconnecting account connected, with its tokens, until its webhooks are gone, when GitLab %s one", async (_, deleted) => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const [webhook] = gitlab.webhooks.values();
+
+  gitlab.failDeletesWith = 500;
+  gitlab.deleteDespiteFailure = deleted;
+  expect(await triage.hooks.revokeAccount(account)).toEqual({
+    error: "GitLab failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
+  });
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBe(0);
+  // Its hooks stopped all the same.
+  await expect(triage.enable()).rejects.toThrow("This GitLab account has been disconnected.");
+
+  gitlab.failDeletesWith = undefined;
+  await unwrap(await triage.hooks.revokeAccount(account));
+  expect(gitlab.webhooks.has(webhook.id)).toBe(false);
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
+});
+
+it("lets a disconnect finish without a webhook the account can no longer delete", async () => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+
+  // No longer a Maintainer of the project, whose Maintainers alone can now clean up.
+  gitlab.maintainer = false;
+  await unwrap(await triage.hooks.revokeAccount(account));
+  expect(gitlab.webhooks.size).toBe(1);
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
+});
+
+it("keeps on record what a disconnect has yet to delete from GitLab, for another try should it be cut short", async () => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const stored = () => runInDurableObject(driver(account), (_instance, state) =>
+    [...state.storage.kv.list()].map(([key]) => key).filter(key => !key.startsWith("queue:")).toSorted());
+
+  gitlab.stallDeletes = true;
+  const disconnecting = triage.hooks.revokeAccount(account);
+  await vi.waitFor(() => expect(gitlab.stalledDeletes).toBe(1));
+  expect(await stored()).toEqual(["account", "revoked", `webhook:${PROJECT_ID}`]);
+  gitlab.stallDeletes = false;
+  await unwrap(await disconnecting);
+  expect(await stored()).toEqual(["revoked"]);
+});
+
+it("deletes at the next hourly check a webhook GitLab failed to delete as its last hook was disabled", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const [webhook] = gitlab.webhooks.values();
+
+  gitlab.failDeletesWith = 500;
+  await triage.disable();
+  expect(gitlab.webhooks.has(webhook.id)).toBe(true);
+  gitlab.failDeletesWith = undefined;
+  await after(HOUR, account);
+  expect(gitlab.webhooks.has(webhook.id)).toBe(false);
+});
+
+it.each<[string, number | undefined]>([
+  ["", undefined],
+  [", and its first deletion fails", 500],
+])("refuses an enable whose account is disconnected while it adds its webhook, deleting that%s", async (_, failDeletesWith) => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+
+  gitlab.stallCreates = true;
+  // Expected at once, as the enable is refused while the test is still acting.
+  const refused = expect(triage.enable()).rejects.toThrow("This GitLab account has been disconnected.");
+  await vi.waitFor(() => expect(gitlab.stalledCreates).toBe(1));
+  const disconnecting = triage.hooks.revokeAccount(account);
+  // Time for the disconnect to reach the driver, where it waits for the enable.
+  await scheduler.wait(100);
+  gitlab.failDeletesWith = failDeletesWith;
+  gitlab.stallCreates = false;
+  await refused;
+  if (failDeletesWith !== undefined) {
+    expect(await disconnecting).toEqual({
+      error: "GitLab failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
+    });
+    expect(gitlab.webhooks.size).toBe(1);
+    gitlab.failDeletesWith = undefined;
+    await unwrap(await triage.hooks.revokeAccount(account));
+  } else {
+    await unwrap(await disconnecting);
+  }
+  expect(gitlab.webhooks.size).toBe(0);
   expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
 });
 
