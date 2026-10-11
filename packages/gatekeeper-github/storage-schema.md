@@ -192,6 +192,10 @@ One per connected account, named by its `UserAccount` id; see `src/github-hooks.
   repository, from when its first hook is enabled until GitHub has deleted it, once its last is
   disabled or the account disconnected, or can't: the hourly check, and another disconnect, try
   again meanwhile. Reached by the repository's id, which survives a rename.
+- `unrecorded:<repoId>` -> `{ repo, url }`, written as GitHub is asked to add or change the
+  repository's webhook and deleted once its id is recorded: should GitHub's answer be lost, the
+  webhook at `url` is found by it and deleted, as the account is disconnected or, while no hook
+  needs it, at the hourly check.
 - `repaired:<repoId>` -> when that webhook's configuration was last restored, by the hourly check
   or by enabling or disabling a hook there: what GitHub failed to deliver before then is
   redelivered whatever the refusal, which may have been the misconfiguration's. Deleted with the
@@ -209,8 +213,8 @@ One per connected account, named by its `UserAccount` id; see `src/github-hooks.
 - `queue:due:<time>:<hookKey>:<eventId>`, `queue:finished:<time>:<hookKey>:<eventId>` and
   `queue:indexed` -> the queue's indexes of those rows: by when each pending one is next due, and
   when each finished one finished, which the dedupe window counts from.
-- `revoked` -> set, with every key but `account` and `webhook:` deleted, once the account is
-  disconnected.
+- `revoked` -> set, with every key but `account`, `webhook:` and `unrecorded:` deleted, once the
+  account is disconnected.
 
 ## Simulation model
 
