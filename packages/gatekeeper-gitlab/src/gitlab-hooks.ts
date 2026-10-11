@@ -626,9 +626,12 @@ function retryable(error: unknown): boolean {
   return !isCredentialsExpired((error as { cause?: unknown } | undefined)?.cause);
 }
 
-/** Whether an attempt was delivered: GitLab counts a redirect as delivered too. */
-const delivered = (event: GitLabWebhookEventResponse) =>
-  Number(event.response_status) >= 200 && Number(event.response_status) < 400;
+/**
+ * Whether an attempt was delivered: answered 204, as this worker answers every delivery it takes.
+ * GitLab counts a redirect as delivered too, but none comes from the worker: Cloudflare Access
+ * sends one in its stead, to its login page, when it turns GitLab away.
+ */
+const delivered = (event: GitLabWebhookEventResponse) => Number(event.response_status) === 204;
 
 /**
  * What to have GitLab resend, oldest first: each delivery whose latest attempt failed, unless the

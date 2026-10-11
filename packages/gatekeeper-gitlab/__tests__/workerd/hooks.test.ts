@@ -1065,7 +1065,11 @@ it("adopts the webhook an earlier attempt left on the project", async () => {
   expect((await triage.read()).received).toHaveLength(1);
 });
 
-it("has GitLab resend, at its next hourly check, what GitLab failed to deliver", async () => {
+it.each<[string, number]>([
+  ["failed to deliver", 503],
+  // As Cloudflare Access does in the worker's stead, without the bypass for webhooks.
+  ["was redirected away from", 302],
+])("has GitLab resend, at its next hourly check, what it %s", async (_, status) => {
   const gitlab = new FakeGitLabHooks();
   const account = await connectAccount();
   const triage = binding(account);
@@ -1075,7 +1079,7 @@ it("has GitLab resend, at its next hourly check, what GitLab failed to deliver",
   const { at, alarm } = clock(account);
 
   await at(0, async () => {
-    gitlab.failDeliveriesWith = 503;
+    gitlab.failDeliveriesWith = status;
     await gitlab.deliver("Issue Hook", issueHook("open", 42));
     gitlab.failDeliveriesWith = undefined;
     // Refused for good: it isn't JSON.
