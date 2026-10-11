@@ -175,23 +175,19 @@ export class GitHubHookDriver extends DurableObject<Env> {
     if (kv.get("revoked")) throw new Error(DISCONNECTED);
     kv.put("account", userObjectId);
     const { repo } = registration;
-    try {
-      await this.#webhookChanges.run(async () => {
-        // Disconnected while an earlier change ran.
-        if (kv.get("revoked")) throw new Error(DISCONNECTED);
-        await this.#readViewer(userObjectId);
-        const others = this.#registrations(repo).filter(([regKey]) => regKey !== registrationKey(key));
-        await this.#ensureWebhook(repo, [registration, ...others.map(([, other]) => other)]);
-        // Recorded in the same change, so a removal queued after it sees this hook.
-        const replaced = kv.get<Capabilities>(capabilitiesKey(key));
-        kv.put(registrationKey(key), registration);
-        kv.put(capabilitiesKey(key), capabilities);
-        disposeStubs(replaced);
-      });
-    } finally {
-      // A failed enable too, which may leave a webhook GitHub added for the hourly check to delete.
-      await this.#reschedule();
-    }
+    await this.#webhookChanges.run(async () => {
+      // Disconnected while an earlier change ran.
+      if (kv.get("revoked")) throw new Error(DISCONNECTED);
+      await this.#readViewer(userObjectId);
+      const others = this.#registrations(repo).filter(([regKey]) => regKey !== registrationKey(key));
+      await this.#ensureWebhook(repo, [registration, ...others.map(([, other]) => other)]);
+      // Recorded in the same change, so a removal queued after it sees this hook.
+      const replaced = kv.get<Capabilities>(capabilitiesKey(key));
+      kv.put(registrationKey(key), registration);
+      kv.put(capabilitiesKey(key), capabilities);
+      disposeStubs(replaced);
+    });
+    await this.#reschedule();
   }
 
   async unregister(key: string): Promise<void> {
@@ -483,8 +479,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
     }
     const config = { url, secret, events: webhookEvents(registrations) };
     const recorded = kv.get<Webhook>(webhookKey(repo.id));
-    // Until the webhook GitHub answers with is recorded, in case its answer is lost.
+    // Until the webhook GitHub answers with is recorded, in case its answer is lost; and the hourly
+    // check that would then delete it scheduled now, before GitHub is asked, as nothing after may
+    // run should this object restart meanwhile.
     kv.put<Unrecorded>(unrecordedKey(repo.id, url), { repo, url });
+    await this.#reschedule();
     // `repaired` when it didn't deliver here until this restored it, as the hourly check would have.
     let made: { id: number; repaired: boolean };
     try {
