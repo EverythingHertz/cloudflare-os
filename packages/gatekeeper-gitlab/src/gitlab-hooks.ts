@@ -191,22 +191,18 @@ export class GitLabHookDriver extends DurableObject<Env> {
     if (kv.get("revoked")) throw new Error(DISCONNECTED);
     kv.put("account", userObjectId);
     const { project } = registration;
-    try {
-      await this.#webhookChanges.run(async () => {
-        // Disconnected while an earlier change ran.
-        if (kv.get("revoked")) throw new Error(DISCONNECTED);
-        const others = this.#registrations(project).filter(([regKey]) => regKey !== registrationKey(key));
-        await this.#ensureWebhook(project, [registration, ...others.map(([, other]) => other)]);
-        // Recorded in the same change, so a removal queued after it sees this hook.
-        const replaced = kv.get<Capabilities>(capabilitiesKey(key));
-        kv.put(registrationKey(key), registration);
-        kv.put(capabilitiesKey(key), capabilities);
-        disposeStubs(replaced);
-      });
-    } finally {
-      // A failed enable too, which may leave a webhook GitLab added for the hourly check to delete.
-      await this.#reschedule();
-    }
+    await this.#webhookChanges.run(async () => {
+      // Disconnected while an earlier change ran.
+      if (kv.get("revoked")) throw new Error(DISCONNECTED);
+      const others = this.#registrations(project).filter(([regKey]) => regKey !== registrationKey(key));
+      await this.#ensureWebhook(project, [registration, ...others.map(([, other]) => other)]);
+      // Recorded in the same change, so a removal queued after it sees this hook.
+      const replaced = kv.get<Capabilities>(capabilitiesKey(key));
+      kv.put(registrationKey(key), registration);
+      kv.put(capabilitiesKey(key), capabilities);
+      disposeStubs(replaced);
+    });
+    await this.#reschedule();
   }
 
   async unregister(key: string): Promise<void> {
@@ -506,8 +502,11 @@ export class GitLabHookDriver extends DurableObject<Env> {
     }
     const config = { url, signingToken: secret, triggers: webhookTriggers(registrations) };
     const recorded = kv.get<Webhook>(webhookKey(project.id));
-    // Until the webhook GitLab answers with is recorded, in case its answer is lost.
+    // Until the webhook GitLab answers with is recorded, in case its answer is lost; and the hourly
+    // check that would then delete it scheduled now, before GitLab is asked, as nothing after may
+    // run should this object restart meanwhile.
     kv.put<Unrecorded>(unrecordedKey(project.id, url), { project, url });
+    await this.#reschedule();
     let webhook;
     try {
       webhook = await this.#api(account, async api => {

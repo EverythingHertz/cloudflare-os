@@ -241,6 +241,9 @@ class FakeGitLabHooks {
   stalledCreates = 0;
   /** While set, GitLab adds a webhook but its answer is lost, as when the connection drops. */
   loseCreateAnswers = false;
+  /** While set, GitLab adds a webhook but stalls its answer, counted in `stalledCreateAnswers`. */
+  stallCreateAnswers = false;
+  stalledCreateAnswers = 0;
   #nextId = 100;
 
   constructor() {
@@ -292,6 +295,10 @@ class FakeGitLabHooks {
         const webhook = this.#configured(hookIds(request).projectId, this.#nextId++, request.body!);
         this.webhooks.set(webhook.id, webhook);
         if (this.loseCreateAnswers) throw new TypeError("Network connection lost.");
+        if (this.stallCreateAnswers) {
+          this.stalledCreateAnswers++;
+          while (this.stallCreateAnswers) await scheduler.wait(1);
+        }
         return json(this.#reported(webhook), { status: 201 });
       })
       .on("GET", new RegExp(`${ANY_HOOKS}/(\\d+)$`), request => {
@@ -1784,6 +1791,27 @@ it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promis
   expect(gitlab.webhooks.size).toBe(1);
   gitlab.loseCreateAnswers = false;
   await cleanUp(account, triage);
+  expect(gitlab.webhooks.size).toBe(0);
+});
+
+it("deletes at the next hourly check a webhook GitLab added as the driver restarted, before it could record it", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+
+  gitlab.stallCreateAnswers = true;
+  const refused = expect(triage.enable()).rejects.toThrow();
+  await vi.waitFor(() => expect(gitlab.stalledCreateAnswers).toBe(1));
+  await runInDurableObject(driver(account), async (_instance, state) => {
+    await state.storage.sync();
+    state.abort("The test hook driver restarted.");
+  }).catch(() => {});
+  gitlab.stallCreateAnswers = false;
+  await refused;
+  expect(gitlab.webhooks.size).toBe(1);
+
+  await after(HOUR, account);
   expect(gitlab.webhooks.size).toBe(0);
 });
 
