@@ -190,8 +190,9 @@ class FakeGitHub {
       return Response.json(own.map(({ id, url }) => ({ id, config: { url } })));
     }
     if (rest === "/hooks" && method === "POST") {
-      const { config } = await request.clone().json<WebhookBody>();
-      if (own.some(webhook => webhook.url === config.url)) {
+      const { config, events } = await request.clone().json<WebhookBody>();
+      // A second webhook with one URL only if their events don't overlap.
+      if (own.some(webhook => webhook.url === config.url && webhook.events.some(event => events.includes(event)))) {
         return Response.json({
           message: "Validation Failed", errors: [{ message: "Hook already exists on this repository" }],
         }, { status: 422 });
@@ -923,6 +924,24 @@ it("gives each account its own webhook on a repository, and each its own events"
   const [adaWebhook, carolWebhook] = github.webhooks.values();
   github.webhooks.set(carolWebhook.id, { ...carolWebhook, secret: adaWebhook.secret });
   expect(await github.deliver("issues", issues("reopened", 42))).toEqual([204, 401]);
+});
+
+it("adopts, rather than adds beside, the webhook an unanswered enable of other events left", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const issueHook = binding(account);
+  await issueHook.subscribe({ events: ["issue"] });
+  github.loseCreateAnswers = true;
+  await expect(issueHook.enable()).rejects.toThrow("Network connection lost.");
+  github.loseCreateAnswers = false;
+
+  // A hook for pushes, which GitHub would let a webhook of its own deliver beside the first.
+  const pushHook = binding(account);
+  await pushHook.subscribe({ events: ["push"] });
+  await pushHook.enable();
+  expect([...github.webhooks.values()].map(webhook => webhook.events)).toEqual([["push"]]);
+  await unwrap(pushHook.hooks.revokeAccount(account));
+  expect(github.webhooks.size).toBe(0);
 });
 
 it("adopts the webhook an earlier attempt left on the repository", async () => {

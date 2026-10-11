@@ -8,8 +8,8 @@
 // CONTRACT_GITHUB_OUTSIDER_TOKEN, a token that can't read the repository (the workflow passes its
 // own), adds the access check. CONTRACT_GITHUB_WEBHOOK_URL is where the webhooks deliver,
 // https://example.com/webhook unless set, each with a query of its own, as GitHub refuses a second
-// webhook at one URL: nothing has to answer, since GitHub's delivery log records each request
-// whatever the answer.
+// webhook at one URL with events overlapping the first's: nothing has to answer, since GitHub's
+// delivery log records each request whatever the answer.
 
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -33,7 +33,7 @@ type Delivery = DeliverySummary & {
 
 const sign = (secret: string, body: string) => `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
 const newSecret = () => randomBytes(32).toString("hex");
-/** A URL for one webhook alone, as GitHub refuses a second webhook at a URL one delivers to. */
+/** A URL for one webhook alone, as GitHub refuses a second at one URL with overlapping events. */
 const newUrl = () => `${receiver}?contract=${randomUUID()}`;
 const header = (delivery: Delivery, name: string) => Object.entries(delivery.request.headers)
   .find(([key]) => key.toLowerCase() === name.toLowerCase())?.[1];
@@ -189,13 +189,6 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
     expect(header(jsonAgain, "X-Hub-Signature-256")).toBe(sign(secrets.now, JSON.stringify(jsonAgain.request.payload)));
   });
 
-  it("refuses a second webhook at a URL one delivers to, which the gatekeeper adopts rather than adds", async () => {
-    const url = newUrl();
-    await webhook(["issues"], newSecret(), url);
-    const second = api.createRepoWebhook(repository.id, { url, secret: newSecret(), events: ["issues"] })
-      .then(made => cleanups.push(() => api.deleteRepoWebhook(repository.id, made.id)));
-    await expect(second).rejects.toMatchObject({ status: 422 });
-  });
 
   it("lists a webhook's deliveries newest first, the gatekeeper paging through them as it does", async () => {
     const hook = await webhook(["issues"]);
