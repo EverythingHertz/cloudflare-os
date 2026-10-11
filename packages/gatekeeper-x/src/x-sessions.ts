@@ -18,7 +18,7 @@ import type {
   XSearchOptions, XTimeRangeOptions, XTimelineOptions, XUser, XUserInfo, XUserSummary,
 } from "./types";
 import {
-  LIST_FIELDS, POST_FIELDS, USER_FIELDS, XApi, pageQuery, requireData, xTime, type XEnvelope,
+  LIST_FIELDS, POST_FIELDS, USER_FIELDS, XApi, pageQuery, requireData, requirePage, xTime, type XEnvelope,
 } from "./x-api";
 import { MAX_THREAD_POSTS, validateDraft, type StoredDraft, type XActions } from "./x-actions";
 import type { StoredIdentity } from "./x-credentials";
@@ -197,7 +197,9 @@ function postsCursor(ctx: SessionContext, size: number, listing: PostListing): C
   return new XCursor<XPostInfo>({
     fetchPage: async token => {
       const me = await host.me();
-      const load = () => host.read<WirePost[]>(size, (api, current) => listing.request(api, current, token, size));
+      // Checked before it is cached, so a failed read is asked again rather than replayed.
+      const load = () => host.read<WirePost[]>(size, (api, current) => listing.request(api, current, token, size))
+        .then(requirePage);
       const envelope = token === undefined && listing.cacheKey
         ? await host.cached(`page:${listing.cacheKey}:${size}`, PAGE_TTL_MS, load)
         : await load();
@@ -249,7 +251,8 @@ function usersCursor(ctx: SessionContext, size: number, listing: UserListing): C
   return new XCursor<XUserInfo>({
     fetchPage: async token => {
       const me = await host.me();
-      const envelope = await host.read<WireUser[]>(size, (api, current) => listing.request(api, current, token, size));
+      const envelope = await host.read<WireUser[]>(size, (api, current) => listing.request(api, current, token, size))
+        .then(requirePage);
       const fetched = (envelope.data ?? []).map(user => toUserInfo(user, listing.relationship && user.id !== me.id));
       const items = listing.overlay(fetched, token === undefined);
       return {
@@ -279,10 +282,10 @@ export async function fetchPost(host: XSessionHost, id: string): Promise<PostRea
   return { info: toPostInfo(post, includes), unverified: authorsUnverified([post], includes) };
 }
 
-/** A List as X has it, cached, with no pending action replayed. */
-export async function fetchList(host: XSessionHost, id: string): Promise<XListInfo> {
-  const envelope = await host.cached(`list:${id}`, LIST_TTL_MS,
-    () => host.read<WireList>(1, api => api.get<WireList>(`/2/lists/${id}`, LIST_FIELDS)));
+/** A List as X has it, with no pending action replayed: cached, unless `fresh` asks X again. */
+export async function fetchList(host: XSessionHost, id: string, { fresh = false } = {}): Promise<XListInfo> {
+  const load = () => host.read<WireList>(1, api => api.get<WireList>(`/2/lists/${id}`, LIST_FIELDS));
+  const envelope = fresh ? await load() : await host.cached(`list:${id}`, LIST_TTL_MS, load);
   return toListInfo(requireData(envelope, "List"), indexIncludes(envelope.includes));
 }
 
@@ -320,7 +323,8 @@ export async function readUser(host: XSessionHost, target: UserTarget): Promise<
  * the List is private, or a pending change makes it so. A pending change to public lifts nothing,
  * since the List stays private on X until that change is approved.
  */
-async function readList(ctx: SessionContext, id: string): Promise<{ info: XListInfo; restricted: boolean }> {
+async function readList(ctx: SessionContext, id: string, options?: { fresh?: boolean }):
+    Promise<{ info: XListInfo; restricted: boolean }> {
   const { host } = ctx;
   const resolved = host.resolve(id);
   if (isProvisional(resolved)) {
@@ -328,10 +332,20 @@ async function readList(ctx: SessionContext, id: string): Promise<{ info: XListI
     if (!pending) throw new Error("No pending List has this temporary ID; it may have been rejected.");
     return { info: pending, restricted: pending.private };
   }
-  const info = await fetchList(host, resolved);
+  const info = await fetchList(host, resolved, options);
   const visible = overlayList(info, host.pending(), ref => host.resolve(ref));
   if (!visible) throw new Error("This List has been deleted.");
   return { info: visible, restricted: info.private || visible.private };
+}
+
+/**
+ * Whether a page of a List's posts or members is private to the account, judged by the List as X
+ * has it now: the page can be newer than a cached record of the List, which may predate its becoming
+ * private on X, or through another binding of this connection, whose approval invalidates only its
+ * own cache. A List already cached as private needs no second look.
+ */
+async function pageRestricted(ctx: SessionContext, id: string): Promise<boolean> {
+  return (await readList(ctx, id)).restricted || (await readList(ctx, id, { fresh: true })).restricted;
 }
 
 /** Captures a draft's images for the action that will upload them once approved. */
@@ -756,7 +770,7 @@ export class XListImpl extends RpcTarget implements XList {
       overlay: { kind: "others" },
       newestFirst: false,
       // For each page: a cursor can outlive the List being public.
-      privateSource: async () => (await readList(this.#ctx, id)).restricted,
+      privateSource: () => pageRestricted(this.#ctx, id),
       title: "Read an X List's posts",
       describe: count => `Read ${countOf(count, "post")} from the List "${name}".`,
       cacheKey: `list-posts:${id}`,
@@ -790,7 +804,7 @@ export class XListImpl extends RpcTarget implements XList {
       relationship: false,
       overlay: (users, newestPage) => overlayMembers(users, host.pending(), id, ref => host.resolve(ref), newestPage),
       // For each page: a cursor can outlive the List being public.
-      privateSource: async () => (await readList(this.#ctx, id)).restricted,
+      privateSource: () => pageRestricted(this.#ctx, id),
       title: "Read an X List's members",
       describe: count => `Read ${countOf(count, "member")} of the List "${name}".`,
     });
@@ -988,7 +1002,7 @@ export class XAccountSessionImpl extends RpcTarget implements XAccountSession {
       fetchPage: async token => {
         const envelope = await host.read<WireList[]>(size, (api, me) => api.get<WireList[]>(`/2/users/${me.id}/owned_lists`, {
           ...LIST_FIELDS, ...pageQuery(size, token, { min: 1, max: 100 }),
-        }));
+        })).then(requirePage);
         const includes = indexIncludes(envelope.includes);
         const fetched = (envelope.data ?? []).map(list => toListInfo(list, includes));
         const items = overlayOwnedLists(fetched, host.pending(), ref => host.resolve(ref), token === undefined);
