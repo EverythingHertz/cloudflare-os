@@ -469,7 +469,8 @@ export class XActivityRouter extends DurableObject<Env> {
       await this.#delete(eventType, subscription);
     } catch (error) {
       logger.warn("failed to delete an X subscription; retrying later", { event: "hooks.subscription.delete.failed", error });
-      kv.put(subscriptionKey(eventType), { id: subscription.id, deleting: true });
+      // The whole record, `at` too, so a revocation from before it still can't forget it.
+      kv.put<Subscription>(subscriptionKey(eventType), { ...subscription, deleting: true });
       await this.#wakeBy(Date.now() + RETRY_MS);
     }
   }

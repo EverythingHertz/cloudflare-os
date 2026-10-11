@@ -240,6 +240,24 @@ describe("subscribing", () => {
     expect(mentions()).toHaveLength(0);
   });
 
+  it("keeps deleting a subscription X failed to delete, though an earlier revocation is delivered again", async () => {
+    const { x, hook } = await watchingMentions();
+    const revocation = { id: "revoke-1", createdAt: new Date(Date.now() - 1000).toISOString() };
+    for (const [id, subscription] of x.subscriptions) if (subscription.by === ALICE.id) x.subscriptions.delete(id);
+    expect(await x.deliver("oauth.revoke", undefined, { user_id: ALICE.id }, revocation)).toBe(200);
+    await hook.disable();
+    await hook.enable();
+    // X is down as the hook is disabled, so its new subscription waits to be deleted...
+    let outage = true;
+    x.on("DELETE", /^\/2\/activity\/subscriptions\//, () => outage ? json({ title: "Service Unavailable" }, { status: 503 }) : undefined);
+    await hook.disable();
+    // ...and the earlier revocation, delivered again, leaves it waiting.
+    expect(await x.deliver("oauth.revoke", undefined, { user_id: ALICE.id }, revocation)).toBe(200);
+    outage = false;
+    expect(await runDurableObjectAlarm(env.X_ACTIVITY_ROUTER.getByName(ALICE.id))).toBe(true);
+    expect(subscriptionsOf(x).map(([type]) => type)).toEqual(["oauth.revoke"]);
+  });
+
   it("subscribes afresh when a hook needs a subscription X may have deleted", async () => {
     const { x, account, hook } = await watchingMentions();
     // X deletes it, but the answer is lost.
