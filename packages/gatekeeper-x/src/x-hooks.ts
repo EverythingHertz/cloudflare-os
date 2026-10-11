@@ -392,10 +392,13 @@ export class XActivityRouter extends DurableObject<Env> {
 
   /**
    * The user revoked this app: X deleted the subscriptions their token made, so the next watch of
-   * a private event subscribes afresh.
+   * a private event subscribes afresh. In turn with the other changes, so a watch whose answer
+   * arrives after the revocation can't put back a subscription X has deleted.
    */
   async revoked(): Promise<void> {
-    for (const eventType of PRIVATE_EVENT_TYPES) this.ctx.storage.kv.delete(subscriptionKey(eventType));
+    await this.#changes.run(async () => {
+      for (const eventType of PRIVATE_EVENT_TYPES) this.ctx.storage.kv.delete(subscriptionKey(eventType));
+    });
   }
 
   #watchers(eventType: string): string[] {

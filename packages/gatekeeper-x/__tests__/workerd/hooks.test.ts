@@ -414,6 +414,34 @@ describe("accounts going away", () => {
     expect(subscriptionsOf(x).map(([type]) => type)).toEqual(["oauth.revoke", "post.mention.create"]);
   });
 
+  it("doesn't keep a subscription a revocation deleted while X was still making it", async () => {
+    const x = new FakeX().install();
+    const account = await seedAccount(x);
+    const mentions = binding({ userObjectId: account, resourceKind: "account" });
+    await mentions.subscribe([["subscribeMentions"]]);
+    let subscribing = false;
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    x.on("POST", /^\/2\/activity\/subscriptions$/, async request => {
+      if (JSON.parse(request.body!).event_type !== "post.mention.create") return undefined;
+      subscribing = true;
+      await released;
+      return undefined;
+    });
+    const enabling = mentions.tryEnable();
+    await vi.waitFor(() => expect(subscribing).toBe(true));
+    // X deletes what the token made and says so before answering the subscription it was making:
+    // long enough for the revocation to land, were it not held behind that subscription.
+    const router = env.X_ACTIVITY_ROUTER.getByName(ALICE.id);
+    const revoking = router.revoked();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    release();
+    unwrap(await enabling);
+    await revoking;
+    await runInDurableObject(router, (_instance, state) =>
+      expect(state.storage.kv.get("sub:post.mention.create")).toBeUndefined());
+  });
+
   it("undoes the subscription of a hook enabled as the account is disconnected", async () => {
     const x = new FakeX().install();
     const account = await seedAccount(x);
