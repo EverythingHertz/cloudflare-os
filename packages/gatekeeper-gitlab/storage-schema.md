@@ -46,5 +46,5 @@ One per connected account, named by its `UserAccount` id; see `src/gitlab-hooks.
 | `reg:<hookKey>` | `{ project, target?, events, viewerId }` | What one enabled hook watches: its project, the issue or merge request it is narrowed to, its event kinds, and the account's GitLab user id when it was subscribed, used only when the account can't say who it is now. |
 | `caps:<hookKey>` | `{ delivery, initiator }` | The facet's persistent delivery stub and the Workshop's `HookInitiator`. |
 | `msg:<hookKey>:<webhookId>` | kit `HookDeliveryQueue` row | An event pending delivery to one hook, or a finished one kept for a day, named by the delivery's signed `webhook-id`, so GitLab's retries and resends of it collapse. |
-| `queue:due:…`, `queue:expires:…`, `queue:indexed` | kit `HookDeliveryQueue` indexes | Those rows by when each is next due or forgotten, which is all a run reads. |
+| `queue:due:…`, `queue:finished:…`, `queue:indexed` | kit `HookDeliveryQueue` indexes | Those rows by when each pending one is next due and when each finished one finished, which the dedupe window counts from: all a run reads. |
 | `revoked` | `true` | Set, with every other key deleted, once the account is disconnected. |
