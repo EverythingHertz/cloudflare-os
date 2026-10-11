@@ -146,6 +146,9 @@ class FakeGitHub {
   stalledCreates = 0;
   /** While set, GitHub adds a webhook but its answer is lost, as when the connection drops. */
   loseCreateAnswers = false;
+  /** While set, GitHub adds a webhook but stalls its answer, counted in `stalledCreateAnswers`. */
+  stallCreateAnswers = false;
+  stalledCreateAnswers = 0;
   /** How many repository reads GitHub answered 304, as it does a conditional read of an unchanged one. */
   notModified = 0;
   /** While set, the repository whose name this one had, renamed since, now names. */
@@ -200,6 +203,10 @@ class FakeGitHub {
       const id = this.#nextId++;
       this.webhooks.set(id, this.#configured(id, name, await request.json<WebhookBody>()));
       if (this.loseCreateAnswers) throw new TypeError("Network connection lost.");
+      if (this.stallCreateAnswers) {
+        this.stalledCreateAnswers++;
+        while (this.stallCreateAnswers) await scheduler.wait(1);
+      }
       return Response.json({ id, config: { url: this.webhooks.get(id)!.url } }, { status: 201 });
     }
     const id = Number(/^\/hooks\/(\d+)/.exec(rest)?.[1]);
@@ -1452,6 +1459,8 @@ it.each<[string, (github: FakeGitHub) => void]>([
   }],
   ["meets a secondary rate limit deleting", github => {
     github.failDeletesWith = 403;
+    // Its primary quota far from spent.
+    github.failDeletesHeaders = { "x-ratelimit-remaining": "20" };
     github.failDeletesMessage = "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.";
   }],
 ])("keeps a disconnecting account connected, with its token, until its webhooks are gone, when GitHub %s one", async (_, fail) => {
@@ -1605,6 +1614,27 @@ it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promis
   expect(github.webhooks.size).toBe(1);
   github.loseCreateAnswers = false;
   await cleanUp(account, triage);
+  expect(github.webhooks.size).toBe(0);
+});
+
+it("deletes at the next hourly check a webhook GitHub added as the driver restarted, before it could record it", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+
+  github.stallCreateAnswers = true;
+  const refused = expect(triage.enable()).rejects.toThrow();
+  await vi.waitFor(() => expect(github.stalledCreateAnswers).toBe(1));
+  await runInDurableObject(driver(account), async (_instance, state) => {
+    await state.storage.sync();
+    state.abort("The test hook driver restarted.");
+  }).catch(() => {});
+  github.stallCreateAnswers = false;
+  await refused;
+  expect(github.webhooks.size).toBe(1);
+
+  await after(HOUR, account);
   expect(github.webhooks.size).toBe(0);
 });
 
