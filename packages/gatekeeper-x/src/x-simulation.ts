@@ -6,10 +6,10 @@
 // `metrics` (they lag real actions on X too), and hidden replies (X reports no hidden state).
 
 import type { JournalEntry } from "@gadgets/gatekeeper-kit/actions";
-import type { XListInfo, XPostInfo, XUserInfo, XUserSummary } from "./types";
-import type { StoredDraft, XAction } from "./x-actions";
+import type { XListInfo, XPostInfo, XTimeRangeOptions, XUserInfo, XUserSummary } from "./types";
+import { snowflakeTime, type StoredDraft, type XAction } from "./x-actions";
 import type { StoredIdentity } from "./x-credentials";
-import { comparableText, extractMentions, extractUrls } from "./x-text";
+import { duplicateKey, extractMentions, extractUrls } from "./x-text";
 import { postUrl } from "./x-urls";
 
 /** The journal's pending entries, in submission order. */
@@ -155,12 +155,28 @@ export type PostOverlay =
   | { kind: "liked" };
 
 /**
+ * Whether a post pending actions add falls within the range a listing asked X for, judged by when it
+ * shows as created and taking each bound as X does. An ID bound stands for the time its snowflake
+ * encodes, so the post sorts against posts on X as they sort against each other.
+ */
+export function withinBounds(post: XPostInfo, bounds: XTimeRangeOptions = {}): boolean {
+  const at = post.createdAt.getTime();
+  const { sinceId, untilId, startTime, endTime } = bounds;
+  return (startTime === undefined || at >= startTime.getTime())
+    && (endTime === undefined || at < endTime.getTime())
+    && (sinceId === undefined || at > snowflakeTime(sinceId))
+    && (untilId === undefined || at < snowflakeTime(untilId));
+}
+
+/**
  * A page of posts with pending actions replayed: deleted posts dropped, and on the newest page
- * the posts pending actions add, prepended without trimming the page, so no real row is lost.
+ * the posts pending actions add within the listing's `bounds`, prepended without trimming the page,
+ * so no real row is lost.
  */
 export function overlayPosts(items: readonly XPostInfo[], pending: Pending, overlay: PostOverlay,
-                             context: { me: StoredIdentity; resolve: Resolve; newestPage: boolean }): XPostInfo[] {
-  const { me, resolve, newestPage } = context;
+                             context: { me: StoredIdentity; resolve: Resolve; newestPage: boolean;
+                                        bounds?: XTimeRangeOptions }): XPostInfo[] {
+  const { me, resolve, newestPage, bounds } = context;
   const gone = deleted(pending, resolve);
   let result = items.filter(post => !gone.has(post.id));
   let added: XPostInfo[] = [];
@@ -214,7 +230,7 @@ export function overlayPosts(items: readonly XPostInfo[], pending: Pending, over
     }
   }
   const present = new Set(result.map(post => post.id));
-  return [...added.filter(post => !present.has(post.id)), ...result];
+  return [...added.filter(post => !present.has(post.id) && withinBounds(post, bounds)), ...result];
 }
 
 /** A post with pending actions replayed: `null` once a pending deletion removes it. */
@@ -312,13 +328,13 @@ export function overlayOwnedLists(lists: readonly XListInfo[], pending: Pending,
   return [...added, ...result];
 }
 
-/** The texts of posts waiting to publish, as `validateDraft` compares them. */
+/** The texts of posts waiting to publish, keyed as `validateDraft` compares them (`duplicateKey`). */
 export function pendingTexts(pending: Pending): Set<string> {
   const texts = new Set<string>();
   for (const { action } of pending) {
     const drafts = action.kind === "createPost" ? action.payload.drafts
       : action.kind === "reply" ? [action.payload.draft] : [];
-    for (const draft of drafts) if (draft.text.trim()) texts.add(comparableText(draft.text));
+    for (const draft of drafts) if (draft.text.trim()) texts.add(duplicateKey(draft.text));
   }
   return texts;
 }

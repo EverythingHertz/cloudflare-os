@@ -6,7 +6,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { XListInfo, XPostInfo, XUserInfo } from "../../src/types";
 import { ALICE, BOB, CAROL, FakeX, accountStub, failure, hooks, json, seedAccount, unwrap } from "./fake-x";
-import type { GatekeeperProps } from "./worker";
+import type { GatekeeperProps, Step } from "./worker";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -285,6 +285,19 @@ describe("pending actions in reads", () => {
     expect(x.requests.every(r => r.method === "GET")).toBe(true);
   });
 
+  it("shows posts waiting for approval only where a listing's bounds take them in", async () => {
+    const { props, name } = await setup();
+    unwrap(await hooks().run(name, props, [["createThread", [{ text: "Draft one" }, { text: "Draft two" }]]]));
+    const later = new Date(Date.now() + 60_000);
+    const ids = async (...steps: Step[]) =>
+      (unwrap(await hooks().run(name, props, steps, { pages: 1 })) as XPostInfo[][])[0].map(post => post.id);
+    expect(await ids(["listMyPosts", { startTime: later }])).toEqual([]);
+    expect(await ids(["listMyPosts", { endTime: later }])).toEqual(["~2", "~1"]);
+    // A pending post's replies are all pending too, and the bounds hold for them as well.
+    expect(await ids(["getPost", "~1"], ["listReplies", { startTime: later }])).toEqual([]);
+    expect(await ids(["getPost", "~1"], ["listReplies", { endTime: later }])).toEqual(["~2"]);
+  });
+
   it("shows a pending bookmark and follow", async () => {
     const { x, props, name } = await setup();
     const post = x.post(BOB, "worth keeping");
@@ -330,6 +343,14 @@ describe("pending actions in reads", () => {
     expect(members.map(member => member.username)).toEqual(["bob"]);
     expect((await hooks().queueLog(name)).observations.at(-1))
       .toEqual({ title: "Read an X List's members", description: 'Read 1 member of the List "Friends".' });
+  });
+
+  it("tells drafts apart by where their links point", async () => {
+    const { props, name } = await setup();
+    unwrap(await hooks().run(name, props, [["createThread", [{ text: "https://example.com/one" }, { text: "https://example.com/two" }]]]));
+    unwrap(await hooks().run(name, props, [["createPost", { text: "Read https://example.com/three" }]]));
+    unwrap(await hooks().run(name, props, [["createPost", { text: "Read https://example.com/four" }]]));
+    expect((await hooks().queueLog(name)).submitted).toHaveLength(3);
   });
 
   it("refuses a post X would refuse before it is queued", async () => {
