@@ -1519,7 +1519,11 @@ it("keeps on record what a disconnect has yet to delete from GitHub, for another
   expect(await stored()).toEqual(["revoked"]);
 });
 
-it("deletes at the next hourly check a webhook GitHub failed to delete as its last hook was disabled", async () => {
+it.each<[string, boolean]>([
+  ["", false],
+  // Deleting a webhook needs no URL for one.
+  [", even once hooks are turned off", true],
+])("deletes at the next hourly check a webhook GitHub failed to delete as its last hook was disabled%s", async (_, off) => {
   const github = new FakeGitHub();
   const account = await connectAccount();
   const triage = binding(account);
@@ -1531,7 +1535,14 @@ it("deletes at the next hourly check a webhook GitHub failed to delete as its la
   await triage.disable();
   expect(github.webhooks.has(webhook.id)).toBe(true);
   github.failDeletesWith = undefined;
-  await after(HOUR, account);
+  const shared = env as { WEBHOOK_ORIGIN?: string };
+  const origin = shared.WEBHOOK_ORIGIN;
+  if (off) delete shared.WEBHOOK_ORIGIN;
+  try {
+    await after(HOUR, account);
+  } finally {
+    shared.WEBHOOK_ORIGIN = origin;
+  }
   expect(github.webhooks.has(webhook.id)).toBe(false);
 });
 
