@@ -65,6 +65,15 @@ const MERGE_REQUEST_ACTIONS = new Map<unknown, GitLabMergeRequestEvent["action"]
   ["open", "opened"], ["close", "closed"], ["reopen", "reopened"], ["merge", "merged"],
 ]);
 
+/**
+ * The `object_kind` each event's payload carries, by its `X-Gitlab-Event`. An issue event's
+ * `work_item` is another kind of work item, which GitLab reports under the same name.
+ */
+const OBJECT_KINDS: Record<string, string> = {
+  "Issue Hook": "issue", "Merge Request Hook": "merge_request", "Note Hook": "note", "Push Hook": "push",
+  "Tag Push Hook": "tag_push",
+};
+
 /** The review decisions a reviewer's new state reports, from GitLab 19.3 (approvals are their own action). */
 const REVIEW_STATES = new Map<unknown, GitLabReviewDecision>([
   ["requested_changes", "requestChanges"], ["reviewed", "comment"],
@@ -82,11 +91,13 @@ export function parseWebhookEvent(name: string, id: string, projectId: number, p
   const attributes = payload.object_attributes ?? {};
   const senderId = typeof payload.user?.id === "number" ? payload.user.id : undefined;
   const base = { id, projectId, actor: actorOf(webUrl, payload.user) };
+  // The header that names the event is outside the signature, so the signed payload must agree:
+  // a delivery replayed under another name would otherwise read as another kind of event.
+  if (payload.object_kind !== OBJECT_KINDS[name]) return undefined;
   switch (name) {
     case "Issue Hook": {
       const action = ISSUE_ACTIONS.get(attributes.action);
-      // `object_kind: "work_item"` is another kind of work item reported under the same name.
-      if (payload.object_kind !== "issue" || !action || typeof attributes.iid !== "number") return undefined;
+      if (!action || typeof attributes.iid !== "number") return undefined;
       return { event: { ...base, kind: "issue", action, target: { kind: "issue", iid: attributes.iid } }, senderId };
     }
     case "Merge Request Hook": {

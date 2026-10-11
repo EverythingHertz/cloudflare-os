@@ -971,6 +971,20 @@ it("takes a delivery signed by any one of the signatures it lists, however many 
   expect((await triage.read()).received).toHaveLength(1);
 });
 
+it("goes by the signed payload's kind, not the header naming the event, which no signature covers", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe({ events: ["mergeRequest"] });
+  await triage.enable();
+
+  // An issue's delivery, replayed under another name, as anyone who captured it could.
+  expect(await gitlab.deliver("Merge Request Hook", issueHook("open", 42))).toEqual([204]);
+  expect(await gitlab.deliver("Merge Request Hook", mergeRequestHook("open", 42))).toEqual([204]);
+  await settled(account);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({ kind: "mergeRequest", action: "opened" })]);
+});
+
 it("delivers an event once, however often GitLab delivers it", async () => {
   const gitlab = new FakeGitLabHooks();
   const account = await connectAccount();
