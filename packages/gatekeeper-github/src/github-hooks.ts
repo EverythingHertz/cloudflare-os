@@ -135,7 +135,7 @@ type Unrecorded = { repo: PinnedRepo; url: string };
 const registrationKey = (key: string) => `reg:${key}`;
 const capabilitiesKey = (key: string) => `caps:${key}`;
 const webhookKey = (repoId: number) => `webhook:${repoId}`;
-const unrecordedKey = (repoId: number) => `unrecorded:${repoId}`;
+const unrecordedKey = (repoId: number, url: string) => `unrecorded:${repoId}:${url}`;
 const repairedKey = (repoId: number) => `repaired:${repoId}`;
 
 /**
@@ -146,8 +146,9 @@ const repairedKey = (repoId: number) => `repaired:${repoId}`;
  * next check's redeliveries start with), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows
  * and `queue:` indexes, and `revoked` once the account is disconnected, which refuses everything
  * for good. A webhook stays on record until GitHub has deleted it, or can't, and `account` with
- * it; `unrecorded:` notes, per repository, a webhook GitHub was asked to add or change while its id
- * is yet to be recorded, so that one added though GitHub's answer was lost is found and deleted.
+ * it; `unrecorded:` notes, per repository and URL, a webhook GitHub was asked to add or change while
+ * its id is yet to be recorded, so that one added though GitHub's answer was lost is found and
+ * deleted.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
@@ -369,10 +370,12 @@ export class GitHubHookDriver extends DurableObject<Env> {
       });
     }
     for (const unrecorded of this.#unrecorded()) {
-      // A hook's webhook, which only failed to be recorded, once the hook is enabled after all.
-      if (this.#registrations(unrecorded.repo).length > 0) continue;
+      // Unless it is the webhook of the hooks there, at the URL they deliver to, which just went
+      // unrecorded: one at another, as before WEBHOOK_ORIGIN changed, is no hook's.
+      const needed = () => this.#registrations(unrecorded.repo).length > 0 && (url === undefined || unrecorded.url === url);
+      if (needed()) continue;
       await this.#webhookChanges.run(async () => {
-        if (this.#registrations(unrecorded.repo).length === 0) await this.#deleteUnrecorded(account, unrecorded);
+        if (!needed()) await this.#deleteUnrecorded(account, unrecorded);
       }).catch((error: unknown) => {
         logger.warn("failed to delete a GitHub webhook", { event: "hooks.webhook.delete.failed", error });
       });
@@ -481,7 +484,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
     const config = { url, secret, events: webhookEvents(registrations) };
     const recorded = kv.get<Webhook>(webhookKey(repo.id));
     // Until the webhook GitHub answers with is recorded, in case its answer is lost.
-    kv.put<Unrecorded>(unrecordedKey(repo.id), { repo, url });
+    kv.put<Unrecorded>(unrecordedKey(repo.id, url), { repo, url });
     // `repaired` when it didn't deliver here until this restored it, as the hourly check would have.
     let made: { id: number; repaired: boolean };
     try {
@@ -508,7 +511,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
       throw webhookRefusal(repo, error);
     }
     kv.put<Webhook>(webhookKey(repo.id), { id: made.id, repo });
-    kv.delete(unrecordedKey(repo.id));
+    kv.delete(unrecordedKey(repo.id, url));
     // Disconnected meanwhile: revoke(), which waits for this change, deletes what it recorded.
     if (kv.get("revoked")) throw new Error(DISCONNECTED);
     if (made.repaired) kv.put(repairedKey(repo.id), Date.now());
@@ -532,7 +535,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
       const found = (await api.listRepoWebhooks(repo.id)).find(webhook => webhook.config.url === url);
       if (found) await api.deleteRepoWebhook(repo.id, found.id);
     });
-    if (settled) this.ctx.storage.kv.delete(unrecordedKey(repo.id));
+    if (settled) this.ctx.storage.kv.delete(unrecordedKey(repo.id, url));
   }
 
   /**

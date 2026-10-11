@@ -138,8 +138,9 @@ class FakeGitHub {
   /** While set, a webhook DELETE fails with this status; with `deleteDespiteFailure`, once it has deleted the webhook, as when its answer is lost. */
   failDeletesWith: number | undefined;
   deleteDespiteFailure = false;
-  /** Headers a failed DELETE is answered with, such as a rate limit's. */
+  /** Headers a failed DELETE is answered with, such as a rate limit's, and its message. */
   failDeletesHeaders: Record<string, string> = {};
+  failDeletesMessage = "Failed";
   /** While set, adding a webhook stalls, counted in `stalledCreates`, polled as `stallDeletes` is. */
   stallCreates = false;
   stalledCreates = 0;
@@ -215,7 +216,7 @@ class FakeGitHub {
           this.deleted.push(id);
         }
         if (this.failDeletesWith !== undefined) {
-          return Response.json({ message: "Failed" }, { status: this.failDeletesWith, headers: this.failDeletesHeaders });
+          return Response.json({ message: this.failDeletesMessage }, { status: this.failDeletesWith, headers: this.failDeletesHeaders });
         }
         return new Response(null, { status: 204 });
       }
@@ -1436,13 +1437,24 @@ it("revokes a disconnected account's token even when its hook driver can't be re
   expect(github.requests).toContain("DELETE /applications/test-client/token");
 });
 
-it.each<[string, number, Record<string, string>, boolean]>([
-  ["fails to delete", 500, {}, false],
+it.each<[string, (github: FakeGitHub) => void]>([
+  ["fails to delete", github => { github.failDeletesWith = 500; }],
   // Asked again, GitHub has no such webhook.
-  ["loses its answer to deleting", 500, {}, true],
-  // A 403 as much as a 429, which only its headers tell from a refusal.
-  ["rate-limits deleting", 403, { "x-ratelimit-remaining": "0" }, false],
-])("keeps a disconnecting account connected, with its token, until its webhooks are gone, when GitHub %s one", async (_, status, headers, deleted) => {
+  ["loses its answer to deleting", github => {
+    github.failDeletesWith = 500;
+    github.deleteDespiteFailure = true;
+  }],
+  // A 403 as much as a 429, which only its headers, or for a secondary limit its message, tell from
+  // a refusal.
+  ["rate-limits deleting", github => {
+    github.failDeletesWith = 403;
+    github.failDeletesHeaders = { "x-ratelimit-remaining": "0" };
+  }],
+  ["meets a secondary rate limit deleting", github => {
+    github.failDeletesWith = 403;
+    github.failDeletesMessage = "You have exceeded a secondary rate limit. Please wait a few minutes before you try again.";
+  }],
+])("keeps a disconnecting account connected, with its token, until its webhooks are gone, when GitHub %s one", async (_, fail) => {
   const github = new FakeGitHub();
   const account = await connectAccount();
   const triage = binding(account);
@@ -1450,9 +1462,7 @@ it.each<[string, number, Record<string, string>, boolean]>([
   await triage.enable();
   const [webhook] = github.webhooks.values();
 
-  github.failDeletesWith = status;
-  github.failDeletesHeaders = headers;
-  github.deleteDespiteFailure = deleted;
+  fail(github);
   expect(await triage.hooks.revokeAccount(account)).toEqual({
     error: "GitHub failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
   });
@@ -1596,6 +1606,34 @@ it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promis
   github.loseCreateAnswers = false;
   await cleanUp(account, triage);
   expect(github.webhooks.size).toBe(0);
+});
+
+it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promise<unknown>, number]>([
+  ["as the account is disconnected", (account, triage) => unwrap(triage.hooks.revokeAccount(account)), 0],
+  // Keeping the webhook the hook delivers through now.
+  ["at the next hourly check", account => after(HOUR, account), 1],
+])("deletes %s a webhook an unanswered enable left at a URL the deployment has since moved from", async (_, cleanUp, kept) => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  github.loseCreateAnswers = true;
+  await expect(triage.enable()).rejects.toThrow("Network connection lost.");
+  github.loseCreateAnswers = false;
+
+  // Enabled again once the deployment's origin has changed, as a development tunnel's does.
+  const shared = env as { WEBHOOK_ORIGIN?: string };
+  const origin = shared.WEBHOOK_ORIGIN;
+  shared.WEBHOOK_ORIGIN = "https://moved.gadgets.test";
+  try {
+    await triage.enable();
+    expect(github.webhooks.size).toBe(2);
+    await cleanUp(account, triage);
+  } finally {
+    shared.WEBHOOK_ORIGIN = origin;
+  }
+  expect([...github.webhooks.values()].filter(webhook => webhook.url.startsWith("https://moved.gadgets.test/"))).toHaveLength(kept);
+  expect(github.webhooks.size).toBe(kept);
 });
 
 it("keeps on record the webhook an enable added as its account was disconnected, until GitHub has deleted it", async () => {
