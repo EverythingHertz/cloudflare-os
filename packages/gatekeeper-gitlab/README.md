@@ -166,7 +166,7 @@ root `.dev.vars`.
 What this relies on GitLab for is checked against GitLab itself by `pnpm test:contract`
 (`__tests__/contract`), which the `gitlab-contract` workflow runs weekly and on demand once the
 `CONTRACT_GITLAB_TOKEN` secret and `CONTRACT_GITLAB_PROJECT` variable name a disposable private
-project:
+project (the token reaching that project alone, as a Maintainer; see the workflow):
 - a reader without access gets a 404;
 - a webhook keeps the settings the hourly check compares;
 - an attempt's log names its delivery, which a resend repeats;

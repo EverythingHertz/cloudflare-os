@@ -3,18 +3,14 @@
 // can only assume it. The gitlab-contract workflow runs this weekly and on demand against a
 // disposable private project, with at least one commit, on GitLab 19.0 or later (gitlab.com
 // unless CONTRACT_GITLAB_URL names another instance). CONTRACT_GITLAB_PROJECT names it by its path,
-// and CONTRACT_GITLAB_TOKEN is an access token with the `api` scope of an account that maintains
-// it. With either unset, every check is skipped. What the checks make is removed or closed after
-// them, however they end.
+// and CONTRACT_GITLAB_TOKEN is a token that reaches that project alone, as a Maintainer (see the
+// workflow). With either unset, every check is skipped. What the checks make is removed or closed
+// after them, however they end.
 //
 // CONTRACT_GITLAB_WEBHOOK_URL is where the webhooks deliver, https://example.com/webhook unless
 // set: nothing has to answer, since GitLab's webhook log records each request whatever the answer.
-// CONTRACT_GITLAB_PAYLOADS_DIR, if set, receives each payload GitLab sent, with the account's and
-// project's names replaced, for fixtures.
 
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   GitLabApi, type GitLabIssueResponse, type GitLabProjectResponse, type GitLabUserResponse, type GitLabWebhookTrigger,
@@ -25,7 +21,6 @@ const token = process.env.CONTRACT_GITLAB_TOKEN;
 const projectPath = process.env.CONTRACT_GITLAB_PROJECT;
 const origin = (process.env.CONTRACT_GITLAB_URL || "https://gitlab.com").replace(/\/+$/, "");
 const receiver = process.env.CONTRACT_GITLAB_WEBHOOK_URL || "https://example.com/webhook";
-const payloadsDir = process.env.CONTRACT_GITLAB_PAYLOADS_DIR;
 
 /** One attempt in a webhook's log, as GitLab lists it, with what it sent. */
 type LoggedEvent = {
@@ -126,20 +121,8 @@ describe.skipIf(!token || !projectPath)("GitLab, as the GitLab gatekeeper's hook
       (await logged(hookId)).toReversed().find(found => header(found, "X-Gitlab-Event") === event && matches(found)));
   }
 
-  /** Keep `found`'s payload as a fixture, with the account's and project's names replaced. */
-  function keep(fixture: string, found: LoggedEvent): void {
-    if (!payloadsDir) return;
-    let text = JSON.stringify(payloadOf(found), null, 2);
-    const [namespace = "", ...rest] = projectPath!.split("/");
-    for (const [real, placeholder] of [[rest.join("/"), "widgets"], [namespace, "acme"], [viewer.username, "ada"]] as const) {
-      if (!real) continue;
-      text = text.replaceAll(new RegExp(`\\b${real.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"), placeholder);
-    }
-    mkdirSync(payloadsDir, { recursive: true });
-    writeFileSync(join(payloadsDir, `${fixture}.json`), `${text}\n`);
-  }
-
   beforeAll(async () => {
+    if (new URL(origin).protocol !== "https:") throw new Error("CONTRACT_GITLAB_URL must be https, or the token would go in the clear.");
     project = await api.getProject(projectPath!);
     if (project.visibility !== "private") {
       throw new Error(`${projectPath} must be private, or anyone could read it and the access check would prove nothing.`);
@@ -187,8 +170,6 @@ describe.skipIf(!token || !projectPath)("GitLab, as the GitLab gatekeeper's hook
     const note = await api.createNote(projectPath!, "issues", issue.iid, "Commented by the GitLab contract checks.");
     const opened = await attempt(hook.id, "Issue Hook", ofIssue(issue, "open"));
     const commented = await attempt(hook.id, "Note Hook", found => payloadOf(found).object_attributes?.id === note.id);
-    keep("issue.open", opened);
-    keep("note.create", commented);
     for (const found of [opened, commented]) {
       expect(deliveryOf(found)).toMatch(/\S/);
       expect(header(found, "webhook-timestamp")).toMatch(/^\d+$/);
@@ -260,8 +241,6 @@ describe.skipIf(!token || !projectPath)("GitLab, as the GitLab gatekeeper's hook
     const pushed = await attempt(hook.id, "Push Hook", found => payloadOf(found).after === commit.id);
     const mergeRequest = await attempt(hook.id, "Merge Request Hook", found =>
       payloadOf(found).object_attributes?.iid === opened.iid && payloadOf(found).object_attributes?.action === "open");
-    keep("push", pushed);
-    keep("merge_request.open", mergeRequest);
     expect(parseWebhookEvent("Push Hook", deliveryOf(pushed)!, project.id, payloadOf(pushed), origin)).toMatchObject({
       event: { kind: "push", branch, before: commit.parent_ids[0], after: commit.id },
     });
