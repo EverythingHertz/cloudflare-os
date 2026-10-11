@@ -323,7 +323,12 @@ export class XHookDriver extends DurableObject<Env> {
 // ── Router ──────────────────────────────────────────────────────────
 
 /** A subscription this deployment holds at X; `deleting` once X failed to confirm deleting it. */
-type Subscription = { id: string; deleting?: true };
+/**
+ * One of X's subscriptions as a router records it. `at` is when the router asked X for it, or saw
+ * it listed: a revocation from before then can't have deleted it, and one after then did, whenever
+ * X's answer came. A record kept before that was noted has none.
+ */
+type Subscription = { id: string; deleting?: true; at?: number };
 
 const subscriptionKey = (eventType: string) => `sub:${eventType}`;
 const watcherPrefix = (eventType: string) => `watch:${eventType}:`;
@@ -391,13 +396,19 @@ export class XActivityRouter extends DurableObject<Env> {
   }
 
   /**
-   * The user revoked this app: X deleted the subscriptions their token made, so the next watch of
-   * a private event subscribes afresh. In turn with the other changes, so a watch whose answer
-   * arrives after the revocation can't put back a subscription X has deleted.
+   * The user revoked this app at `at`: X deleted the subscriptions their token had made, so the
+   * next watch of a private event subscribes afresh. One made since is the new token's and is kept,
+   * though X delivers the revocation again or late; with no time, every one is forgotten. In turn
+   * with the other changes, so a watch whose answer arrives after the revocation can't put back a
+   * subscription X has deleted.
    */
-  async revoked(): Promise<void> {
+  async revoked(at: number): Promise<void> {
     await this.#changes.run(async () => {
-      for (const eventType of PRIVATE_EVENT_TYPES) this.ctx.storage.kv.delete(subscriptionKey(eventType));
+      const kv = this.ctx.storage.kv;
+      for (const eventType of PRIVATE_EVENT_TYPES) {
+        const stored = kv.get<Subscription>(subscriptionKey(eventType));
+        if (stored !== undefined && !((stored.at ?? 0) >= at)) kv.delete(subscriptionKey(eventType));
+      }
     });
   }
 
@@ -413,12 +424,13 @@ export class XActivityRouter extends DurableObject<Env> {
   async #subscribe(userId: string, eventType: string, account: string): Promise<Subscription> {
     const webhookId = await this.ctx.exports.XWebhookRegistry.getByName(REGISTRY).webhookId();
     const body = { event_type: eventType, filter: { user_id: userId }, webhook_id: webhookId, tag: TAG };
+    const at = Date.now();
     try {
       const created = PRIVATE_EVENT_TYPES.has(eventType)
         ? await accountSource(this.ctx.exports, account).run(creds =>
           new XApi(creds.accessToken).post<SubscriptionResponse>("/2/activity/subscriptions", body))
         : await appApi(this.env).post<SubscriptionResponse>("/2/activity/subscriptions", body);
-      return { id: subscriptionIdOf(requireData(created, "subscription")) };
+      return { id: subscriptionIdOf(requireData(created, "subscription")), at };
     } catch (error) {
       // Refused as one X already has, or perhaps made with the answer lost: either way, X's is adopted.
       if (!isDuplicate(error) && !isOutcomeUnknown(error)) throw error;
@@ -429,7 +441,7 @@ export class XActivityRouter extends DurableObject<Env> {
       }
       const existing = await findSubscription(this.env, eventType, userId);
       if (!existing) throw error;
-      return { id: existing };
+      return { id: existing, at };
     }
   }
 
@@ -439,7 +451,7 @@ export class XActivityRouter extends DurableObject<Env> {
     try {
       if (kv.get<Subscription>(subscriptionKey(eventType)) === undefined) {
         const id = await findSubscription(this.env, eventType, userId);
-        if (id !== undefined) kv.put(subscriptionKey(eventType), { id });
+        if (id !== undefined) kv.put<Subscription>(subscriptionKey(eventType), { id, at: Date.now() });
       }
       kv.delete(unconfirmedKey(eventType));
     } catch (error) {
@@ -667,7 +679,7 @@ export async function handleWebhookRequest(request: Request, env: Env, exports: 
     const delivered = parseDelivery(item);
     if (delivered === undefined) continue;
     if (delivered.type === "revoke") {
-      await exports.XActivityRouter.getByName(delivered.userId).revoked();
+      await exports.XActivityRouter.getByName(delivered.userId).revoked(delivered.at);
       continue;
     }
     // Older than the delivery queue remembers: nothing would stop its replay.
@@ -680,7 +692,8 @@ export async function handleWebhookRequest(request: Request, env: Env, exports: 
 /** One event of a delivery, as routing needs it. */
 type Delivery =
   | { type: "post"; eventType: string; event: XActivityEvent; at: number }
-  | { type: "revoke"; userId: string };
+  /** `at`: when X says the user revoked this app, NaN when it doesn't say. */
+  | { type: "revoke"; userId: string; at: number };
 
 const KINDS_BY_EVENT_TYPE = new Map(Object.entries(EVENT_TYPES).map(([kind, type]) => [type, kind as XHookKind]));
 
@@ -692,7 +705,8 @@ export function parseDelivery(item: unknown): Delivery | undefined {
   if (typeof eventType !== "string" || typeof payload !== "object" || payload === null) return undefined;
   if (eventType === "oauth.revoke") {
     const userId = (payload as ActivityJson).user_id;
-    return typeof userId === "string" ? { type: "revoke", userId } : undefined;
+    if (typeof userId !== "string") return undefined;
+    return { type: "revoke", userId, at: typeof createdAt === "string" ? Date.parse(createdAt) : Number.NaN };
   }
   const kind = KINDS_BY_EVENT_TYPE.get(eventType);
   const userId = (filter as ActivityJson | undefined)?.user_id;

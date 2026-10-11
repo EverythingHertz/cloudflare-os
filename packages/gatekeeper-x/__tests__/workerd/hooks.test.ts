@@ -433,13 +433,28 @@ describe("accounts going away", () => {
     // X deletes what the token made and says so before answering the subscription it was making:
     // long enough for the revocation to land, were it not held behind that subscription.
     const router = env.X_ACTIVITY_ROUTER.getByName(ALICE.id);
-    const revoking = router.revoked();
+    const revoking = router.revoked(Date.now());
     await new Promise(resolve => setTimeout(resolve, 100));
     release();
     unwrap(await enabling);
     await revoking;
     await runInDurableObject(router, (_instance, state) =>
       expect(state.storage.kv.get("sub:post.mention.create")).toBeUndefined());
+  });
+
+  it("keeps a subscription made after a revocation that X delivers again", async () => {
+    const { x, hook } = await watchingMentions();
+    const revocation = { id: "revoke-1", createdAt: new Date(Date.now() - 1000).toISOString() };
+    // X deletes what the revoked token made, and says so.
+    for (const [id, subscription] of x.subscriptions) if (subscription.by === ALICE.id) x.subscriptions.delete(id);
+    expect(await x.deliver("oauth.revoke", undefined, { user_id: ALICE.id }, revocation)).toBe(200);
+    // Reconnected, the hook subscribes afresh, and X delivers the same revocation once more...
+    await hook.disable();
+    await hook.enable();
+    expect(await x.deliver("oauth.revoke", undefined, { user_id: ALICE.id }, revocation)).toBe(200);
+    // ...which leaves the new subscription recorded, so disabling the hook ends it at X.
+    await hook.disable();
+    expect(subscriptionsOf(x).map(([type]) => type)).toEqual(["oauth.revoke"]);
   });
 
   it("undoes the subscription of a hook enabled as the account is disconnected", async () => {
