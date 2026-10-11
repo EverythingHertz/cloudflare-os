@@ -29,16 +29,18 @@ import {
 } from "./x-api";
 import type { StoredIdentity } from "./x-credentials";
 import { VENDOR_ID } from "./x-env";
-import { sentContent, type SentContent, type WireList, type WirePost } from "./x-normalize";
+import { sentContent, type SentContent, type WireList, type WirePost, type WireUser } from "./x-normalize";
 import {
-  TEXT_LIMIT, TEXT_LIMIT_PREMIUM, comparableText, comparableUrl, duplicateKey, extractMentions, extractUrls,
-  weightedLength,
+  TEXT_LIMIT, TEXT_LIMIT_PREMIUM, comparableText, comparableUrl, duplicateKey, extractCashtags, extractMentions, extractUrls,
+  weightedLength, withoutLeadingMentions,
 } from "./x-text";
 
 /** Most posts one thread may hold. */
 export const MAX_THREAD_POSTS = 25;
 /** Most images one post may carry. */
 export const MAX_IMAGES_PER_POST = 4;
+/** Cashtags X takes in a post a self-serve app makes. */
+export const MAX_CASHTAGS = 1;
 /** Largest image X accepts for a post. */
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 /** Longest alt text X accepts. */
@@ -95,11 +97,29 @@ export type XActions = {
   };
   deletePost: { post: PostTarget; appliedAt?: number };
   like: { post: PostTarget; on: boolean; appliedAt?: number };
-  repost: { post: PostTarget; on: boolean; appliedAt?: number };
+  repost: {
+    post: PostTarget;
+    on: boolean;
+    /** When it was staged: what a pending repost's row is dated by. */
+    submittedAt?: number;
+    appliedAt?: number;
+  };
   bookmark: { post: PostTarget; on: boolean; appliedAt?: number };
   hide: { post: PostTarget; hidden: boolean; appliedAt?: number };
-  follow: { user: XUserInfo; on: boolean; appliedAt?: number };
-  mute: { user: XUserInfo; on: boolean; appliedAt?: number };
+  follow: {
+    user: XUserInfo;
+    on: boolean;
+    /** Whether the account already followed them, read just before it applied: what a revert restores. */
+    before?: boolean;
+    appliedAt?: number;
+  };
+  mute: {
+    user: XUserInfo;
+    on: boolean;
+    /** Whether the account already muted them, read just before it applied: what a revert restores. */
+    before?: boolean;
+    appliedAt?: number;
+  };
   createList: {
     ref: string;
     name: string;
@@ -139,10 +159,15 @@ export type XActionHost = {
   /** Posts a thread has published so far, so a retry resumes rather than reposting. */
   progress: { get(id: number): string[]; put(id: number, ids: string[]): void; delete(id: number): void };
   /**
-   * A List's details from just before an update first went to X, so a retry after X applied it
-   * but lost the answer still records what to restore.
+   * What an action changes, from just before it first went to X -- a List's details, or whether a
+   * follow or mute was already on -- so a retry after X applied it but lost the answer still records
+   * what to restore.
    */
-  previous: { get(id: number): ListDetails | undefined; put(id: number, details: ListDetails): void; delete(id: number): void };
+  previous: {
+    get(id: number): ListDetails | boolean | undefined;
+    put(id: number, before: ListDetails | boolean): void;
+    delete(id: number): void;
+  };
   /** A send whose outcome X never reported, keyed by action and post index (0 for a List). */
   attempts: {
     get(key: string): SendAttempt | undefined; put(key: string, attempt: SendAttempt): void; delete(key: string): void;
@@ -207,6 +232,21 @@ const IMAGE_SIGNATURES: Record<string, (bytes: Uint8Array) => boolean> = {
  * @param pendingTexts Texts of posts already waiting to publish, as `duplicateKey` keys them, since X
  * refuses a duplicate.
  */
+/**
+ * Refuses a reply X would refuse: a self-serve app may reply only to a post that summons the account,
+ * by being its own or by mentioning it or quoting one of its posts. A reply to the account mentions
+ * it, so its own conversations stay open.
+ */
+export function validateReplyParent(parent: XPostInfo, me: StoredIdentity): void {
+  const summoned = parent.author.id === me.id
+    || parent.mentions.some(handle => handle.toLowerCase() === me.username.toLowerCase())
+    || parent.quoteOf?.author.id === me.id;
+  if (!summoned) {
+    throw new Error(`X takes a reply made through the API only to a post by @${me.username}, or one that ` +
+      `mentions @${me.username} or quotes one of its posts, and this post does none of those.`);
+  }
+}
+
 export function validateDraft(draft: XPostDraft, me: StoredIdentity, pendingTexts: ReadonlySet<string>): void {
   const images = draft.images ?? [];
   const text = draft.text ?? "";
@@ -216,6 +256,9 @@ export function validateDraft(draft: XPostDraft, me: StoredIdentity, pendingText
   if (length > limit) {
     throw new Error(`This post is ${length} characters as X counts them (each link counts as 23), ` +
       `over the ${limit.toLocaleString("en-US")}-character limit for @${me.username}.`);
+  }
+  if (extractCashtags(text).length > MAX_CASHTAGS) {
+    throw new Error("X takes at most one cashtag (such as $TICKER) in a post made through the API.");
   }
   if (images.length > MAX_IMAGES_PER_POST) throw new Error(`A post can carry at most ${MAX_IMAGES_PER_POST} images.`);
   if (draft.poll && images.length > 0) throw new Error("A post can't have both a poll and images.");
@@ -312,6 +355,25 @@ function refuse(error: unknown, what: string): never {
  * Runs a write X makes idempotent -- liking a liked post or following a followed account answers
  * with the resulting state, not an error -- so a replay under refreshed credentials is safe.
  */
+/**
+ * Whether the account already followed or muted `userId`, so a revert restores that rather than
+ * undoing a change that made none: read from X once, before the action's first effect, and kept for
+ * its retries, which would otherwise read that effect back. A follow request already sent counts as
+ * a follow.
+ */
+async function stateBefore(host: XActionHost, actionId: number, userId: string,
+                           relationship: "following" | "muting"): Promise<boolean> {
+  const recorded = host.previous.get(actionId);
+  if (typeof recorded === "boolean") return recorded;
+  const user = requireData(await host.read<WireUser>(1, api => api.get<WireUser>(`/2/users/${userId}`, {
+    "user.fields": "connection_status",
+  })), "user");
+  const status = user.connection_status ?? [];
+  const before = status.includes(relationship) || (relationship === "following" && status.includes("follow_request_sent"));
+  host.previous.put(actionId, before);
+  return before;
+}
+
 async function toggle(host: XActionHost, op: (api: XApi, me: StoredIdentity) => Promise<unknown>,
                       what: string): Promise<void> {
   try {
@@ -351,6 +413,25 @@ function unresolved(things: "posts" | "Lists"): ActionOutcomeUnknownError {
 }
 
 /**
+ * Whether a send's window has closed: X has dated, and shown, anything the send made by then, so a
+ * look that finds nothing proves it made nothing. Until then X may still be about to show it.
+ */
+function windowClosed(attempt: SendAttempt): boolean {
+  return attempt.at + RECONCILE_WINDOW_MS < Date.now() - CLOCK_SKEW_MS;
+}
+
+/**
+ * The end of a look that found nothing while X may yet show what the send made: X can take minutes
+ * to show a new post. It fails the apply, keeping the attempt, so an approval after `conclusive`
+ * looks again rather than sending a second.
+ */
+function notShownYet(conclusive: number): Error {
+  const after = new Date(Math.ceil(conclusive / 60_000) * 60_000).toISOString().slice(11, 16);
+  return new Error("X doesn't show this post yet, and one it made can take a few minutes to appear, so it " +
+    `wasn't sent again. Approve it again after ${after} UTC to look once more.`);
+}
+
+/**
  * The rows of a reconciliation read. X can answer 200 with errors in place of rows, and a row it
  * left out could be what the send made, so such an answer settles nothing: it fails the apply,
  * leaving the attempt for the next approval to look again, rather than letting it send twice.
@@ -367,7 +448,7 @@ function completeRows<T>(envelope: XEnvelope<T[]>, things: "posts" | "Lists"): T
 function contentKey(content: SentContent): string {
   return JSON.stringify([
     content.replyTo ?? null,
-    comparableText(content.text),
+    comparableText(content.replyTo ? withoutLeadingMentions(content.text) : content.text),
     content.links.map(comparableUrl).toSorted(),
     content.mediaIds.toSorted(),
     content.poll,
@@ -378,18 +459,18 @@ function contentKey(content: SentContent): string {
  * Finds the post a send whose outcome X never reported made, so a retry binds it instead of
  * posting twice: among the account's posts dated around the attempt, the one with the draft's
  * reply parent, text, link destinations and poll, carrying the media the attempt uploaded.
- * @returns The post's ID, or `undefined` when none matches and the send may go again.
+ * @returns The post's ID, or `undefined` when none matches: proof the send made none only once its
+ * window has closed (`windowClosed`).
  * @throws ActionOutcomeUnknownError when more than one could match, or one from before the send
  * (`unresolved`).
  */
 async function findPublished(host: XActionHost, draft: StoredDraft, replyTo: string | undefined,
                              attempt: SendAttempt): Promise<string | undefined> {
-  const windowEnd = attempt.at + RECONCILE_WINDOW_MS;
   const envelope = await host.read<WirePost[]>(5, (api, me) => api.get<WirePost[]>(`/2/users/${me.id}/tweets`, {
     max_results: 100,
     start_time: xTime(new Date(attempt.at - CLOCK_SKEW_MS)),
     // Until the window has closed it runs to the present.
-    ...(windowEnd < Date.now() - CLOCK_SKEW_MS ? { end_time: xTime(new Date(windowEnd)) } : {}),
+    ...(windowClosed(attempt) ? { end_time: xTime(new Date(attempt.at + RECONCILE_WINDOW_MS)) } : {}),
     "tweet.fields": "created_at,referenced_tweets,note_tweet,entities,attachments",
   }));
   const wanted = contentKey({
@@ -450,11 +531,14 @@ async function publishOne(host: XActionHost, draft: StoredDraft, replyTo: string
                           attemptKey: string): Promise<string> {
   const prior = host.attempts.get(attemptKey);
   if (prior) {
+    // Judged before the look: one run while the window was open proves nothing by finding nothing.
+    const conclusive = windowClosed(prior);
     const landed = await findPublished(host, draft, replyTo, prior);
     if (landed) {
       host.attempts.delete(attemptKey);
       return landed;
     }
+    if (!conclusive) throw notShownYet(prior.at + RECONCILE_WINDOW_MS + CLOCK_SKEW_MS);
   }
 
   const mediaIds: string[] = [];
@@ -674,7 +758,7 @@ export const actions = defineActions<XActionHost, XActions>({
         ...targetFields(buildDescription(payload.on
           ? `Like this post by ${post(payload.post)} as ${handle(me.username)}.`
           : `Remove ${handle(me.username)}'s like from this post by ${post(payload.post)}.`), payload.post).finish(),
-        implementsRevert: true,
+        implementsRevert: false,
       };
     },
     dependsOn: payload => isProvisional(payload.post.id) ? [payload.post.id] : [],
@@ -699,7 +783,7 @@ export const actions = defineActions<XActionHost, XActions>({
         ...targetFields(buildDescription(payload.on
           ? `Repost this post by ${post(payload.post)} to ${handle(me.username)}'s followers.`
           : `Undo ${handle(me.username)}'s repost of this post by ${post(payload.post)}.`), payload.post).finish(),
-        implementsRevert: true,
+        implementsRevert: false,
       };
     },
     dependsOn: payload => isProvisional(payload.post.id) ? [payload.post.id] : [],
@@ -726,7 +810,7 @@ export const actions = defineActions<XActionHost, XActions>({
         ...targetFields(buildDescription(payload.on
           ? `Bookmark this post by ${post(payload.post)} in ${handle(me.username)}'s private bookmarks.`
           : `Remove this post by ${post(payload.post)} from ${handle(me.username)}'s bookmarks.`), payload.post).finish(),
-        implementsRevert: true,
+        implementsRevert: false,
       };
     },
     dependsOn: payload => isProvisional(payload.post.id) ? [payload.post.id] : [],
@@ -751,7 +835,7 @@ export const actions = defineActions<XActionHost, XActions>({
       ...targetFields(buildDescription(payload.hidden
         ? `Hide this reply by ${post(payload.post)} from the conversation. It stays reachable behind X's "hidden replies" link.`
         : `Show this reply by ${post(payload.post)} in the conversation again.`), payload.post).finish(),
-      implementsRevert: true,
+        implementsRevert: false,
     }),
     dependsOn: payload => isProvisional(payload.post.id) ? [payload.post.id] : [],
     apply: async (payload, host) => {
@@ -778,12 +862,14 @@ export const actions = defineActions<XActionHost, XActions>({
         implementsRevert: true,
       };
     },
-    apply: async (payload, host) => {
+    apply: async (payload, host, ctx) => {
+      const before = await stateBefore(host, ctx.id, payload.user.id, "following");
       await toggle(host, (api, me) => payload.on
         ? api.post(`/2/users/${me.id}/following`, { target_user_id: payload.user.id })
         : api.delete(`/2/users/${me.id}/following/${payload.user.id}`),
       payload.on ? "follow this account" : "unfollow this account");
-      return { action: { ...payload, appliedAt: Date.now() } };
+      host.previous.delete(ctx.id);
+      return { action: { ...payload, before, appliedAt: Date.now() } };
     },
   },
 
@@ -804,12 +890,14 @@ export const actions = defineActions<XActionHost, XActions>({
         implementsRevert: true,
       };
     },
-    apply: async (payload, host) => {
+    apply: async (payload, host, ctx) => {
+      const before = await stateBefore(host, ctx.id, payload.user.id, "muting");
       await toggle(host, (api, me) => payload.on
         ? api.post(`/2/users/${me.id}/muting`, { target_user_id: payload.user.id })
         : api.delete(`/2/users/${me.id}/muting/${payload.user.id}`),
       payload.on ? "mute this account" : "unmute this account");
-      return { action: { ...payload, appliedAt: Date.now() } };
+      host.previous.delete(ctx.id);
+      return { action: { ...payload, before, appliedAt: Date.now() } };
     },
   },
 
@@ -882,7 +970,8 @@ export const actions = defineActions<XActionHost, XActions>({
     dependsOn: payload => isProvisional(payload.list.id) ? [payload.list.id] : [],
     apply: async (payload, host, ctx) => {
       const id = listId(host, payload.list);
-      let previous = host.previous.get(ctx.id);
+      const recorded = host.previous.get(ctx.id);
+      let previous = typeof recorded === "object" ? recorded : undefined;
       if (previous === undefined) {
         const before = requireData(await host.read<WireList>(1, api => api.get<WireList>(`/2/lists/${id}`, LIST_FIELDS)), "List");
         // Privacy X didn't report is restored as private, the safe way to be wrong.
@@ -931,7 +1020,7 @@ export const actions = defineActions<XActionHost, XActions>({
           ? `Add @${payload.user.username} to the X List "${payload.list.info.name}"`
           : `Remove @${payload.user.username} from the X List "${payload.list.info.name}"`),
         ...builder.finish(),
-        implementsRevert: true,
+        implementsRevert: false,
       };
     },
     dependsOn: payload => isProvisional(payload.list.id) ? [payload.list.id] : [],
@@ -957,9 +1046,17 @@ export const actions = defineActions<XActionHost, XActions>({
 /** The outcome `revertAction` reports. */
 export type RevertOutcome = void | { message?: string; canRetry?: boolean; restart?: boolean };
 
+/** A revert refused because X can't say how things stood before the action. */
+const PRIOR_UNKNOWN: RevertOutcome = {
+  message: "X can't say how this stood before the action, so undoing it could remove what was there " +
+    "already. Change it on X if it shouldn't stay.",
+  canRetry: false,
+};
+
 /**
- * Undoes an applied action with the inverse call. Posts are deleted, toggles flipped back, a List's
- * old details restored; a deletion cannot be undone.
+ * Undoes an applied action. Posts are deleted, a List's old details restored, and a follow or mute
+ * returned to how it stood before; a deletion cannot be undone, nor a like, repost, bookmark, hide or
+ * List membership, since X can't say whether it was already so (`PRIOR_UNKNOWN`).
  */
 export async function revert(action: XAction, host: XActionHost): Promise<RevertOutcome> {
   switch (action.kind) {
@@ -973,33 +1070,19 @@ export async function revert(action: XAction, host: XActionHost): Promise<Revert
       return { message: "A deleted post can't be restored.", canRetry: false };
     case "deleteList":
       return { message: "A deleted List can't be restored.", canRetry: false };
-    case "like": {
-      const id = postId(host, action.payload.post);
-      await host.write((api, me) => action.payload.on
-        ? api.delete(`/2/users/${me.id}/likes/${id}`)
-        : api.post(`/2/users/${me.id}/likes`, { tweet_id: id }), { replayable: true });
-      return;
-    }
-    case "repost": {
-      const id = postId(host, action.payload.post);
-      await host.write((api, me) => action.payload.on
-        ? api.delete(`/2/users/${me.id}/retweets/${id}`)
-        : api.post(`/2/users/${me.id}/retweets`, { tweet_id: id }), { replayable: true });
-      return;
-    }
-    case "bookmark": {
-      const id = postId(host, action.payload.post);
-      await host.write((api, me) => action.payload.on
-        ? api.delete(`/2/users/${me.id}/bookmarks/${id}`)
-        : api.post(`/2/users/${me.id}/bookmarks`, { tweet_id: id }), { replayable: true });
-      return;
-    }
-    case "hide": {
-      const id = postId(host, action.payload.post);
-      await host.write(api => api.put(`/2/tweets/${id}/hidden`, { hidden: !action.payload.hidden }), { replayable: true });
-      return;
-    }
+    case "like":
+      return PRIOR_UNKNOWN;
+    case "repost":
+      return PRIOR_UNKNOWN;
+    case "bookmark":
+      return PRIOR_UNKNOWN;
+    case "hide":
+      return PRIOR_UNKNOWN;
     case "follow": {
+      const { before, on } = action.payload;
+      if (before === undefined) return PRIOR_UNKNOWN;
+      // A follow that changed nothing leaves nothing to undo.
+      if (before === on) return;
       const target = action.payload.user.id;
       await host.write((api, me) => action.payload.on
         ? api.delete(`/2/users/${me.id}/following/${target}`)
@@ -1007,6 +1090,9 @@ export async function revert(action: XAction, host: XActionHost): Promise<Revert
       return;
     }
     case "mute": {
+      const { before, on } = action.payload;
+      if (before === undefined) return PRIOR_UNKNOWN;
+      if (before === on) return;
       const target = action.payload.user.id;
       await host.write((api, me) => action.payload.on
         ? api.delete(`/2/users/${me.id}/muting/${target}`)
@@ -1026,13 +1112,7 @@ export async function revert(action: XAction, host: XActionHost): Promise<Revert
       await host.write(api => api.put(`/2/lists/${id}`, previous), { replayable: true });
       return;
     }
-    case "listMember": {
-      const id = listId(host, action.payload.list);
-      const user = action.payload.user.id;
-      await host.write(api => action.payload.add
-        ? api.delete(`/2/lists/${id}/members/${user}`)
-        : api.post(`/2/lists/${id}/members`, { user_id: user }), { replayable: true });
-      return;
-    }
+    case "listMember":
+      return PRIOR_UNKNOWN;
   }
 }

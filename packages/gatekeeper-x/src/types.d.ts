@@ -24,7 +24,11 @@ export interface Cursor<T> {
 
 /** How many results each page of a listing holds. */
 export type XPageOptions = {
-  /** Results per page, 1–100. Defaults to 20. */
+  /**
+   * Results per page, 1–100. Defaults to 20. Some listings take a larger page however small this is,
+   * because X returns and bills its minimum: 10 for `searchPosts`, `listReplies`, `listConversation`
+   * and `listQuotes`; 5 for `listMentions`, `listMyPosts`, a user's `listPosts` and `listLikedPosts`.
+   */
   pageSize?: number;
 };
 
@@ -32,10 +36,11 @@ export type XPageOptions = {
 export type XTimeRangeOptions = XPageOptions & {
   /**
    * Only posts newer than this post ID. Pass the newest post ID you have already seen to fetch
-   * only the posts that arrived since.
+   * only the posts that arrived since. A temporary ID ("~N") stands for its post: the ID X assigned
+   * once it is published, and until then the time it was submitted.
    */
   sinceId?: string;
-  /** Only posts older than this post ID. */
+  /** Only posts older than this post ID, which may be a temporary one, as for `sinceId`. */
   untilId?: string;
   /** Only posts created after this time. */
   startTime?: Date;
@@ -261,7 +266,12 @@ export interface XPost {
    */
   getConversationPost(postId: string): XPost;
 
-  /** Reply to this post as the connected account. Returns the new reply. */
+  /**
+   * Reply to this post as the connected account. Returns the new reply. X takes a reply made through
+   * the API only to a post that summons the account: one by the account, or one that mentions it or
+   * quotes one of its posts (a reply to the account mentions it). Any other is refused here, before
+   * it reaches the approver, so a Post binding replies within the account's own conversations.
+   */
   reply(draft: XPostDraft): Promise<XPost>;
 
   /** Like this post as the connected account. */
@@ -281,10 +291,11 @@ export interface XPost {
   delete(): Promise<void>;
 
   /**
-   * Hide this reply. Only replies in a conversation the connected account started can be hidden.
+   * Hide this reply. Only replies in a conversation the connected account started can be hidden;
+   * any other is refused here, before it reaches the approver.
    */
   hide(): Promise<void>;
-  /** Unhide this reply. */
+  /** Unhide this reply, on the same terms as `hide`. */
   unhide(): Promise<void>;
 
   /**
@@ -351,7 +362,10 @@ export interface XList {
   /** Read the List's details. */
   getInfo(): Promise<XListInfo>;
 
-  /** Posts from the List's members, newest first. */
+  /**
+   * Posts from the List's members, newest first. X offers no `sinceId` here, so polling a List
+   * re-reads its newest page (cached for a minute).
+   */
   listPosts(options?: XPageOptions): Promise<Cursor<XPostInfo>>;
 
   /** The List's members. */
@@ -427,7 +441,10 @@ export interface XAccountSession {
   /** A capability for a user by numeric ID. Dispose the returned stub when done. */
   getUserById(userId: string): XUser;
 
-  /** A capability for a List, by ID or link. Dispose the returned stub when done. */
+  /**
+   * A capability for a List, by ID, link, or the temporary ID ("~N") of one waiting to be created.
+   * Dispose the returned stub when done.
+   */
   getList(idOrUrl: string): XList;
 
   /** Publish a post as the connected account. Returns the new post. */

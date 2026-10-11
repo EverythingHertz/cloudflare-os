@@ -83,6 +83,16 @@ describe("pending posts", () => {
       .toEqual(["~3"]);
   });
 
+  it("dates a pending repost when it was staged, however late it is read", () => {
+    const stagedAt = Date.UTC(2026, 9, 1);
+    const repost: XAction = { kind: "repost", payload: { post: { id: "60", info: post("60") }, on: true, submittedAt: stagedAt } };
+    const read = (bounds?: XTimeRangeOptions) =>
+      overlayPosts([], pending(repost), { kind: "mine" }, { me, resolve: unresolved, newestPage: true, bounds });
+    expect(read().map(row => row.createdAt)).toEqual([new Date(stagedAt)]);
+    // So a later watermark doesn't bring it back as new.
+    expect(read({ startTime: new Date(Date.UTC(2026, 9, 10)) })).toEqual([]);
+  });
+
   it("joins a listing only within its bounds, by when the post shows as created", () => {
     const day = 24 * 60 * 60 * 1000;
     const submittedAt = Date.UTC(2026, 9, 1);
@@ -97,6 +107,20 @@ describe("pending posts", () => {
     expect(joins({ sinceId: idAt(submittedAt) })).toBe(false);
     expect(joins({ untilId: idAt(submittedAt + day) })).toBe(true);
     expect(joins({ untilId: idAt(submittedAt) })).toBe(false);
+  });
+});
+
+describe("pending follows", () => {
+  const follow = (relationship: XUserInfo["relationship"]): XAction =>
+    ({ kind: "follow", payload: { user: user("30", { relationship }), on: true } });
+
+  it("show in the account's follow lists as follows, keeping whether they follow back", () => {
+    const pendingFollow = pending(follow({ following: false, followedBy: true }));
+    expect(overlayFollowing([], pendingFollow, true)).toEqual([
+      expect.objectContaining({ id: "30", relationship: { following: true, followedBy: true } }),
+    ]);
+    const follower = user("30", { relationship: { following: false, followedBy: true } });
+    expect(overlayUser(follower, pendingFollow).relationship).toEqual({ following: true, followedBy: true });
   });
 });
 

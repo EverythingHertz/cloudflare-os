@@ -5,7 +5,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { XListInfo, XPostInfo, XUserInfo } from "../../src/types";
-import { ALICE, BOB, CAROL, FakeX, accountStub, failure, hooks, json, seedAccount, unwrap } from "./fake-x";
+import { ALICE, BOB, CAROL, FakeX, accountStub, failure, hooks, json, seedAccount, snowflakeAt, unwrap } from "./fake-x";
 import type { GatekeeperProps, Step } from "./worker";
 
 afterEach(() => {
@@ -115,6 +115,18 @@ describe("the daily read limit", () => {
     unwrap(await hooks().run(name, props, [["listMentions", { pageSize: 20 }]], { pages: 1 }));
     // One post and its author.
     expect(await readsUsed(userObjectId)).toBe(2);
+  });
+
+  it("reserves the page X will return, though a smaller one was asked for", async () => {
+    const { x, userObjectId, props, name } = await setup();
+    let reserved: number | undefined;
+    x.on("GET", /^\/2\/tweets\/search\/recent/, async () => {
+      reserved = await readsUsed(userObjectId);
+      return undefined;
+    });
+    unwrap(await hooks().run(name, props, [["searchPosts", "hello", { pageSize: 1 }]], { pages: 1 }));
+    // X's search returns, and bills, at least ten rows a page.
+    expect(reserved).toBe(10);
   });
 
   it("refuses reads past the deployment's limit, naming when it resets", async () => {
@@ -234,22 +246,79 @@ describe("what a read discloses", () => {
     expect(await exclusions(name)).toEqual([["observer"], undefined, ["observer"]]);
   });
 
-  it("decides a List's privacy afresh for each page, as X has it then", async () => {
+  it("decides a List's privacy for each page, as X described it within a minute", async () => {
     const { x, props, name } = await observed();
+    vi.useFakeTimers({ toFake: ["Date"] });
     x.lists.set("77", { id: "77", name: "Open", private: false, owner_id: ALICE.id, member_count: 2 });
     x.listMembers.set("77", new Set([BOB.id, CAROL.id]));
     let pages = 0;
     x.on("GET", /^\/2\/lists\/77\/members/, () => {
-      // Made private on X while the cursor is open, long before the cached List would expire.
-      if (++pages === 2) x.lists.get("77")!.private = true;
+      // Made private on X while the cursor is open, a minute after the List was last read and long
+      // before the List as cached would expire.
+      if (++pages === 2) {
+        x.lists.get("77")!.private = true;
+        vi.setSystemTime(Date.now() + 61 * 1000);
+      }
       return undefined;
     });
     unwrap(await hooks().run(name, props, [["getList", "77"], ["listMembers", { pageSize: 1 }]], { pages: 2 }));
     expect(await exclusions(name)).toEqual([undefined, ["observer"]]);
   });
 
-  it("withholds a List's rows once another binding of the connection made it private", async () => {
+  it("looks a List up at most once a minute while its posts are polled", async () => {
     const { x, props, name } = await observed();
+    x.lists.set("77", { id: "77", name: "Open", private: false, owner_id: ALICE.id, member_count: 1 });
+    x.listMembers.set("77", new Set([BOB.id]));
+    x.post(BOB, "listed");
+    for (let poll = 0; poll < 3; poll++) {
+      unwrap(await hooks().run(name, props, [["getList", "77"], ["listPosts"]], { pages: 1 }));
+    }
+    expect(x.count("GET", /^\/2\/lists\/77(\?|$)/)).toBe(1);
+  });
+
+  it("withholds a List's page X couldn't vouch for, rather than failing it", async () => {
+    const { x, props, name } = await observed();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    x.lists.set("77", { id: "77", name: "Open", private: false, owner_id: ALICE.id, member_count: 1 });
+    x.listMembers.set("77", new Set([BOB.id]));
+    unwrap(await hooks().run(name, props, [["getList", "77"], ["listMembers"]], { pages: 1 }));
+    vi.setSystemTime(Date.now() + 61 * 1000);
+    x.on("GET", /^\/2\/lists\/77(\?|$)/, () => json({ title: "Too Many Requests" }, { status: 429 }));
+    const [page] = unwrap(await hooks().run(name, props, [["getList", "77"], ["listMembers"]], { pages: 1 })) as XUserInfo[][];
+    expect(page.map(user => user.username)).toEqual(["bob"]);
+    expect(await exclusions(name)).toEqual([undefined, ["observer"]]);
+  });
+
+  it("judges the follow graph by the account's protection as X described it within a minute", async () => {
+    const { x, props, name } = await observed();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    x.following.add(`${ALICE.id}:${BOB.id}`);
+    x.post(BOB, "public words");
+    unwrap(await hooks().run(name, props, [["listFollowing"]], { pages: 1 }));
+    // The account turns protected on X, while the identity kept for display stays a day old at most.
+    x.users.set(ALICE.id, { ...ALICE, protected: true });
+    vi.setSystemTime(Date.now() + 61 * 1000);
+    unwrap(await hooks().run(name, props, [["listFollowing"]], { pages: 1 }));
+    unwrap(await hooks().run(name, props, [["listFollowers"]], { pages: 1 }));
+    unwrap(await hooks().run(name, props, [["getUser", "bob"], ["getInfo"]]));
+    unwrap(await hooks().run(name, props, [["listHomeTimeline"]], { pages: 1 }));
+    expect(await exclusions(name)).toEqual([undefined, ["observer"], ["observer"], ["observer"], ["observer"]]);
+  });
+
+  it("withholds the follow graph while X can't say whether the account is protected", async () => {
+    const { x, props, name } = await observed();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    x.following.add(`${ALICE.id}:${BOB.id}`);
+    vi.setSystemTime(Date.now() + 61 * 1000);
+    x.on("GET", /^\/2\/users\/me/, () => json({ title: "Service Unavailable" }, { status: 503 }));
+    const [page] = unwrap(await hooks().run(name, props, [["listFollowing"]], { pages: 1 })) as XUserInfo[][];
+    expect(page.map(user => user.username)).toEqual(["bob"]);
+    expect(await exclusions(name)).toEqual([["observer"]]);
+  });
+
+  it("withholds a List's rows once another binding of the connection made it private, within a minute", async () => {
+    const { x, props, name } = await observed();
+    vi.useFakeTimers({ toFake: ["Date"] });
     x.lists.set("77", { id: "77", name: "Open", private: false, owner_id: ALICE.id, member_count: 1 });
     x.listMembers.set("77", new Set([BOB.id]));
     // This binding caches the List as public.
@@ -260,6 +329,7 @@ describe("what a read discloses", () => {
     const [{ actionId }] = (await hooks().queueLog(other)).submitted;
     unwrap(await hooks().applyAction(other, props, actionId));
     expect(x.lists.get("77")!.private).toBe(true);
+    vi.setSystemTime(Date.now() + 61 * 1000);
     x.listMembers.get("77")!.add(CAROL.id);
     x.post(CAROL, "listed since");
     unwrap(await hooks().run(name, props, [["getList", "77"], ["listMembers"]], { pages: 1 }));
@@ -332,6 +402,21 @@ describe("pending actions in reads", () => {
     expect(await ids(["getPost", "~1"], ["listReplies", { endTime: later }])).toEqual(["~2"]);
   });
 
+  it("polls on from a pending post's temporary ID, before and after X publishes it", async () => {
+    const { x, props, name } = await setup();
+    unwrap(await hooks().run(name, props, [["createPost", { text: "Draft one" }]]));
+    const since = async (sinceId: string) =>
+      (unwrap(await hooks().run(name, props, [["listMyPosts", { sinceId }]], { pages: 1 })) as XPostInfo[][])[0]
+        .map(post => post.text);
+    expect(await since("~1")).toEqual([]);
+    const [{ actionId }] = (await hooks().queueLog(name)).submitted;
+    unwrap(await hooks().applyAction(name, props, actionId));
+    x.post(ALICE, "Later one");
+    expect(await since("~1")).toEqual(["Later one"]);
+    expect(failure(await hooks().run(name, props, [["listMyPosts", { sinceId: "~9" }]], { pages: 1 })))
+      .toBe("sinceId names no pending post; it may have been rejected.");
+  });
+
   it("shows a pending bookmark and follow", async () => {
     const { x, props, name } = await setup();
     const post = x.post(BOB, "worth keeping");
@@ -341,6 +426,16 @@ describe("pending actions in reads", () => {
     expect(bookmarks.map(item => item.id)).toEqual([post.id]);
     const bob = unwrap(await hooks().run(name, props, [["getUser", "bob"], ["getInfo"]])) as XUserInfo;
     expect(bob.relationship).toEqual({ following: true, followedBy: false });
+  });
+
+  it("shows a pending follow in both follow lists, so it isn't staged twice", async () => {
+    const { x, props, name } = await setup();
+    x.following.add(`${BOB.id}:${ALICE.id}`);
+    unwrap(await hooks().run(name, props, [["getUser", "bob"], ["follow"]]));
+    const [followers] = unwrap(await hooks().run(name, props, [["listFollowers"]], { pages: 1 })) as XUserInfo[][];
+    expect(followers.map(user => [user.username, user.relationship])).toEqual([["bob", { following: true, followedBy: true }]]);
+    const [following] = unwrap(await hooks().run(name, props, [["listFollowing"]], { pages: 1 })) as XUserInfo[][];
+    expect(following.map(user => [user.username, user.relationship])).toEqual([["bob", { following: true, followedBy: true }]]);
   });
 
   it("hides a post waiting for approval once its deletion is waiting too", async () => {
@@ -363,6 +458,21 @@ describe("pending actions in reads", () => {
     })]);
     const [withoutReposts] = unwrap(await hooks().run(name, props, [["listMyPosts", { excludeReposts: true }]], { pages: 1 })) as XPostInfo[][];
     expect(withoutReposts).toEqual([]);
+  });
+
+  it("dates a pending repost when it was staged, so later bounds leave it out", async () => {
+    const { x, props, name } = await setup();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const post = x.post(BOB, "worth sharing");
+    unwrap(await hooks().run(name, props, [["getPost", post.id], ["repost"]]));
+    const staged = Date.now();
+    vi.setSystemTime(staged + 60 * 60 * 1000);
+    const [all] = unwrap(await hooks().run(name, props, [["listMyPosts"]], { pages: 1 })) as XPostInfo[][];
+    expect(all.map(item => item.createdAt)).toEqual([new Date(staged)]);
+    // A post ID stands for the time it encodes; a Date can't cross into the faked clock's Durable Object.
+    const since = { sinceId: snowflakeAt(staged + 1000) };
+    const [later] = unwrap(await hooks().run(name, props, [["listMyPosts", since]], { pages: 1 })) as XPostInfo[][];
+    expect(later).toEqual([]);
   });
 
   it("authorizes the profiles of a pending List's members, which were read from X", async () => {

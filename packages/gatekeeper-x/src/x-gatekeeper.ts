@@ -174,8 +174,8 @@ export class XGatekeeperImpl extends DurableObject<Env, XGatekeeperImplProps> im
       delete: id => this.ctx.storage.kv.delete(`${PROGRESS_PREFIX}${id}`),
     },
     previous: {
-      get: id => this.ctx.storage.kv.get<ListDetails>(`${PREVIOUS_PREFIX}${id}`),
-      put: (id, details) => this.ctx.storage.kv.put(`${PREVIOUS_PREFIX}${id}`, details),
+      get: id => this.ctx.storage.kv.get<ListDetails | boolean>(`${PREVIOUS_PREFIX}${id}`),
+      put: (id, before) => this.ctx.storage.kv.put(`${PREVIOUS_PREFIX}${id}`, before),
       delete: id => this.ctx.storage.kv.delete(`${PREVIOUS_PREFIX}${id}`),
     },
     attempts: {
@@ -189,7 +189,7 @@ export class XGatekeeperImpl extends DurableObject<Env, XGatekeeperImplProps> im
   readonly #actions = actions.bind(this.#journal, this.#actionHost);
 
   readonly #sessionHost: XSessionHost = {
-    me: () => this.#me(),
+    me: options => this.#me(options),
     read: (reserve, op) => this.#read(reserve, op),
     cached: (key, ttlMs, load) => this.#cache.cached(key, ttlMs, load),
     pending: () => this.#journal.listPending(),
@@ -437,10 +437,14 @@ export class XGatekeeperImpl extends DurableObject<Env, XGatekeeperImplProps> im
    * The X user the connection belongs to, pinned at the binding's first use. The account already
    * refuses a reconnect as anyone else; the pin keeps a binding from following one regardless.
    */
-  async #me(): Promise<StoredIdentity> {
+  async #me(options?: { maxAgeMs?: number }): Promise<StoredIdentity> {
     const now = Date.now();
-    if (this.#identity && now - this.#identity.at < IDENTITY_MEMO_MS) return this.#identity.value;
-    const identity = await this.#account().getIdentity();
+    const memo = this.#identity;
+    if (memo && now - memo.at < IDENTITY_MEMO_MS
+      && (options?.maxAgeMs === undefined || now - memo.value.fetchedAt < options.maxAgeMs)) {
+      return memo.value;
+    }
+    const identity = await this.#account().getIdentity(options);
     const kv = this.ctx.storage.kv;
     const pinned = kv.get<string>(PINNED_USER_KEY);
     if (pinned === undefined) {

@@ -13,6 +13,7 @@ import type { GatekeeperProps, Step } from "./worker";
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
@@ -146,6 +147,7 @@ describe("publishing", () => {
       { text: "Read this: https://example.com/b" }],
   ])("never binds an earlier post that differs only in its %s", async (_differs, earlier, draft) => {
     const t = await setup();
+    vi.useFakeTimers({ toFake: ["Date"] });
     const { id: earlierId } = t.x.post(ALICE, earlier.text, earlier);
     await t.run([["createPost", draft]]);
     let failed = false;
@@ -156,6 +158,8 @@ describe("publishing", () => {
     });
     const [{ actionId }] = await t.submitted();
     expect(failure(await t.apply(actionId))).toMatch(/did not confirm whether this post was published/);
+    // Once X has had time to show what the first send made, finding only the earlier post sends again.
+    vi.setSystemTime(Date.now() + 6 * 60 * 1000);
     unwrap(await t.apply(actionId));
     const [created] = postsBy(t.x, ALICE.id).filter(post => post.id !== earlierId);
     expect(await t.run([["getPost", "~1"], ["getInfo"]])).toMatchObject({ id: created.id });
@@ -205,23 +209,69 @@ describe("publishing", () => {
     expect(t.x.posts.has(earlier.id)).toBe(true);
   });
 
-  it("binds the post an unconfirmed send made when X refuses the next as its duplicate", async () => {
+  it.each([
+    ["HTML-escaped", { text: "Q&A at 5pm <3" }],
+    ["with its link shortened before a full stop", { text: "Visit example.com." }],
+  ])("binds the post a lost answer hid, though X stores its text %s", async (_how, draft) => {
     const t = await setup();
-    await t.run([["createPost", { text: "Slow to show" }]]);
+    await t.run([["createPost", draft]]);
     t.x.loseAnswer("POST", /^\/2\/tweets$/);
-    // X's timeline lags: the post is missing from the first two looks.
-    let lagging = 2;
-    t.x.on("GET", new RegExp(`^/2/users/${ALICE.id}/tweets`), () => lagging-- > 0 ? json({ meta: { result_count: 0 } }) : undefined);
     const [{ actionId }] = await t.submitted();
-    expect(failure(await t.apply(actionId))).toMatch(/did not confirm whether this post was published/);
     unwrap(await t.apply(actionId));
     const posts = postsBy(t.x, ALICE.id);
     expect(posts).toHaveLength(1);
     expect(await t.run([["getPost", "~1"], ["getInfo"]])).toMatchObject({ id: posts[0].id });
   });
 
-  it("won't let a post X may have made be rejected, and posts it on the next approval if it didn't", async () => {
+  it("binds the reply a lost answer hid, though X leads it with the handle it replies to", async () => {
+    const x = new FakeX().install();
+    const root = x.post(BOB, "@alice What do you think?");
+    const t = await setup(x);
+    const props: GatekeeperProps = { userObjectId: t.userObjectId, resourceKind: "post", postId: root.id };
+    const name = crypto.randomUUID();
+    unwrap(await hooks().run(name, props, [["reply", { text: "Agreed" }]]));
+    x.loseAnswer("POST", /^\/2\/tweets$/);
+    const [{ actionId }] = (await hooks().queueLog(name)).submitted;
+    unwrap(await hooks().applyAction(name, props, actionId));
+    expect(postsBy(x, ALICE.id).map(post => post.text)).toEqual(["@bob Agreed"]);
+  });
+
+  it("binds the post an unconfirmed send made once X shows it, sending nothing again", async () => {
     const t = await setup();
+    await t.run([["createPost", { text: "Slow to show" }]]);
+    t.x.loseAnswer("POST", /^\/2\/tweets$/);
+    // X's timeline lags: the post is missing from the look right after the lost answer, and the next.
+    let lagging = 2;
+    t.x.on("GET", new RegExp(`^/2/users/${ALICE.id}/tweets`), () => lagging-- > 0 ? json({ meta: { result_count: 0 } }) : undefined);
+    const [{ actionId }] = await t.submitted();
+    expect(failure(await t.apply(actionId))).toMatch(/did not confirm whether this post was published/);
+    expect(failure(await t.apply(actionId))).toMatch(/doesn't show this post yet.*Approve it again after \d\d:\d\d UTC/);
+    unwrap(await t.apply(actionId));
+    const posts = postsBy(t.x, ALICE.id);
+    expect(posts).toHaveLength(1);
+    expect(t.x.count("POST", /^\/2\/tweets$/)).toBe(1);
+    expect(await t.run([["getPost", "~1"], ["getInfo"]])).toMatchObject({ id: posts[0].id });
+  });
+
+  it("won't send an image post again while X may not show the first yet", async () => {
+    const t = await setup();
+    // Image-only: no duplicate-text refusal would stop a second send.
+    await t.run([["createPost", { text: "", images: [{ data: PNG, mediaType: "image/png" }] }]]);
+    t.x.loseAnswer("POST", /^\/2\/tweets$/);
+    let lagging = 3;
+    t.x.on("GET", new RegExp(`^/2/users/${ALICE.id}/tweets`), () => lagging-- > 0 ? json({ meta: { result_count: 0 } }) : undefined);
+    const [{ actionId }] = await t.submitted();
+    expect(failure(await t.apply(actionId))).toMatch(/did not confirm whether this post was published/);
+    expect(failure(await t.apply(actionId))).toMatch(/doesn't show this post yet/);
+    expect(failure(await t.apply(actionId))).toMatch(/doesn't show this post yet/);
+    unwrap(await t.apply(actionId));
+    expect(postsBy(t.x, ALICE.id)).toHaveLength(1);
+    expect(t.x.count("POST", /^\/2\/tweets$/)).toBe(1);
+  });
+
+  it("won't let a post X may have made be rejected, and posts it once X has had time to show it", async () => {
+    const t = await setup();
+    vi.useFakeTimers({ toFake: ["Date"] });
     await t.run([["createPost", { text: "Maybe" }]]);
     let failed = false;
     t.x.on("POST", /^\/2\/tweets$/, () => {
@@ -232,13 +282,26 @@ describe("publishing", () => {
     const [{ actionId }] = await t.submitted();
     expect(failure(await t.apply(actionId))).toMatch(/did not confirm whether this post was published/);
     expect(failure(await t.reject(actionId))).toMatch(/never confirmed whether this post was published/);
+    expect(failure(await t.apply(actionId))).toMatch(/doesn't show this post yet/);
+    vi.setSystemTime(Date.now() + 6 * 60 * 1000);
     unwrap(await t.apply(actionId));
     expect(postsBy(t.x, ALICE.id).map(post => post.text)).toEqual(["Maybe"]);
   });
 
+  it("refuses a reply X would refuse, to a post that doesn't summon the account", async () => {
+    const x = new FakeX().install();
+    const root = x.post(BOB, "What does everyone think?");
+    const t = await setup(x);
+    const props: GatekeeperProps = { userObjectId: t.userObjectId, resourceKind: "post", postId: root.id };
+    const name = crypto.randomUUID();
+    expect(failure(await hooks().run(name, props, [["reply", { text: "Agreed" }]])))
+      .toMatch(/only to a post by @alice, or one that mentions @alice or quotes one of its posts/);
+    expect((await hooks().queueLog(name)).submitted).toEqual([]);
+  });
+
   it("replies through a Post binding, confined to that conversation", async () => {
     const x = new FakeX().install();
-    const root = x.post(BOB, "What do you think?");
+    const root = x.post(BOB, "@alice What do you think?");
     const t = await setup(x);
     const props: GatekeeperProps = { userObjectId: t.userObjectId, resourceKind: "post", postId: root.id };
     const name = crypto.randomUUID();
@@ -248,7 +311,22 @@ describe("publishing", () => {
     expect(description.title).toBe("Reply on X to @bob as @alice");
     unwrap(await hooks().applyAction(name, props, actionId));
     const [posted] = postsBy(x, ALICE.id);
-    expect(posted).toMatchObject({ text: "Agreed", conversation_id: root.id, referenced_tweets: [{ type: "replied_to", id: root.id }] });
+    expect(posted).toMatchObject({ text: "@bob Agreed", conversation_id: root.id, referenced_tweets: [{ type: "replied_to", id: root.id }] });
+  });
+
+  it("hides replies only in a conversation the account started", async () => {
+    const x = new FakeX().install();
+    const reply = (author: typeof BOB, to: WirePost) => x.post(author, "@someone hi", {
+      conversation_id: to.conversation_id, in_reply_to_user_id: to.author_id,
+      referenced_tweets: [{ type: "replied_to", id: to.id }],
+    });
+    const mine = reply(BOB, x.post(ALICE, "My thread"));
+    const theirs = reply(BOB, x.post(BOB, "Bob's thread"));
+    const t = await setup(x);
+    await t.run([["getPost", mine.id], ["hide"]]);
+    expect(failure(await t.attempt([["getPost", theirs.id], ["hide"]])))
+      .toBe("Only replies in a conversation the connected account started can be hidden.");
+    expect((await t.submitted()).map(({ description }) => description.title)).toEqual([expect.stringMatching(/^Hide/)]);
   });
 
   it("deletes only the account's own posts", async () => {
@@ -300,7 +378,7 @@ describe("actions on a pending post", () => {
 });
 
 describe("engagement", () => {
-  it("likes, follows and mutes, and undoes each", async () => {
+  it("likes, follows and mutes, and undoes the follow and mute but not the like", async () => {
     const t = await setup();
     const post = t.x.post(BOB, "nice");
     await t.run([["getPost", post.id], ["like"]]);
@@ -309,11 +387,30 @@ describe("engagement", () => {
     const [like, follow, mute] = await t.submitted();
     expect(mute.description.autoApprovable).toBe(true);
     expect(like.description.autoApprovable).toBe(false);
+    // X can't say whether the post was liked before, so undoing could remove a like that was there.
+    expect(like.description.implementsRevert).toBe(false);
+    expect(follow.description.implementsRevert).toBe(true);
     for (const { actionId } of [like, follow, mute]) unwrap(await t.apply(actionId));
     expect([...t.x.likes, ...t.x.following, ...t.x.muting])
       .toEqual([`${ALICE.id}:${post.id}`, `${ALICE.id}:${BOB.id}`, `${ALICE.id}:${BOB.id}`]);
-    for (const { actionId } of [like, follow, mute]) unwrap(await t.revert(actionId));
-    expect(t.x.likes.size + t.x.following.size + t.x.muting.size).toBe(0);
+    expect(unwrap(await t.revert(like.actionId)))
+      .toMatchObject({ message: expect.stringMatching(/can't say how this stood before the action/), canRetry: false });
+    for (const { actionId } of [follow, mute]) unwrap(await t.revert(actionId));
+    expect([...t.x.likes]).toEqual([`${ALICE.id}:${post.id}`]);
+    expect(t.x.following.size + t.x.muting.size).toBe(0);
+  });
+
+  it("keeps a follow and a mute that were already there when undoing actions that changed nothing", async () => {
+    const t = await setup();
+    t.x.following.add(`${ALICE.id}:${BOB.id}`);
+    t.x.muting.add(`${ALICE.id}:${BOB.id}`);
+    await t.run([["getUser", "bob"], ["follow"]]);
+    await t.run([["getUser", "bob"], ["mute"]]);
+    for (const { actionId } of await t.submitted()) {
+      unwrap(await t.apply(actionId));
+      unwrap(await t.revert(actionId));
+    }
+    expect([...t.x.following, ...t.x.muting]).toEqual([`${ALICE.id}:${BOB.id}`, `${ALICE.id}:${BOB.id}`]);
   });
 
   it("refuses to act on the connected account itself", async () => {

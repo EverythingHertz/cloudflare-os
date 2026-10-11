@@ -166,8 +166,12 @@ export class FakeX {
   /** Adds a post by `author`. */
   post(author: WireUser, text: string, extra: Partial<WirePost> = {}): WirePost {
     const id = extra.id ?? this.id();
+    // X lists the handles a post mentions among its entities.
+    const mentions = [...text.matchAll(/(?:^|[^A-Za-z0-9_@])@([A-Za-z0-9_]{1,15})/g)].map(match => ({ username: match[1] }));
+    const entities = { ...(mentions.length > 0 ? { mentions } : {}), ...extra.entities };
     const post: WirePost = {
       id, text, author_id: author.id, conversation_id: id, created_at: new Date().toISOString(), ...extra,
+      ...(Object.keys(entities).length > 0 ? { entities } : {}),
     };
     this.posts.set(id, post);
     return post;
@@ -293,9 +297,12 @@ export class FakeX {
       const [, userId, kind] = match;
       const since = Date.parse(url.searchParams.get("start_time") ?? "");
       const until = Date.parse(url.searchParams.get("end_time") ?? "");
+      const sinceId = BigInt(url.searchParams.get("since_id") ?? "0");
+      const untilId = url.searchParams.has("until_id") ? BigInt(url.searchParams.get("until_id")!) : undefined;
       const posts = [...this.posts.values()].filter(post => {
         const created = Date.parse(post.created_at ?? "");
         if (created < since || created > until) return false;
+        if (BigInt(post.id) <= sinceId || (untilId !== undefined && BigInt(post.id) >= untilId)) return false;
         switch (kind) {
           case "tweets": return post.author_id === userId;
           case "mentions": return post.text?.includes(`@${this.users.get(userId)?.username}`) ?? false;
@@ -349,7 +356,10 @@ export class FakeX {
       const author = this.users.get(me)!;
       const id = this.id();
       const shortened = this.#shorten(text, `https://x.com/${author.username}/status/${id}/photo/1`, media?.media_ids);
-      const post = this.post(author, shortened.text, {
+      // As X stores it: HTML-escaped, and a reply to another account led by that account's handle.
+      const replyingTo = parent && parent.author_id !== me ? `@${this.users.get(parent.author_id ?? "")?.username} ` : "";
+      const stored = replyingTo + shortened.text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+      const post = this.post(author, stored, {
         id,
         ...(parent ? {
           conversation_id: parent.conversation_id, in_reply_to_user_id: parent.author_id,

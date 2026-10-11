@@ -20,7 +20,7 @@ import type {
 import {
   LIST_FIELDS, POST_FIELDS, USER_FIELDS, XApi, pageQuery, requireData, requirePage, xTime, type XEnvelope,
 } from "./x-api";
-import { MAX_THREAD_POSTS, validateDraft, type StoredDraft, type XActions } from "./x-actions";
+import { MAX_THREAD_POSTS, validateDraft, validateReplyParent, type StoredDraft, type XActions } from "./x-actions";
 import type { StoredIdentity } from "./x-credentials";
 import { XCursor, type XPage } from "./x-cursor";
 import type { XHookParams, XPostHookTarget } from "./x-hooks";
@@ -44,6 +44,12 @@ export const USER_TTL_MS = 60 * 60 * 1000;
 export const LIST_TTL_MS = 15 * 60 * 1000;
 /** How long a listing's newest page stays cached, absorbing a gadget polling it. */
 export const PAGE_TTL_MS = 60 * 1000;
+/**
+ * How old the privacy a fresh read is judged by may be: the connected account's protection, or a
+ * List's. X allows 75 identity or List lookups per 15 minutes, too few to look again for every page or
+ * profile, so a minute, as long as a listing page is cached.
+ */
+export const PRIVACY_TTL_MS = 60 * 1000;
 /** Listings' default page size. */
 export const DEFAULT_PAGE_SIZE = 20;
 /** Listings' largest page. */
@@ -58,8 +64,11 @@ const BASELINE: ObservationScope = { kind: "baseline" };
 
 /** What a session may ask of the gatekeeper Durable Object. */
 export type XSessionHost = {
-  /** The X user the connection is pinned to. */
-  me(): Promise<StoredIdentity>;
+  /**
+   * The X user the connection is pinned to, as X described it within `maxAgeMs` if given (else up to a
+   * day ago); one X can't describe that recently is refused.
+   */
+  me(options?: { maxAgeMs?: number }): Promise<StoredIdentity>;
   /** Runs a read as the connection, within its daily read limit; `reserve` is the rows expected. */
   read<T>(reserve: number, op: (api: XApi, me: StoredIdentity) => Promise<XEnvelope<T>>): Promise<XEnvelope<T>>;
   /** A cached value, partitioned by connection. */
@@ -109,18 +118,58 @@ function who(user: XUserSummary): string {
   return user.username ? `@${escapeObservationValue(user.username)}` : "an X user";
 }
 
-function pageSize(options: XPageOptions | undefined): number {
+/**
+ * The rows a page asks X for: the caller's page size, raised to the endpoint's `min`, below which X
+ * returns (and bills) its minimum anyway, so the read limit reserves what X will return.
+ */
+function pageSize(options: XPageOptions | undefined, min = 1): number {
   const size = options?.pageSize ?? DEFAULT_PAGE_SIZE;
   if (!Number.isInteger(size) || size < 1 || size > MAX_PAGE_SIZE) {
     throw new Error(`pageSize must be a whole number from 1 to ${MAX_PAGE_SIZE}.`);
   }
-  return size;
+  return Math.max(min, size);
 }
 
 function snowflake(value: string | undefined, name: string): string | undefined {
   if (value === undefined) return undefined;
   if (!SNOWFLAKE.test(value)) throw new Error(`${name} must be an X post ID.`);
   return value;
+}
+
+/**
+ * `options` with a temporary post ID among its bounds resolved, so polling on from a post that is still
+ * waiting keeps working: to the ID X assigned once it is published, and until then to when it was
+ * submitted, the time its pending row shows and is filtered by.
+ */
+async function resolveBounds<T extends XTimeRangeOptions>(ctx: SessionContext, options: T | undefined):
+    Promise<T | undefined> {
+  if (!options) return options;
+  const { host } = ctx;
+  let bounds = options;
+  for (const key of ["sinceId", "untilId"] as const) {
+    const id = bounds[key];
+    if (id === undefined || !isProvisional(id)) continue;
+    const assigned = host.resolve(id);
+    if (!isProvisional(assigned)) {
+      bounds = key === "sinceId" ? { ...bounds, sinceId: assigned } : { ...bounds, untilId: assigned };
+      continue;
+    }
+    const post = pendingPost(assigned, host.pending(), await host.me(), ref => host.resolve(ref));
+    if (!post) throw new Error(`${key} names no pending post; it may have been rejected.`);
+    const at = post.createdAt;
+    bounds = key === "sinceId"
+      ? { ...bounds, sinceId: undefined, startTime: latest(bounds.startTime, new Date(at.getTime() + 1)) }
+      : { ...bounds, untilId: undefined, endTime: earliest(bounds.endTime, at) };
+  }
+  return bounds;
+}
+
+function latest(bound: Date | undefined, other: Date): Date {
+  return bound && bound > other ? bound : other;
+}
+
+function earliest(bound: Date | undefined, other: Date): Date {
+  return bound && bound < other ? bound : other;
 }
 
 function timeQuery(options: XTimeRangeOptions | undefined): Record<string, string | undefined> {
@@ -239,8 +288,11 @@ type UserListing = {
   /** Whether to report each user's relationship to the connected account. */
   relationship: boolean;
   overlay(users: XUserInfo[], newestPage: boolean): XUserInfo[];
-  /** Whether the listing is private to the account (a protected account's follow graph). */
-  privateSource(me: StoredIdentity): boolean | Promise<boolean>;
+  /**
+   * Whether the listing is private to the account (a protected account's follow graph, a private
+   * List's members), asked after each page.
+   */
+  privateSource(): Promise<boolean>;
   title: string;
   describe(count: number): string;
 };
@@ -259,7 +311,7 @@ function usersCursor(ctx: SessionContext, size: number, listing: UserListing): C
         items,
         nextToken: envelope.meta?.next_token,
         observation: { title: listing.title, description: listing.describe(items.length) },
-        scope: await listing.privateSource(me) ? OWNER : BASELINE,
+        scope: await listing.privateSource() ? OWNER : BASELINE,
       };
     },
     authorize: page => gate.authorize(page.observation, page.scope),
@@ -282,10 +334,10 @@ export async function fetchPost(host: XSessionHost, id: string): Promise<PostRea
   return { info: toPostInfo(post, includes), unverified: authorsUnverified([post], includes) };
 }
 
-/** A List as X has it, with no pending action replayed: cached, unless `fresh` asks X again. */
-export async function fetchList(host: XSessionHost, id: string, { fresh = false } = {}): Promise<XListInfo> {
-  const load = () => host.read<WireList>(1, api => api.get<WireList>(`/2/lists/${id}`, LIST_FIELDS));
-  const envelope = fresh ? await load() : await host.cached(`list:${id}`, LIST_TTL_MS, load);
+/** A List as X has it, cached for up to `maxAgeMs`, with no pending action replayed. */
+export async function fetchList(host: XSessionHost, id: string, maxAgeMs = LIST_TTL_MS): Promise<XListInfo> {
+  const envelope = await host.cached(`list:${id}`, maxAgeMs,
+    () => host.read<WireList>(1, api => api.get<WireList>(`/2/lists/${id}`, LIST_FIELDS)));
   return toListInfo(requireData(envelope, "List"), indexIncludes(envelope.includes));
 }
 
@@ -323,7 +375,7 @@ export async function readUser(host: XSessionHost, target: UserTarget): Promise<
  * the List is private, or a pending change makes it so. A pending change to public lifts nothing,
  * since the List stays private on X until that change is approved.
  */
-async function readList(ctx: SessionContext, id: string, options?: { fresh?: boolean }):
+async function readList(ctx: SessionContext, id: string, maxAgeMs?: number):
     Promise<{ info: XListInfo; restricted: boolean }> {
   const { host } = ctx;
   const resolved = host.resolve(id);
@@ -332,7 +384,7 @@ async function readList(ctx: SessionContext, id: string, options?: { fresh?: boo
     if (!pending) throw new Error("No pending List has this temporary ID; it may have been rejected.");
     return { info: pending, restricted: pending.private };
   }
-  const info = await fetchList(host, resolved, options);
+  const info = await fetchList(host, resolved, maxAgeMs);
   const visible = overlayList(info, host.pending(), ref => host.resolve(ref));
   if (!visible) throw new Error("This List has been deleted.");
   return { info: visible, restricted: info.private || visible.private };
@@ -340,12 +392,31 @@ async function readList(ctx: SessionContext, id: string, options?: { fresh?: boo
 
 /**
  * Whether a page of a List's posts or members is private to the account, judged by the List as X
- * has it now: the page can be newer than a cached record of the List, which may predate its becoming
- * private on X, or through another binding of this connection, whose approval invalidates only its
- * own cache. A List already cached as private needs no second look.
+ * described it within `PRIVACY_TTL_MS`: the List as cached can be 15 minutes old, from before it became
+ * private on X or through another binding of this connection, whose approval invalidates only its own
+ * cache. One already cached as private needs no second look, and one X can't vouch for counts as
+ * private, so a page already paid for is withheld rather than lost.
  */
 async function pageRestricted(ctx: SessionContext, id: string): Promise<boolean> {
-  return (await readList(ctx, id)).restricted || (await readList(ctx, id, { fresh: true })).restricted;
+  try {
+    return (await readList(ctx, id)).restricted || (await readList(ctx, id, PRIVACY_TTL_MS)).restricted;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Whether the connected account is protected, which decides who may observe its follow graph and
+ * home timeline: as X described it within `PRIVACY_TTL_MS`, not as the identity kept for display, which
+ * can be a day old. One already known to be protected needs no second look, and one X can't vouch for
+ * counts as protected.
+ */
+async function accountProtected(host: XSessionHost): Promise<boolean> {
+  try {
+    return (await host.me()).protected || (await host.me({ maxAgeMs: PRIVACY_TTL_MS })).protected;
+  } catch {
+    return true;
+  }
 }
 
 /** Captures a draft's images for the action that will upload them once approved. */
@@ -424,15 +495,16 @@ export class XPostImpl extends RpcTarget implements XPost {
   }
 
   async listReplies(options?: XTimeRangeOptions): Promise<Cursor<XPostInfo>> {
-    const size = pageSize(options);
-    const query = timeQuery(options);
+    const size = pageSize(options, 10);
+    const bounds = await resolveBounds(this.#ctx, options);
+    const query = timeQuery(bounds);
     const { host } = this.#ctx;
     if (this.#scope) await this.#info();
     const id = host.resolve(this.#id);
     if (isProvisional(id)) {
       const me = await host.me();
       return pendingCursor(pendingPosts(host.pending(), me, ref => host.resolve(ref))
-        .filter(post => post.replyTo?.postId === id && withinBounds(post, options)));
+        .filter(post => post.replyTo?.postId === id && withinBounds(post, bounds)));
     }
     return postsCursor(this.#ctx, size, {
       request: (api, _me, token) => api.get<WirePost[]>("/2/tweets/search/recent", {
@@ -441,21 +513,22 @@ export class XPostImpl extends RpcTarget implements XPost {
       }),
       overlay: { kind: "replies", parentId: id },
       newestFirst: true,
-      bounds: options,
+      bounds,
       title: "Read replies to an X post",
       describe: count => `Read ${countOf(count, "reply", "replies")} to an X post.`,
     });
   }
 
   async listConversation(options?: XTimeRangeOptions): Promise<Cursor<XPostInfo>> {
-    const size = pageSize(options);
-    const query = timeQuery(options);
+    const size = pageSize(options, 10);
+    const bounds = await resolveBounds(this.#ctx, options);
+    const query = timeQuery(bounds);
     const { host } = this.#ctx;
     const conversation = host.resolve(await this.#ownConversation());
     if (isProvisional(conversation)) {
       const me = await host.me();
       return pendingCursor(pendingPosts(host.pending(), me, ref => host.resolve(ref))
-        .filter(post => host.resolve(post.conversationId) === conversation && withinBounds(post, options)));
+        .filter(post => host.resolve(post.conversationId) === conversation && withinBounds(post, bounds)));
     }
     return postsCursor(this.#ctx, size, {
       request: (api, _me, token) => api.get<WirePost[]>("/2/tweets/search/recent", {
@@ -464,14 +537,14 @@ export class XPostImpl extends RpcTarget implements XPost {
       }),
       overlay: { kind: "conversation", conversationId: conversation },
       newestFirst: true,
-      bounds: options,
+      bounds,
       title: "Read an X conversation",
       describe: count => `Read ${countOf(count, "post")} from an X conversation.`,
     });
   }
 
   async listQuotes(options?: XPageOptions): Promise<Cursor<XPostInfo>> {
-    const size = pageSize(options);
+    const size = pageSize(options, 10);
     if (this.#scope) await this.#info();
     const id = this.#ctx.host.resolve(this.#id);
     if (isProvisional(id)) return pendingCursor([]);
@@ -493,7 +566,9 @@ export class XPostImpl extends RpcTarget implements XPost {
   async reply(draft: XPostDraft): Promise<XPost> {
     const { host } = this.#ctx;
     const parent = await this.#info();
-    validateDraft(draft, await host.me(), pendingTexts(host.pending()));
+    const me = await host.me();
+    validateReplyParent(parent, me);
+    validateDraft(draft, me, pendingTexts(host.pending()));
     const stored = await storeDraft(this.#ctx, draft);
     const ref = host.allocate("post");
     await host.submit(this.#ctx.queue, "reply", {
@@ -516,11 +591,13 @@ export class XPostImpl extends RpcTarget implements XPost {
   }
 
   async repost(): Promise<void> {
-    await this.#ctx.host.submit(this.#ctx.queue, "repost", { post: await this.#target(), on: true });
+    await this.#ctx.host.submit(this.#ctx.queue, "repost",
+      { post: await this.#target(), on: true, submittedAt: Date.now() });
   }
 
   async undoRepost(): Promise<void> {
-    await this.#ctx.host.submit(this.#ctx.queue, "repost", { post: await this.#target(), on: false });
+    await this.#ctx.host.submit(this.#ctx.queue, "repost",
+      { post: await this.#target(), on: false, submittedAt: Date.now() });
   }
 
   async bookmark(): Promise<void> {
@@ -567,9 +644,19 @@ export class XPostImpl extends RpcTarget implements XPost {
     return { id: this.#ctx.host.resolve(this.#id), info: unverified ? withProtectedAuthors(info) : info };
   }
 
+  /**
+   * The reply a hide targets. X hides replies only in a conversation the account started, and a hide
+   * may be approved without anyone looking, so any other is refused here rather than fail at X unseen.
+   */
   async #reply(): Promise<{ id: string; info: XPostInfo }> {
     const target = await this.#target();
     if (!target.info.replyTo) throw new Error("Only replies can be hidden.");
+    const { host } = this.#ctx;
+    const me = await host.me();
+    const root = host.resolve(target.info.conversationId);
+    // A conversation X hasn't seen yet starts with one of the account's pending posts.
+    const starter = isProvisional(root) ? me.id : (await fetchPost(host, root)).info.author.id;
+    if (starter !== me.id) throw new Error("Only replies in a conversation the connected account started can be hidden.");
     return target;
   }
 }
@@ -585,10 +672,11 @@ async function profileInfo(ctx: SessionContext, user: WireUser, relationship: bo
 
 async function profilePosts(ctx: SessionContext, user: WireUser, options: XTimelineOptions | undefined):
     Promise<Cursor<XPostInfo>> {
-  const size = pageSize(options);
+  const size = pageSize(options, 5);
   const me = await ctx.host.me();
   const mine = user.id === me.id;
-  const query = { ...timeQuery(options), ...excludeQuery(options) };
+  const bounds = await resolveBounds(ctx, options);
+  const query = { ...timeQuery(bounds), ...excludeQuery(options) };
   const name = user.username ? `@${escapeObservationValue(user.username)}` : "an X user";
   return postsCursor(ctx, size, {
     request: (api, _me, token) => api.get<WirePost[]>(`/2/users/${user.id}/tweets`, {
@@ -598,7 +686,7 @@ async function profilePosts(ctx: SessionContext, user: WireUser, options: XTimel
       ? { kind: "mine", excludeReplies: options?.excludeReplies, excludeReposts: options?.excludeReposts }
       : { kind: "others" },
     newestFirst: true,
-    bounds: options,
+    bounds,
     title: `Read ${name}'s X posts`,
     describe: count => `Read ${countOf(count, "post")} by ${name}.`,
   });
@@ -668,7 +756,7 @@ export class XUserImpl extends RpcTarget implements XUser {
     const info = await profileInfo(this.#ctx, await readUser(this.#ctx.host, this.#target), true);
     // The relationship is one edge of the connected account's follow graph, which is private to it
     // when it is protected, as `listFollowing` and `listFollowers` treat the whole graph.
-    const restricted = info.relationship !== undefined && (await this.#ctx.host.me()).protected;
+    const restricted = info.relationship !== undefined && await accountProtected(this.#ctx.host);
     await this.#ctx.gate.authorize(
       { title: "Read an X profile", description: `Read the profile of ${who(info)}.` }, restricted ? OWNER : BASELINE);
     return info;
@@ -710,10 +798,11 @@ export class XUserImpl extends RpcTarget implements XUser {
   }
 
   /** The user an action targets, read to describe it to the approver: not an observation. */
+  /** The user an action targets, with its relationship, which a pending follow's row keeps. */
   async #info(): Promise<XUserInfo> {
     const user = await readUser(this.#ctx.host, this.#target);
     if (user.id === (await this.#ctx.host.me()).id) throw new Error("That is the connected account itself.");
-    return toUserInfo(user, false);
+    return toUserInfo(user, true);
   }
 }
 
@@ -875,16 +964,17 @@ export class XAccountSessionImpl extends RpcTarget implements XAccountSession {
 
   async listHomeTimeline(options?: XTimelineOptions): Promise<Cursor<XPostInfo>> {
     const size = pageSize(options);
-    const query = { ...timeQuery(options), ...excludeQuery(options) };
+    const bounds = await resolveBounds(this.#ctx, options);
+    const query = { ...timeQuery(bounds), ...excludeQuery(options) };
     return postsCursor(this.#ctx, size, {
       request: (api, me, token) => api.get<WirePost[]>(`/2/users/${me.id}/timelines/reverse_chronological`, {
         ...POST_FIELDS, ...query, ...pageQuery(size, token, { min: 1, max: 100 }),
       }),
       overlay: { kind: "others" },
       newestFirst: true,
-      bounds: options,
+      bounds,
       // Whose posts it shows is whom the account follows, private to a protected account.
-      privateSource: async () => (await this.#ctx.host.me()).protected,
+      privateSource: () => accountProtected(this.#ctx.host),
       title: "Read the X home timeline",
       describe: count => `Read ${countOf(count, "post")} from the home timeline.`,
       cacheKey: `home:${JSON.stringify(query)}`,
@@ -892,15 +982,16 @@ export class XAccountSessionImpl extends RpcTarget implements XAccountSession {
   }
 
   async listMentions(options?: XTimeRangeOptions): Promise<Cursor<XPostInfo>> {
-    const size = pageSize(options);
-    const query = timeQuery(options);
+    const size = pageSize(options, 5);
+    const bounds = await resolveBounds(this.#ctx, options);
+    const query = timeQuery(bounds);
     return postsCursor(this.#ctx, size, {
       request: (api, me, token) => api.get<WirePost[]>(`/2/users/${me.id}/mentions`, {
         ...POST_FIELDS, ...query, ...pageQuery(size, token, { min: 5, max: 100 }),
       }),
       overlay: { kind: "others" },
       newestFirst: true,
-      bounds: options,
+      bounds,
       title: "Read X mentions",
       describe: count => `Read ${countOf(count, "post")} mentioning the connected account.`,
       cacheKey: `mentions:${JSON.stringify(query)}`,
@@ -915,12 +1006,12 @@ export class XAccountSessionImpl extends RpcTarget implements XAccountSession {
   async searchPosts(query: string, options?: XSearchOptions): Promise<Cursor<XPostInfo>> {
     if (typeof query !== "string" || query.trim() === "") throw new Error("A search query is required.");
     if (query.length > MAX_QUERY_LENGTH) throw new Error(`A search query must be at most ${MAX_QUERY_LENGTH} characters.`);
-    const size = pageSize(options);
+    const size = pageSize(options, 10);
     const sortOrder = options?.sortOrder;
     if (sortOrder !== undefined && sortOrder !== "recency" && sortOrder !== "relevancy") {
       throw new Error('sortOrder must be "recency" or "relevancy".');
     }
-    const range = timeQuery(options);
+    const range = timeQuery(await resolveBounds(this.#ctx, options));
     const shown = escapeObservationValue(query.length > 120 ? `${query.slice(0, 117)}...` : query);
     return postsCursor(this.#ctx, size, {
       request: (api, _me, token) => api.get<WirePost[]>("/2/tweets/search/recent", {
@@ -950,7 +1041,7 @@ export class XAccountSessionImpl extends RpcTarget implements XAccountSession {
   }
 
   async listLikedPosts(options?: XPageOptions): Promise<Cursor<XPostInfo>> {
-    const size = pageSize(options);
+    const size = pageSize(options, 5);
     return postsCursor(this.#ctx, size, {
       request: (api, me, token) => api.get<WirePost[]>(`/2/users/${me.id}/liked_tweets`, {
         ...POST_FIELDS, ...pageQuery(size, token, { min: 5, max: 100 }),
@@ -974,7 +1065,7 @@ export class XAccountSessionImpl extends RpcTarget implements XAccountSession {
       relationship: true,
       overlay: (users, newestPage) => overlayFollowing(users, host.pending(), newestPage),
       // A protected account's follow graph is visible only to its approved followers.
-      privateSource: me => me.protected,
+      privateSource: () => accountProtected(this.#ctx.host),
       title: "Read the accounts the connected account follows",
       describe: count => `Read ${countOf(count, "followed account")}.`,
     });
@@ -987,8 +1078,9 @@ export class XAccountSessionImpl extends RpcTarget implements XAccountSession {
         ...USER_FIELDS, ...pageQuery(size, token, { min: 1, max: 100 }),
       }),
       relationship: true,
-      overlay: users => users,
-      privateSource: me => me.protected,
+      // A follow-back gadget re-listing its followers sees the follows it has already staged.
+      overlay: users => users.map(user => overlayUser(user, this.#ctx.host.pending())),
+      privateSource: () => accountProtected(this.#ctx.host),
       title: "Read the connected account's followers",
       describe: count => `Read ${countOf(count, "follower")}.`,
     });

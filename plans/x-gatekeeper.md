@@ -1,11 +1,10 @@
 # Plan: X (Twitter) gatekeeper — read, publish and engage on X, with every public act approved
 
-**Status: design proposal — not implemented.** The open questions were answered on 2026-10-10
-([Decisions from review](#decisions-from-review-2026-10-10)). What remains before code is review
-of §5's `types.d.ts` sketch: per the gatekeeper workflow nothing past the package skeleton is
-built until it is approved. X API facts are from docs.x.com (OpenAPI `2.170`) as retrieved
-2026-10-10; the ones the design leans on without anyone having seen them live are collected under
-[Verification](#verification).
+**Status: implemented** in `packages/gatekeeper-x` (hooks and webhooks separately). The open
+questions were answered on 2026-10-10 ([Decisions from review](#decisions-from-review-2026-10-10)),
+and where the build departed from this design, the decisions record says so. X API facts are from
+docs.x.com (OpenAPI `2.170`) as retrieved 2026-10-10; the ones the design leans on without anyone
+having seen them live are collected under [Verification](#verification).
 
 ## Goal
 
@@ -644,14 +643,20 @@ submits none):
 | `x.post.create` | Publish posts | `createPost`, `createThread` | upload images → alt text → `POST /2/tweets`; a thread in order, with progress | delete what was posted, newest first | no |
 | `x.post.reply` | Reply to posts | `XPost.reply` | `POST /2/tweets` with `reply.in_reply_to_tweet_id` | delete the reply | no |
 | `x.post.delete` | Delete posts | `XPost.delete` | `DELETE /2/tweets/:id` | — permanent | no |
-| `x.post.like` | Like posts | `like`, `unlike` | likes endpoints | inverse | no |
-| `x.post.repost` | Repost posts | `repost`, `undoRepost` | retweets endpoints | inverse | no |
-| `x.post.bookmark` | Bookmark posts | `bookmark`, `removeBookmark` | bookmarks endpoints | inverse | **yes** |
-| `x.post.hide` | Hide replies | `hide`, `unhide` | `PUT /2/tweets/:id/hidden` | inverse | **yes** |
-| `x.user.follow` | Follow accounts | `follow`, `unfollow` | following endpoints | inverse | no |
-| `x.user.mute` | Mute accounts | `mute`, `unmute` | muting endpoints | inverse | **yes** |
+| `x.post.like` | Like posts | `like`, `unlike` | likes endpoints | — X can't say whether it was already liked | no |
+| `x.post.repost` | Repost posts | `repost`, `undoRepost` | retweets endpoints | — likewise | no |
+| `x.post.bookmark` | Bookmark posts | `bookmark`, `removeBookmark` | bookmarks endpoints | — likewise | **yes** |
+| `x.post.hide` | Hide replies | `hide`, `unhide` | `PUT /2/tweets/:id/hidden` | — likewise | **yes** |
+| `x.user.follow` | Follow accounts | `follow`, `unfollow` | `connection_status` read once before the first effect, then following endpoints | restore that state (nothing, if the action changed nothing) | no |
+| `x.user.mute` | Mute accounts | `mute`, `unmute` | likewise, then muting endpoints | restore that state | **yes** |
 | `x.list.manage` | Manage Lists | `createList`, `XList.update`, `XList.delete` | lists endpoints | create → delete; update → restore the snapshot taken at apply; delete → — | no |
-| `x.list.members` | Manage List members | `addMember`, `removeMember` | members endpoints | inverse | no |
+| `x.list.members` | Manage List members | `addMember`, `removeMember` | members endpoints | — X can't say whether they were already a member | no |
+
+A revert that only made the inverse call would undo a change the action never made -- an approved
+`like()` on a post already liked, then reverted, removes the earlier like -- so a toggle is
+reverted only where X can say how it stood before: follows and mutes, through a billed
+`connection_status` read kept across the action's retries (`previous:<actionId>`). The rest
+declare `implementsRevert: false`, and their revert refuses, as a deletion's does.
 
 **Descriptions** (kit builder; titles through `sanitizeTitle`, labels through `plainInline`,
 content always in fields). Every title names the acting account — users connect personal and brand
@@ -671,8 +676,11 @@ accounts side by side.
 (twitter-text rules: a URL counts 23, wide code points 2) against 280, or 25,000 when
 `subscription_type` isn't `None`; empty text without images; a poll with images; more than four
 images; image bytes whose magic number disagrees with `mediaType`, or over 5 MB; a thread over 25
-posts; text identical to another pending post (X refuses duplicates); a reply where the cached
-parent's `reply_settings` excludes the account.
+posts; text identical to another pending post (X refuses duplicates); more than one cashtag, or
+a reply to a post that doesn't summon the account (its own, or one mentioning it or quoting one of
+its posts) -- X's rules for self-serve apps since February 2026; hiding a reply in a conversation
+the account didn't start, which, auto-approved, would otherwise fail at X unseen. A parent's `reply_settings` isn't
+checked; X's refusal of it comes back at apply.
 
 **Dependencies.** A post created in this session gets a provisional ID `~N` from
 `ProvisionalIds`; replying to, liking, reposting, bookmarking or deleting it is a dependent action
@@ -736,10 +744,13 @@ Each read is classified before it is authorized:
   privacy's absence: a post whose author X did not expand, or expanded without `protected` (a
   200 can omit expansions it failed to hydrate), counts as a protected account's, as does a
   connected account whose identity X returned without it; a List X returned without `private`
-  counts as private. A page of a List's posts or members is judged by the List as X has it when
-  the page is read, not as cached: the cached List can predate its becoming private, on X or
-  through another binding, whose approval invalidates only its own cache. One cached as private
-  needs no second look.
+  counts as private. What decides a fresh read's privacy is at most a minute old
+  (`PRIVACY_TTL_MS`): a List's posts and members are judged by the List as X described it within
+  the minute, not as cached (up to 15 minutes, per binding: an approval invalidates only its own
+  binding's cache), and the follow graph, relationships and home timeline by the account's
+  protection as X described it within the minute, not by the identity kept for display (up to a
+  day). X allows 75 List or identity lookups per 15 minutes, too few for every page. One already
+  private needs no second look, and one X can't vouch for counts as private.
 - **Public** otherwise: public posts, every profile (X shows protected accounts' profiles; only
   their posts are hidden), public Lists, and an unprotected account's followers and following.
 
@@ -993,7 +1004,7 @@ PR A lands the gatekeeper in reviewable layers; PR B adds hooks.
 3. **x: resources and configurators** — URL canonicalization, patterns, `getGatekeeperClassFor`,
    the four configurators; configurator tests.
 4. **x: reads, caching, observers, read limit** — the read side of every session (the Profile
-   binding is complete here), `TokenCursor` walks, `KvTtlCache`, classification +
+   binding is complete here), `XCursor` walks, `KvTtlCache`, classification +
    `ObservationGate`, verifier probes, the daily read limit; workerd read, resource and observer
    tests.
 5. **x: actions and simulation** — journal, provisional IDs, descriptions, apply / reject / revert
@@ -1076,8 +1087,13 @@ departed from the design above:
   time and the media IDs it attached) before `POST /2/tweets`; a lost answer or a 5xx leaves the
   action pending with a plain error, and the next apply first reads the account's posts dated from
   10 s before the attempt to 5 minutes after it (`max_results=100`). It binds a post only when
-  exactly one matches the draft's reply parent, `comparableText`, link destinations
-  (`expanded_url`, through `comparableUrl`), poll and media IDs. None sends again. More than one,
+  exactly one matches the draft's reply parent, `comparableText` (with X's HTML entities turned
+  back, the punctuation after a link kept either way, and a reply's leading handles, which X adds,
+  dropped), link destinations
+  (`expanded_url`, through `comparableUrl`), poll and media IDs. None sends again, but only once
+  the window has closed: until then X may still be about to show the post, which nothing else
+  (no duplicate-text refusal for an image-only post) would stop a second send of, so the apply
+  fails and names when approving again will settle it. More than one,
   one X dated before the send began (by its snowflake ID, to the millisecond), which may have been
   there already, or a window too full for one page ends the action with
   `ActionOutcomeUnknownError`, since binding the wrong post would have a revert delete it. A
