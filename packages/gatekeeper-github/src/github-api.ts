@@ -193,6 +193,11 @@ function webhookBody({ url, secret, events }: GitHubRepoWebhookConfig) {
 
 /** Bounds one read of a webhook's delivery log, at 100 attempts a page. */
 const MAX_DELIVERY_PAGES = 10;
+/**
+ * Bounds one listing of a repository's webhooks, at 100 a page: far beyond the 20 per event that
+ * GitHub allows a repository, for any likely number of events.
+ */
+const MAX_WEBHOOK_PAGES = 20;
 
 /** The `cursor` of the page a `Link` header names as the next, if any. */
 function nextCursor(headers: Headers): string | undefined {
@@ -687,14 +692,17 @@ export class GitHubApi {
   // A repository's webhooks are addressed by its id, as `/repositories/<id>` is where GitHub
   // redirects a renamed repository's old path: a name a rename freed can name another repository.
 
-  /**
-   * The repository's webhooks, first page only: a repository may hold at most 20 webhooks for
-   * any one event. GitHub answers only a repository admin.
-   */
+  /** The repository's webhooks, every page of them. GitHub answers only a repository admin. */
   async listRepoWebhooks(repoId: number): Promise<GitHubRepoWebhookResponse[]> {
-    return (await this.#request<GitHubRepoWebhookResponse[]>(
-      "GET", `/repositories/${repoId}/hooks`, { query: { per_page: 100 } },
-    )).data;
+    const webhooks: GitHubRepoWebhookResponse[] = [];
+    // A short page is the last.
+    for (let page = 1; page <= MAX_WEBHOOK_PAGES; page++) {
+      const { data } = await this.#request<GitHubRepoWebhookResponse[]>(
+        "GET", `/repositories/${repoId}/hooks`, { query: { per_page: 100, page } });
+      webhooks.push(...data);
+      if (data.length < 100) return webhooks;
+    }
+    throw new Error(`Repository ${repoId} has more webhooks than can be listed.`);
   }
 
   /** Adds an active webhook to the repository. GitHub allows only a repository admin to. */
