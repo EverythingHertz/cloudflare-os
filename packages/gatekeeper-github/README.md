@@ -109,8 +109,8 @@ creator's access.
 
 The repository's other admins can see the webhook, though not its secret. Every hour the worker
 checks each webhook on GitHub, and restores one that someone has deleted, deactivated, pointed
-elsewhere, switched to form-encoded payloads or unverified TLS, or given other events or another
-secret: to stop the deliveries, disable the hooks. The same check moves them to a new
+elsewhere, switched to form-encoded payloads or unverified TLS, or given other events, another
+secret or none: to stop the deliveries, disable the hooks. The same check moves them to a new
 `WEBHOOK_ORIGIN` within the hour. GitHub never retries a failed delivery itself, so the same check
 asks it to redeliver what it failed to deliver in the past two hours: up to 20 an hour for each
 account, shared among its repositories so that a busy one can't crowd out the rest. That includes

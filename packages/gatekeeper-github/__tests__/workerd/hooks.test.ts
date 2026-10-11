@@ -22,7 +22,9 @@ const CREATED = new Date().toISOString();
 
 type Row = Record<string, unknown>;
 type Webhook = {
-  id: number; url: string; secret: string; events: string[]; active: boolean;
+  id: number; url: string; events: string[]; active: boolean;
+  /** Unset as GitHub leaves it when someone updates the webhook without restating it. */
+  secret: string | undefined;
   /** The name of the repository it is on, in `acme`. */
   repo: string;
   /** `"json"` or `"form"`, GitHub's `config.content_type`. */
@@ -200,7 +202,10 @@ class FakeGitHub {
       if (method === "GET") {
         const { url, events, active, contentType, insecureSsl } = webhook;
         return Response.json({
-          id, active, events, config: { url, content_type: contentType, insecure_ssl: insecureSsl, secret: "********" },
+          id, active, events, config: {
+            url, content_type: contentType, insecure_ssl: insecureSsl,
+            ...webhook.secret === undefined ? {} : { secret: "********" },
+          },
         });
       }
       if (method === "PATCH") {
@@ -325,7 +330,8 @@ class FakeGitHub {
       method: "POST",
       headers: {
         "Content-Type": contentType, "X-GitHub-Event": event, "X-GitHub-Delivery": guid,
-        "X-Hub-Signature-256": `sha256=${await hmac(secret, sent)}`,
+        // Unsigned without a secret, as GitHub sends.
+        ...secret === undefined ? {} : { "X-Hub-Signature-256": `sha256=${await hmac(secret, sent)}` },
       },
       body: sent,
     })).status;
@@ -719,7 +725,7 @@ it("refuses deliveries that aren't signed with the webhook's secret", async () =
     method: "POST", body: "{}",
     headers: { "X-GitHub-Event": "issues", "X-GitHub-Delivery": crypto.randomUUID() },
   });
-  expect(unsigned.status).toBe(400);
+  expect(unsigned.status).toBe(401);
   const elsewhere = await SELF.fetch(url.replace(/[0-9a-f]{64}$/, "f".repeat(64)), { method: "POST", body: "{}" });
   expect(elsewhere.status).toBe(404);
   // Signed, but for a repository this webhook isn't on, or not JSON at all.
@@ -728,7 +734,7 @@ it("refuses deliveries that aren't signed with the webhook's secret", async () =
   const [{ secret }] = github.webhooks.values();
   const garbled = await SELF.fetch(url, {
     method: "POST", body: "not json",
-    headers: { "X-GitHub-Event": "issues", "X-Hub-Signature-256": `sha256=${await hmac(secret, "not json")}` },
+    headers: { "X-GitHub-Event": "issues", "X-Hub-Signature-256": `sha256=${await hmac(secret!, "not json")}` },
   });
   expect(garbled.status).toBe(400);
   const oversized = new Uint8Array(5 * 1024 * 1024 + 1);
@@ -1128,7 +1134,11 @@ it("has GitHub redeliver what another receiver refused while the webhook pointed
   expect(github.pendingRedeliveries()).toEqual({});
 });
 
-it("restores its webhook's secret, has GitHub redeliver what the wrong one signed, then leaves it", async () => {
+it.each<[string, string | undefined]>([
+  ["changes", "chosen-by-another-admin"],
+  // As GitHub does to a webhook anyone updates without restating its secret, leaving it unsigned.
+  ["removes", undefined],
+])("restores its webhook's secret when someone %s it, has GitHub redeliver what that refused, then leaves it", async (_, changed) => {
   const github = new FakeGitHub();
   const account = await connectAccount();
   const triage = binding(account);
@@ -1137,7 +1147,7 @@ it("restores its webhook's secret, has GitHub redeliver what the wrong one signe
   const [{ id, secret }] = github.webhooks.values();
   const { at, alarm } = clock(account);
 
-  github.webhooks.get(id)!.secret = "chosen-by-another-admin";
+  github.webhooks.get(id)!.secret = changed;
   await at(HOUR / 2, async () => expect(await github.deliver("issues", issues("opened", 42))).toEqual([401]));
   await at(HOUR, alarm);
   expect(github.webhooks.get(id)?.secret).toBe(secret);
