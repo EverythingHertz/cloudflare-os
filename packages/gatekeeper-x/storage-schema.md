@@ -51,6 +51,7 @@ One per connected account, named by its `UserAccount` id.
 | `reg:<hook key>` | `{ kind, postId?, conversationId?, userId?, viewerId }` | An enabled hook: what it watches for, and the connected X user, whose own posts are never delivered back to it. |
 | `caps:<hook key>` | `{ delivery, initiator }` | The facet's delivery stub and the overseer's initiator. Disposed when replaced, unregistered or revoked. |
 | `msg:<hook key>:<event id>` | kit `HookDeliveryQueue` rows | Each event queued for a hook, retried with backoff; finished rows are kept a day, deduplicating X's `event_uuid`. |
+| `queue:due:<time>:<hook key>:<event id>`, `queue:finished:<time>:<hook key>:<event id>`, `queue:indexed` | kit `HookDeliveryQueue` indexes | The queue's indexes of those rows: by when each pending one is next due, and when each finished one finished, which its day is counted from. |
 | `revoked` | `true` | The account was disconnected: nothing more is registered or delivered. |
 
 ## XActivityRouter

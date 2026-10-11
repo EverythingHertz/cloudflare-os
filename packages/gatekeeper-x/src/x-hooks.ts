@@ -167,8 +167,8 @@ export function watches(registration: Registration, event: XActivityEvent): bool
 
 /**
  * One per connected account, named by its `UserAccount` id. Storage: `account` (that id),
- * `reg:`/`caps:` per hook, the delivery queue's `msg:` rows, and `revoked` once the account is
- * disconnected, which refuses everything for good.
+ * `reg:`/`caps:` per hook, the delivery queue's `msg:` rows and their `queue:` indexes, and
+ * `revoked` once the account is disconnected, which refuses everything for good.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
