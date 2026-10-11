@@ -348,10 +348,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
     const kv = this.ctx.storage.kv;
     kv.put("checkAt", Date.now() + CHECK_INTERVAL_MS);
     const account = kv.get<string>("account");
+    if (account === undefined) return;
+    // Undefined while this deployment has hooks turned off, when only deletions go on.
     const url = this.#webhookUrl();
-    if (account === undefined || url === undefined) return;
     // In case a reconnect's notice to this driver was lost.
-    if (!kv.get("revoked")) {
+    if (url !== undefined && !kv.get("revoked")) {
       await this.#readViewer(account).catch((error: unknown) => {
         logger.warn("failed to read who a GitHub account is", { event: "hooks.viewer.read.failed", error });
       });
@@ -367,7 +368,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
           });
           continue;
         }
-        checked.push({ webhook, failed: await this.#checkWebhook(account, url, webhook) });
+        if (url !== undefined) checked.push({ webhook, failed: await this.#checkWebhook(account, url, webhook) });
       } catch (error) {
         // Tried again at the next check.
         logger.warn("failed to check a GitHub webhook", { event: "hooks.webhook.check.failed", error });
@@ -504,9 +505,9 @@ export class GitHubHookDriver extends DurableObject<Env> {
         logger.warn("failed to delete a GitHub webhook, which is tried again", { event: "hooks.webhook.delete.failed", error });
         return;
       }
-      // 404: deleted already.
+      // 404: deleted already. Otherwise, only the repository's admins can delete it now.
       if (!(error instanceof GitHubApiError && error.status === 404)) {
-        logger.warn("left a GitHub webhook the account can't delete", { event: "hooks.webhook.delete.abandoned", error });
+        logger.error("left a GitHub webhook the account can't delete", { event: "hooks.webhook.delete.abandoned", error });
       }
     }
     // Only if still this one: a webhook added since, for a later hook, is another's to delete.
