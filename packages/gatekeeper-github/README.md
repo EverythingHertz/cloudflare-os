@@ -128,7 +128,7 @@ root `.dev.vars`.
 What this relies on GitHub for is checked against GitHub itself by `pnpm test:contract`
 (`__tests__/contract`), which the `github-contract` workflow runs weekly and on demand once the
 `CONTRACT_GITHUB_TOKEN` secret and `CONTRACT_GITHUB_REPO` variable name a disposable private
-repository:
+repository (the token fine-grained, with access to that repository alone; see the workflow):
 - a reader without access gets a 404, whatever ETag it sends;
 - a redelivery uses the webhook's current URL, encoding and secret;
 - a second webhook at a URL one delivers to is refused, so the worker adopts one an earlier attempt
