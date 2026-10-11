@@ -886,6 +886,35 @@ it("refuses deliveries that aren't signed with the webhook's signing token, or r
   expect((await triage.read()).received).toEqual([]);
 });
 
+it("takes a delivery signed by any one of the signatures it lists, however many it lists", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const [{ url, signingToken }] = gitlab.webhooks.values();
+  /** Send an issue event, signed with `signatures`, where `VALID` stands for its true signature. */
+  const send = async (signatures: string) => {
+    const id = crypto.randomUUID();
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const body = JSON.stringify(issueHook("open", 42));
+    const valid = await sign(signingToken!, id, timestamp, body);
+    return (await SELF.fetch(url, {
+      method: "POST", body,
+      headers: {
+        "X-Gitlab-Event": "Issue Hook", "webhook-id": id, "webhook-timestamp": timestamp,
+        "webhook-signature": signatures.replace("VALID", valid),
+      },
+    })).status;
+  };
+
+  // One for each key, as Standard Webhooks lists them while a key is rotated.
+  expect(await send(`v1,AAAA VALID v1,${btoa("x".repeat(32))}`)).toBe(204);
+  expect(await send(Array.from({ length: 300 }, () => `v1,${btoa("x".repeat(32))}`).join(" "))).toBe(401);
+  await settled(account);
+  expect((await triage.read()).received).toHaveLength(1);
+});
+
 it("delivers an event once, however often GitLab delivers it", async () => {
   const gitlab = new FakeGitLabHooks();
   const account = await connectAccount();

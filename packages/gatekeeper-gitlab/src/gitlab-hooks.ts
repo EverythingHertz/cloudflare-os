@@ -749,14 +749,16 @@ async function verifySignature(secret: string, { id, timestamp, signatures }: Gi
   }
   const key = await crypto.subtle.importKey(
     "raw", fromBase64(secret.slice(SIGNING_TOKEN_PREFIX.length))!, { name: "HMAC", hash: "SHA-256" }, false,
-    ["verify"]);
+    ["sign"]);
   const prefix = new TextEncoder().encode(`${id}.${timestamp}.`);
   const signed = new Uint8Array(prefix.length + body.length);
   signed.set(prefix);
   signed.set(body, prefix.length);
-  for (const signature of signatures.split(" ")) {
+  // Computed once, and each signature listed compared with it, so that a header listing many costs
+  // no more hashing of the body than one.
+  const expected = new Uint8Array(await crypto.subtle.sign("HMAC", key, signed));
+  return signatures.split(" ").some(signature => {
     const bytes = signature.startsWith("v1,") ? fromBase64(signature.slice("v1,".length)) : undefined;
-    if (bytes && await crypto.subtle.verify("HMAC", key, bytes, signed)) return true;
-  }
-  return false;
+    return bytes?.length === expected.length && crypto.subtle.timingSafeEqual(bytes, expected);
+  });
 }
