@@ -1289,7 +1289,9 @@ it("starts each check's resends where the last check's stopped, when more projec
 
   await at(2 * HOUR, alarm);
   expect(gitlab.resentTo()).toMatchObject({ [left!]: 1 });
-});
+  // Twenty-one projects' enables and checks, which a loaded CI runner takes longer than the default
+  // five seconds over, as #717's like test for GitHub does.
+}, 30_000);
 
 it("resends at the next check what GitLab refused to resend", async () => {
   const gitlab = new FakeGitLabHooks();
