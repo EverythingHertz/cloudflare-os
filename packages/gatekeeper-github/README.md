@@ -101,11 +101,13 @@ a repository webhook, so this needs a public URL:
 Enabling a hook adds a webhook to the repository, delivering to
 `${WEBHOOK_ORIGIN}/gatekeeper/github/webhook/<id>`, so GitHub allows it only if the connected
 account is an admin of the repository. An account's hooks on one repository share its webhook,
-which is deleted when the last of them is disabled, or when the account is disconnected. Each
-webhook signs its deliveries with a secret only GitHub and this deployment hold; a delivery of a
-payload already received, or of an event more than a day old, is ignored; and an event is
-delivered only while the account can still read the repository, since a webhook outlives its
-creator's access.
+which is deleted when the last of them is disabled, or when the account is disconnected. Should
+GitHub fail to delete it, the hourly check tries again, and a disconnect that leaves it fails,
+keeping the account connected, with the token that can delete it, until disconnecting again finds
+it gone. Each webhook signs its deliveries with a secret only GitHub and this deployment hold; a
+delivery of a payload already received, or of an event more than a day old, is ignored; and an
+event is delivered only while the account can still read the repository, since a webhook outlives
+its creator's access.
 
 The repository's other admins can see the webhook, though not its secret. Every hour the worker
 checks each webhook on GitHub, and restores one that someone has deleted, deactivated, pointed
