@@ -2,13 +2,14 @@
 // resumes where a failure stopped it; a send X never confirmed is reconciled rather than repeated;
 // what builds on a pending post waits for it, and falls with it.
 
+import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { generateNonce } from "@gadgets/gatekeeper-kit/connect-nonce";
 import type { ActionDescription } from "@gadgets/workshop-shared/gatekeeper";
 import type { XListInfo, XPostDraft, XPostInfo } from "../../src/types";
 import { scopesFor } from "../../src/x-env";
 import type { WirePost } from "../../src/x-normalize";
-import { ALICE, BOB, FakeX, failure, hooks, json, reconnectAs, seedAccount, snowflakeAt, unwrap } from "./fake-x";
+import { ALICE, BOB, FakeX, accountStub, failure, hooks, json, reconnectAs, seedAccount, snowflakeAt, unwrap } from "./fake-x";
 import type { GatekeeperProps, Step } from "./worker";
 
 afterEach(() => {
@@ -582,6 +583,36 @@ describe("Lists", () => {
     unwrap(await t.apply(privacy.actionId));
     unwrap(await t.revert(rename.actionId));
     expect(t.x.lists.get("5")).toMatchObject({ name: "Old", description: "before", private: true });
+  });
+
+  it("won't revert a List's description X left out of its answer", async () => {
+    const t = await setup();
+    t.x.lists.set("5", { id: "5", name: "Old", description: "before", private: false, owner_id: ALICE.id });
+    // X describes the List without its description, which it says it failed to hydrate.
+    t.x.on("GET", /^\/2\/lists\/5(\?|$)/, () => json({
+      data: { id: "5", name: "Old", private: false, owner_id: ALICE.id },
+      errors: [{ title: "Field Authorization Error", detail: "description", resource_type: "list", resource_id: "5" }],
+    }));
+    await t.run([["getList", "5"], ["update", { description: "after" }]]);
+    const [{ actionId }] = await t.submitted();
+    unwrap(await t.apply(actionId));
+    expect(unwrap(await t.revert(actionId))).toMatchObject({ canRetry: false });
+    expect(t.x.lists.get("5")).toMatchObject({ description: "after" });
+  });
+
+  it("reserves the page a reconciliation reads", async () => {
+    const t = await setup();
+    await t.run([["createPost", { text: "Counted" }]]);
+    t.x.loseAnswer("POST", /^\/2\/tweets$/);
+    let reserved: number | undefined;
+    t.x.on("GET", new RegExp(`^/2/users/${ALICE.id}/tweets`), async () => {
+      reserved = await runInDurableObject(accountStub(t.userObjectId), async (_instance, state) =>
+        state.storage.kv.get<{ used: number }>("reads")?.used);
+      return undefined;
+    });
+    const [{ actionId }] = await t.submitted();
+    unwrap(await t.apply(actionId));
+    expect(reserved).toBe(100);
   });
 
   it("restores a List's original details though the change's first answer was lost", async () => {

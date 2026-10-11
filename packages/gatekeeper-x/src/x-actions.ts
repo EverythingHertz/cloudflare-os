@@ -71,7 +71,13 @@ export type ListTarget = { id: string; info: XListInfo };
 export type SendAttempt = { at: number; mediaIds?: string[]; existing?: string[] };
 
 /** A List's details, as an update changes and a revert restores them. */
-export type ListDetails = { name: string; description: string; private: boolean };
+export type ListDetails = {
+  /** Absent when X left it out beside errors: a field it failed to hydrate isn't known to be empty. */
+  name?: string;
+  /** Likewise; with no errors, a description X leaves out is an empty one. */
+  description?: string;
+  private: boolean;
+};
 
 /** What each kind of action stores. */
 export type XActions = {
@@ -392,6 +398,9 @@ const CLOCK_SKEW_MS = 10_000;
 /** How long after its attempt began X may date what a send created: well past our timeout. */
 const RECONCILE_WINDOW_MS = 5 * 60 * 1000;
 
+/** Rows a reconciliation read asks X for, and so reserves against the read limit: X's largest page. */
+const RECONCILE_PAGE = 100;
+
 /** Most pages of owned Lists a reconciliation reads: X lets an account own at most 1,000 Lists. */
 const MAX_OWNED_LIST_PAGES = 10;
 
@@ -470,8 +479,8 @@ function contentKey(content: SentContent): string {
  */
 async function findPublished(host: XActionHost, draft: StoredDraft, replyTo: string | undefined,
                              attempt: SendAttempt): Promise<string | undefined> {
-  const envelope = await host.read<WirePost[]>(5, (api, me) => api.get<WirePost[]>(`/2/users/${me.id}/tweets`, {
-    max_results: 100,
+  const envelope = await host.read<WirePost[]>(RECONCILE_PAGE, (api, me) => api.get<WirePost[]>(`/2/users/${me.id}/tweets`, {
+    max_results: RECONCILE_PAGE,
     start_time: xTime(new Date(attempt.at - CLOCK_SKEW_MS)),
     // Until the window has closed it runs to the present.
     ...(windowClosed(attempt) ? { end_time: xTime(new Date(attempt.at + RECONCILE_WINDOW_MS)) } : {}),
@@ -497,9 +506,9 @@ async function matchingLists(host: XActionHost, payload: XActions["createList"])
   const matches: WireList[] = [];
   let token: string | undefined;
   for (let page = 0; page < MAX_OWNED_LIST_PAGES; page++) {
-    const envelope = await host.read<WireList[]>(5, (api, me) => api.get<WireList[]>(`/2/users/${me.id}/owned_lists`, {
+    const envelope = await host.read<WireList[]>(RECONCILE_PAGE, (api, me) => api.get<WireList[]>(`/2/users/${me.id}/owned_lists`, {
       "list.fields": "created_at,description,private",
-      max_results: 100,
+      max_results: RECONCILE_PAGE,
       pagination_token: token,
     }));
     matches.push(...completeRows(envelope, "Lists").filter(list => list.name === payload.name
@@ -982,9 +991,16 @@ export const actions = defineActions<XActionHost, XActions>({
       const recorded = host.previous.get(ctx.id);
       let previous = typeof recorded === "object" ? recorded : undefined;
       if (previous === undefined) {
-        const before = requireData(await host.read<WireList>(1, api => api.get<WireList>(`/2/lists/${id}`, LIST_FIELDS)), "List");
-        // Privacy X didn't report is restored as private, the safe way to be wrong.
-        previous = { name: before.name ?? "", description: before.description ?? "", private: before.private !== false };
+        const read = await host.read<WireList>(1, api => api.get<WireList>(`/2/lists/${id}`, LIST_FIELDS));
+        const before = requireData(read, "List");
+        // A field left out beside errors may have failed to hydrate. Privacy X didn't report is restored
+        // as private, the safe way to be wrong.
+        const complete = !read.errors?.length;
+        previous = {
+          ...(before.name !== undefined ? { name: before.name } : {}),
+          ...(before.description !== undefined || complete ? { description: before.description ?? "" } : {}),
+          private: before.private !== false,
+        };
         host.previous.put(ctx.id, previous);
       }
       await toggle(host, api => api.put(`/2/lists/${id}`, payload.changes), "change this List");
@@ -1117,9 +1133,11 @@ export async function revert(action: XAction, host: XActionHost): Promise<Revert
     case "updateList": {
       const previous = action.payload.previous;
       if (!previous) return { message: "This List's earlier details were not recorded.", canRetry: false };
+      const { changes } = action.payload;
+      if ((changes.name !== undefined && previous.name === undefined)
+        || (changes.description !== undefined && previous.description === undefined)) return PRIOR_UNKNOWN;
       const id = listId(host, action.payload.list);
       // Only what this update changed, so undoing it doesn't undo a later change to another field.
-      const { changes } = action.payload;
       const restored = {
         ...(changes.name !== undefined ? { name: previous.name } : {}),
         ...(changes.description !== undefined ? { description: previous.description } : {}),
