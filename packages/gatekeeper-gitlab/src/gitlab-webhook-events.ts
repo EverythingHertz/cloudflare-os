@@ -37,10 +37,14 @@ export type WebhookPayload = {
   project?: { id?: unknown } | null;
   user?: WebhookUser | null;
   object_attributes?: Record<string, unknown> | null;
+  /** What the event changed, each as `{ previous, current }`, whatever GitLab's docs show. */
   changes?: {
     draft?: { previous?: unknown; current?: unknown };
-    /** The reviewers before and after, with their review states. */
-    reviewers?: [Array<WebhookUser & { state?: unknown }>, Array<WebhookUser & { state?: unknown }>];
+    /** The reviewers, with their review states. */
+    reviewers?: {
+      previous?: Array<WebhookUser & { state?: unknown }> | null;
+      current?: Array<WebhookUser & { state?: unknown }> | null;
+    };
   } | null;
   issue?: { iid?: unknown } | null;
   merge_request?: { iid?: unknown } | null;
@@ -155,11 +159,11 @@ function reviewDecision(attributes: Record<string, unknown>, changes: NonNullabl
                         senderId: number | undefined): GitLabReviewDecision | undefined {
   // An approval GitLab removes or adds itself, as on a push, is no one's review.
   if (attributes.action === "approval") return attributes.system === true ? undefined : "approve";
-  if (attributes.action !== "update" || senderId === undefined || !Array.isArray(changes?.reviewers)) return undefined;
-  const [before, after] = changes.reviewers;
+  const reviewers = changes?.reviewers;
+  if (attributes.action !== "update" || senderId === undefined || !Array.isArray(reviewers?.current)) return undefined;
   // A re-request moves the reviewer back to `unreviewed`, which is no review.
-  const now = after?.find(reviewer => reviewer.id === senderId);
-  if (!now || before?.find(reviewer => reviewer.id === senderId)?.state === now.state) return undefined;
+  const now = reviewers.current.find(reviewer => reviewer.id === senderId);
+  if (!now || reviewers.previous?.find(reviewer => reviewer.id === senderId)?.state === now.state) return undefined;
   return REVIEW_STATES.get(now.state);
 }
 

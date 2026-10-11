@@ -141,9 +141,13 @@ function mergeRequestRest(iid: number, state = "opened", path = PROJECT): Row {
   };
 }
 
-/** A reviewer's review state changing, as a merge request event's `changes` reports it. */
+/**
+ * A reviewer's review state changing, as a merge request event's `changes` reports it: as every
+ * change, `{ previous, current }` (GitLab's `DataBuilder::Issuable#final_changes`), though the
+ * webhook docs show the reviewers as a pair of arrays.
+ */
 const reviewerState = (previous: string, current: string) => ({
-  reviewers: [[{ ...BOB, state: previous }], [{ ...BOB, state: current }]],
+  reviewers: { previous: [{ ...BOB, state: previous }], current: [{ ...BOB, state: current }] },
 });
 
 /** An issue's or merge request's event as the driver queues it, for delivering to a facet directly. */
