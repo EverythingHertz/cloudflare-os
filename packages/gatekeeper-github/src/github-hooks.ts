@@ -462,9 +462,9 @@ export class GitHubHookDriver extends DurableObject<Env> {
 
   /**
    * Give `repo` this driver's webhook, configured as it must be for `registrations`, the hooks it
-   * serves: the recorded one, which an admin may have edited or deleted since; or a new one; or,
-   * as GitHub refuses a second webhook with the same URL, the one an earlier attempt left there
-   * unrecorded.
+   * serves: the recorded one, which an admin may have edited or deleted since; or the one an earlier
+   * attempt left at this driver's URL unrecorded, which GitHub would let a new one stand beside if
+   * their events differ; or a new one.
    */
   async #ensureWebhook(repo: PinnedRepo, registrations: Registration[]): Promise<void> {
     const kv = this.ctx.storage.kv;
@@ -496,15 +496,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
             if (!(error instanceof GitHubApiError && error.status === 404)) throw error;
           }
         }
-        try {
-          return { id: (await api.createRepoWebhook(repo.id, config)).id, repaired: false };
-        } catch (error) {
-          if (!(error instanceof GitHubApiError && error.status === 422)) throw error;
-          const existing = (await api.listRepoWebhooks(repo.id))
-            .find(webhook => webhook.config.url === url);
-          if (!existing) throw error;
+        const existing = (await api.listRepoWebhooks(repo.id)).find(webhook => webhook.config.url === url);
+        if (existing) {
           return { id: (await api.updateRepoWebhook(repo.id, existing.id, config)).id, repaired: !deliversHere(existing, url) };
         }
+        return { id: (await api.createRepoWebhook(repo.id, config)).id, repaired: false };
       });
     } catch (error) {
       throw webhookRefusal(repo, error);
@@ -528,11 +524,12 @@ export class GitHubHookDriver extends DurableObject<Env> {
     if (this.ctx.storage.kv.get<Webhook>(webhookKey(repo.id))?.id === id) this.ctx.storage.kv.delete(webhookKey(repo.id));
   }
 
-  /** Delete the webhook GitHub has at `url` on `repo`, if any, then forget it, as #deleteWebhook() does. */
+  /** Delete the webhooks GitHub has at `url` on `repo`, if any, then forget it, as #deleteWebhook() does. */
   async #deleteUnrecorded(account: string, { repo, url }: Unrecorded): Promise<void> {
     const settled = await this.#settled(account, repo, async api => {
-      const found = (await api.listRepoWebhooks(repo.id)).find(webhook => webhook.config.url === url);
-      if (found) await api.deleteRepoWebhook(repo.id, found.id);
+      for (const found of (await api.listRepoWebhooks(repo.id)).filter(webhook => webhook.config.url === url)) {
+        await api.deleteRepoWebhook(repo.id, found.id);
+      }
     });
     if (settled) this.ctx.storage.kv.delete(unrecordedKey(repo.id, url));
   }
