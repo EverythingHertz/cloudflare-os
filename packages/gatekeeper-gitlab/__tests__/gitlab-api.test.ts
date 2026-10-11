@@ -427,6 +427,18 @@ describe("pagination", () => {
   });
 });
 
+describe("project webhooks", () => {
+  it("lists every page of them, as a self-managed instance may allow a project more than one's worth", async () => {
+    const hook = { id: 1, url: "https://x.test/" };
+    const calls = fakeFetch([
+      json(Array.from({ length: 100 }, () => hook), { headers: { "x-next-page": "2" } }),
+      json([{ ...hook, id: 101 }], { headers: { "x-next-page": "" } }),
+    ]);
+    expect(await api().listProjectWebhooks(15)).toHaveLength(101);
+    expect(calls.map(call => call.url.searchParams.get("page"))).toEqual(["1", "2"]);
+  });
+});
+
 describe("repository", () => {
   it("encodes branch and ref names whole and maps 404 to null", async () => {
     const calls = fakeFetch([

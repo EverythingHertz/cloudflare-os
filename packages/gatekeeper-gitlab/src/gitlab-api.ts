@@ -322,6 +322,8 @@ export type GitLabWebhookEventResponse = {
 
 /** Bounds one read of a webhook's delivery log, at 20 attempts a page, the most GitLab serves. */
 const MAX_WEBHOOK_EVENT_PAGES = 10;
+/** Bounds one listing of a project's webhooks, at 100 a page: twenty times GitLab.com's limit. */
+const MAX_WEBHOOK_PAGES = 20;
 
 function webhookBody({ url, signingToken, triggers }: GitLabProjectWebhookConfig) {
   return {
@@ -825,9 +827,20 @@ export class GitLabApi {
 
   // -- project webhooks, by numeric project id: GitLab answers only its Maintainers and Owners
 
-  /** The project's webhooks, first page only: GitLab.com allows a project 100. */
+  /**
+   * The project's webhooks, every page of them: GitLab.com allows a project 100, but a
+   * self-managed instance may allow more, or any number.
+   */
   async listProjectWebhooks(projectId: number): Promise<GitLabProjectWebhookResponse[]> {
-    return await this.#get<GitLabProjectWebhookResponse[]>(`/projects/${projectId}/hooks`, { per_page: 100 });
+    const webhooks: GitLabProjectWebhookResponse[] = [];
+    for (let page: number | null = 1, read = 0; page !== null; read++) {
+      if (read === MAX_WEBHOOK_PAGES) throw new Error(`Project ${projectId} has more webhooks than can be listed.`);
+      const { items, nextPage }: GitLabPage<GitLabProjectWebhookResponse> = await this.#getPage(
+        `/projects/${projectId}/hooks`, {}, page, 100);
+      webhooks.push(...items);
+      page = nextPage;
+    }
+    return webhooks;
   }
 
   async getProjectWebhook(projectId: number, hookId: number): Promise<GitLabProjectWebhookResponse> {
