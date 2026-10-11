@@ -7,8 +7,7 @@
 # repository, with access to that repository alone (administration, contents, issues, pull requests
 # and webhooks, read and write) -- not a classic one, whose `repo` scope reaches every repository
 # its account can. Only the step running the checks is handed it, not those installing what they
-# run. Each run leaves closed issues and pull requests behind, and uploads the payloads GitHub sent,
-# names replaced, for fixtures.
+# run. Each run leaves closed issues and pull requests behind.
 name: GitHub contract
 
 on:
@@ -73,12 +72,3 @@ jobs:
           # This workflow's own token, which can't read the contract repository: the access check's
           # outsider.
           CONTRACT_GITHUB_OUTSIDER_TOKEN: ${{ github.token }}
-          CONTRACT_GITHUB_PAYLOADS_DIR: ${{ runner.temp }}/github-contract-payloads
-
-      - name: Keep GitHub's payloads
-        if: always() && steps.contract.outputs.configured == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: github-contract-payloads
-          path: ${{ runner.temp }}/github-contract-payloads
-          if-no-files-found: ignore

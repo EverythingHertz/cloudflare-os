@@ -9,12 +9,9 @@
 // own), adds the access check. CONTRACT_GITHUB_WEBHOOK_URL is where the webhooks deliver,
 // https://example.com/webhook unless set, each with a query of its own, as GitHub refuses a second
 // webhook at one URL: nothing has to answer, since GitHub's delivery log records each request
-// whatever the answer. CONTRACT_GITHUB_PAYLOADS_DIR, if set, receives each
-// payload GitHub sent, with the account's and repository's names replaced, for fixtures.
+// whatever the answer.
 
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   GitHubApi, type GitHubIssueResponse, type GitHubRepoResponse, type GitHubSimpleUser,
@@ -25,7 +22,6 @@ const token = process.env.CONTRACT_GITHUB_TOKEN;
 const repoName = process.env.CONTRACT_GITHUB_REPO;
 const outsiderToken = process.env.CONTRACT_GITHUB_OUTSIDER_TOKEN;
 const receiver = process.env.CONTRACT_GITHUB_WEBHOOK_URL || "https://example.com/webhook";
-const payloadsDir = process.env.CONTRACT_GITHUB_PAYLOADS_DIR;
 
 /** One attempt in a webhook's delivery log, as GitHub lists it. */
 type DeliverySummary = { id: number; guid: string; event: string; action: string | null; redelivery: boolean };
@@ -106,17 +102,6 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
     });
   }
 
-  /** Keep `found`'s payload as a fixture, with the account's and repository's names replaced. */
-  function keep(fixture: string, found: Delivery): void {
-    if (!payloadsDir) return;
-    let text = JSON.stringify(found.request.payload, null, 2);
-    for (const [real, placeholder] of [[name, "widgets"], [owner, "acme"], [viewer.login, "ada"]] as const) {
-      text = text.replaceAll(new RegExp(`\\b${real.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"), placeholder);
-    }
-    mkdirSync(payloadsDir, { recursive: true });
-    writeFileSync(join(payloadsDir, `${fixture}.json`), `${text}\n`);
-  }
-
   beforeAll(async () => {
     repository = await api.getRepo(owner, name);
     if (repository.private !== true) {
@@ -155,8 +140,6 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
     const comment = await api.createIssueComment(owner, name, issue.number, "Commented by the GitHub contract checks.");
     const opened = await delivery(hook.id, "issues", ofIssue(issue, "opened"));
     const commented = await delivery(hook.id, "issue_comment", found => found.request.payload.comment?.id === comment.id);
-    keep("issues.opened", opened);
-    keep("issue_comment.created", commented);
     for (const found of [opened, commented]) {
       expect(header(found, "Content-Type")).toBe("application/json");
       expect(header(found, "X-GitHub-Delivery")).toBe(found.guid);
@@ -251,9 +234,6 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
     const opened = await delivery(hook.id, "pull_request",
       found => found.action === "opened" && found.request.payload.pull_request?.number === pull.number);
     const reviewed = await delivery(hook.id, "pull_request_review", found => found.request.payload.review?.id === review.id);
-    keep("push", pushed);
-    keep("pull_request.opened", opened);
-    keep("pull_request_review.submitted", reviewed);
     const push = parseWebhookEvent("push", pushed.guid, pushed.request.payload);
     expect(push).toMatchObject({
       event: { kind: "push", branch, before: base.object.sha, after: file.commit.sha, forced: false },
