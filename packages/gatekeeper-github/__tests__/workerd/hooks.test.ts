@@ -1711,6 +1711,18 @@ it("keeps on record the webhook an enable added as its account was disconnected,
   expect(github.webhooks.size).toBe(0);
 });
 
+it("refuses a first enable that comes as its account is being disconnected, before the token is revoked", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+
+  // As GatekeeperUser.revoke() does first, its token still live for the moment after.
+  expect(await driver(account).revoke()).toBe(true);
+  await expect(triage.enable()).rejects.toThrow("This GitHub account has been disconnected.");
+  expect(github.webhooks.size).toBe(0);
+});
+
 it("deletes a disconnected account's webhooks and delivers nothing more", async () => {
   const github = new FakeGitHub();
   const account = await connectAccount();
