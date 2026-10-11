@@ -1515,6 +1515,12 @@ export class UserAccount extends DurableObject<Env> {
     const grant = commitStagedCredentials<GitHubOAuthGrant>(this.ctx.storage.kv, Date.now(), stageId);
     if (!grant) throw new Error("No reconnect is awaiting confirmation. Please try again.");
     this.#creds.connect(grant);
+    // Perhaps as another GitHub user, whose own comments and reviews the account's hooks then
+    // skip. Should this be lost, the driver's hourly check reads it too.
+    await this.ctx.exports.GitHubHookDriver.getByName(this.ctx.id.toString()).reconnected()
+      .catch((error: unknown) => {
+        logger.warn("failed to tell the hook driver of a reconnect", { event: "hooks.account.reconnect.failed", error });
+      });
   }
 
   /**
@@ -1686,9 +1692,14 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
   async revoke(): Promise<void> {
     const { userObjectId } = this.ctx.props;
-    // First, while the account's token can still delete its webhooks.
-    await this.ctx.exports.GitHubHookDriver.getByName(userObjectId).revoke();
-    await this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(userObjectId)).revoke();
+    try {
+      // First, while the account's token can still delete its webhooks.
+      await this.ctx.exports.GitHubHookDriver.getByName(userObjectId).revoke();
+    } finally {
+      // The token is revoked even when its webhooks can't be: the driver going wrong mustn't leave
+      // a disconnected account's grant live.
+      await this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(userObjectId)).revoke();
+    }
   }
 
   async reconnect(): Promise<{ url: string }> {
@@ -3755,8 +3766,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     const pin = await this.#pinnedRepo();
     if (!pin) throw new Error(`Failed to look up ${owner}/${repo} on GitHub. Please try again.`);
-    const [{ permissions }, { user: viewer }] = await this.#readApi(api =>
-      Promise.all([api.getRepo(owner, repo), api.getViewer()]));
+    const { permissions } = await this.#readApi(api => api.getRepo(owner, repo));
     if (!permissions?.admin) {
       throw new Error(`GitHub delivers events to a webhook, which only an admin of ${owner}/${repo} ` +
         "can add, and the connected account is not one.");
@@ -3770,7 +3780,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       userObjectId,
       repo: pin,
       events,
-      viewerId: viewer.id,
       delivery,
     } });
     const watched = number === undefined

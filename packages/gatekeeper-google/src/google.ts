@@ -740,16 +740,26 @@ export class UserAccount extends DurableObject<Env> {
     });
   }
 
-  /** Note that `driver` holds hooks of this account, so that disconnecting it reaches them. */
-  async trackHookDriver(driver: HookDriverRef): Promise<void> {
-    this.ctx.storage.kv.put(`hookDriver:${driver.kind}:${driver.name}`, driver);
+  /**
+   * Note that `driver` holds hooks of this account, so that disconnecting it reaches them; false,
+   * noting nothing, once the account is disconnected, when no hook of it may be registered.
+   */
+  async trackHookDriver(driver: HookDriverRef): Promise<boolean> {
+    // Serialized with disconnecting, so that a driver is either noted before the account's drivers
+    // are told to drop its hooks, or refused once its credentials are gone.
+    return await this.#credentials.run(async () => {
+      if (!this.ctx.storage.kv.get<string>("refreshToken")) return false;
+      this.ctx.storage.kv.put(`hookDriver:${driver.kind}:${driver.name}`, driver);
+      return true;
+    });
   }
 
   /**
    * Have every driver holding this account's hooks drop them. Their records are about to go with
    * the credentials, and a driver would otherwise go on reading and renewing for them, failing
    * every time. Best effort: a driver that can't be reached is logged rather than block the
-   * disconnect.
+   * disconnect, and drops them itself within a day, when it next asks whether the account knows of
+   * it (see trackHookDriver()).
    */
   async #forgetHooks(): Promise<void> {
     const userObjectId = this.ctx.id.toString();
