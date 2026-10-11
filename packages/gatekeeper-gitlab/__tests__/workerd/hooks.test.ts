@@ -1686,6 +1686,27 @@ it("deletes at the next hourly check a webhook GitLab failed to delete as its la
   expect(gitlab.webhooks.has(webhook.id)).toBe(false);
 });
 
+it("keeps a disconnecting account's tokens when its hook driver restarts before saying GitLab failed to delete a webhook", async () => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+
+  gitlab.failDeletesWith = 500;
+  await runInDurableObject(driver(account), (_instance, state) => state.storage.kv.put("test:restartAfterRevoke", true));
+  expect(await triage.hooks.revokeAccount(account)).toEqual({
+    error: "GitLab failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
+  });
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBe(0);
+
+  gitlab.failDeletesWith = undefined;
+  await unwrap(await triage.hooks.revokeAccount(account));
+  expect(gitlab.webhooks.size).toBe(0);
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
+});
+
 it.each<[string, number | undefined]>([
   ["", undefined],
   [", and its first deletion fails", 500],

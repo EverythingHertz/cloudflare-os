@@ -641,10 +641,14 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
   }
 
   async revoke(): Promise<void> {
+    // A stub of its own for each call: one to a driver that has restarted is broken.
+    const driver = () => this.ctx.exports.GitLabHookDriver.getByName(this.ctx.props.userObjectId);
     let webhooksGone = true;
     try {
-      // First, while the account's token can still delete its webhooks.
-      webhooksGone = await this.ctx.exports.GitLabHookDriver.getByName(this.ctx.props.userObjectId).revoke();
+      // First, while the account's token can still delete its webhooks. Asked again should its
+      // answer be lost, as when it restarts after recording what GitLab failed to delete: it takes
+      // up where it was, and says so.
+      webhooksGone = await driver().revoke().catch(() => driver().revoke());
     } finally {
       // Kept while GitLab may yet delete one of them, which takes the token, for the disconnect to
       // be tried again; revoked otherwise, even when the driver failed, which mustn't leave a

@@ -52,12 +52,20 @@ import {
 
 /**
  * The account's hook driver, whose revoke() fails while its storage has `test:unreachable`, as when
- * disconnecting the account can't reach it.
+ * disconnecting the account can't reach it; or, with `test:restartAfterRevoke`, which revoke()
+ * clears, restarts once it has done its work, before it can answer.
  */
 export class GitLabHookDriver extends GitLabHookDriverImpl {
   override async revoke(): Promise<boolean> {
-    if (this.ctx.storage.kv.get("test:unreachable")) throw new Error("The test hook driver can't be reached.");
-    return await super.revoke();
+    const kv = this.ctx.storage.kv;
+    if (kv.get("test:unreachable")) throw new Error("The test hook driver can't be reached.");
+    const restart = kv.get("test:restartAfterRevoke");
+    const gone = await super.revoke();
+    if (restart) {
+      await this.ctx.storage.sync();
+      this.ctx.abort("The test hook driver restarted.");
+    }
+    return gone;
   }
 }
 
