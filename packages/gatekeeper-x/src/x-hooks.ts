@@ -424,11 +424,15 @@ export class XActivityRouter extends DurableObject<Env> {
   async #subscribe(userId: string, eventType: string, account: string): Promise<Subscription> {
     const webhookId = await this.ctx.exports.XWebhookRegistry.getByName(REGISTRY).webhookId();
     const body = { event_type: eventType, filter: { user_id: userId }, webhook_id: webhookId, tag: TAG };
-    const at = Date.now();
+    // Taken as the request goes out, after any wait for credentials: a reconnect can overtake that
+    // wait, and the request then goes out under the new grant, after a revocation of the old one.
+    let at = Date.now();
     try {
       const created = PRIVATE_EVENT_TYPES.has(eventType)
-        ? await accountSource(this.ctx.exports, account).run(creds =>
-          new XApi(creds.accessToken).post<SubscriptionResponse>("/2/activity/subscriptions", body))
+        ? await accountSource(this.ctx.exports, account).run(creds => {
+          at = Date.now();
+          return new XApi(creds.accessToken).post<SubscriptionResponse>("/2/activity/subscriptions", body);
+        })
         : await appApi(this.env).post<SubscriptionResponse>("/2/activity/subscriptions", body);
       return { id: subscriptionIdOf(requireData(created, "subscription")), at };
     } catch (error) {

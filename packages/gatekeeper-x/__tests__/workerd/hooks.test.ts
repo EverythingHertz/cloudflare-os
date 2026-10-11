@@ -240,6 +240,33 @@ describe("subscribing", () => {
     expect(mentions()).toHaveLength(0);
   });
 
+  it("dates a subscription by when it was asked for, after the credentials it waited on", async () => {
+    const x = new FakeX().install();
+    const account = await seedAccount(x, ALICE, { expiresInMs: -1000 });
+    const mentions = binding({ userObjectId: account, resourceKind: "account" });
+    await mentions.subscribe([["subscribeMentions"]]);
+    // The expired token's refresh is held...
+    let refreshing = false;
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    x.on("POST", /^\/2\/oauth2\/token$/, async () => {
+      refreshing = true;
+      await released;
+      return undefined;
+    });
+    const enabling = mentions.tryEnable();
+    await vi.waitFor(() => expect(refreshing).toBe(true));
+    // ...while a revocation lands, so the subscription is asked for after it, with the fresh token.
+    const router = env.X_ACTIVITY_ROUTER.getByName(ALICE.id);
+    const revoking = router.revoked(Date.now());
+    await new Promise(resolve => setTimeout(resolve, 20));
+    release();
+    unwrap(await enabling);
+    await revoking;
+    await runInDurableObject(router, (_instance, state) =>
+      expect(state.storage.kv.get("sub:post.mention.create")).toBeDefined());
+  });
+
   it("keeps deleting a subscription X failed to delete, though an earlier revocation is delivered again", async () => {
     const { x, hook } = await watchingMentions();
     const revocation = { id: "revoke-1", createdAt: new Date(Date.now() - 1000).toISOString() };
