@@ -1468,6 +1468,17 @@ it("refuses to watch on a GitLab that cannot sign webhook deliveries", async () 
   expect(gitlab.webhooks.size).toBe(0);
 });
 
+it("revokes a disconnected account's tokens even when its hook driver can't be reached", async () => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  await runInDurableObject(driver(account), (_instance, state) => state.storage.kv.put("test:unreachable", true));
+
+  // Disconnecting fails, as it should, but not before the tokens are revoked.
+  expect(await binding(account).hooks.revokeAccount(account)).toEqual({ error: "The test hook driver can't be reached." });
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
+});
+
 it("deletes a disconnected account's webhooks and delivers nothing more", async () => {
   const gitlab = new FakeGitLabHooks();
   gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));

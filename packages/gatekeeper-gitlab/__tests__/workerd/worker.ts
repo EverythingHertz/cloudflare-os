@@ -45,8 +45,21 @@ export { default } from "../../src/gitlab.js";
 export * from "../../src/gitlab.js";
 // Named as well, since the pool builds `ctx.exports` entrypoints only from exports it can see
 // statically, and the facet and the account mint these.
-export { GitLabHookController, GitLabHookDriver } from "../../src/gitlab.js";
-import { GatekeeperUserImpl, GitLabGatekeeperImpl, GitLabVerifier } from "../../src/gitlab.js";
+export { GitLabHookController } from "../../src/gitlab.js";
+import {
+  GatekeeperUserImpl, GitLabGatekeeperImpl, GitLabHookDriver as GitLabHookDriverImpl, GitLabVerifier,
+} from "../../src/gitlab.js";
+
+/**
+ * The account's hook driver, whose revoke() fails while its storage has `test:unreachable`, as when
+ * disconnecting the account can't reach it.
+ */
+export class GitLabHookDriver extends GitLabHookDriverImpl {
+  override async revoke(): Promise<void> {
+    if (this.ctx.storage.kv.get("test:unreachable")) throw new Error("The test hook driver can't be reached.");
+    await super.revoke();
+  }
+}
 
 /**
  * The account entrypoint, reachable for tests. Under the capnweb-validate *vite* plugin (which

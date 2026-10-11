@@ -641,9 +641,14 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
   }
 
   async revoke(): Promise<void> {
-    // First, while the account's token can still delete its webhooks.
-    await this.ctx.exports.GitLabHookDriver.getByName(this.ctx.props.userObjectId).revoke();
-    await this.#account().revoke();
+    try {
+      // First, while the account's token can still delete its webhooks.
+      await this.ctx.exports.GitLabHookDriver.getByName(this.ctx.props.userObjectId).revoke();
+    } finally {
+      // The token is revoked even when its webhooks can't be: the driver going wrong mustn't leave
+      // a disconnected account's grant live.
+      await this.#account().revoke();
+    }
   }
 
   async reconnect(): Promise<{ url: string }> {
