@@ -17,6 +17,7 @@
 
 import { DurableObject, RpcTarget, WorkerEntrypoint, type RpcStub } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
+import { isCredentialsExpired } from "@gadgets/gatekeeper-kit/credentials";
 import {
   DELIVERED_RETENTION_MS, HookDeliveryQueue, disposeStubs,
 } from "@gadgets/gatekeeper-kit/hook-delivery-queue";
@@ -141,7 +142,8 @@ const repairedKey = (repoId: number) => `repaired:${repoId}`;
  * restored), `checkAt` (when to next check them on GitHub), `redeliverFrom` (the repository the
  * next check's redeliveries start with), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows
  * and `queue:` indexes, and `revoked` once the account is disconnected, which refuses everything
- * for good.
+ * for good. A webhook stays on record until GitHub has deleted it, or can't, and `account` with
+ * it.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
@@ -206,34 +208,42 @@ export class GitHubHookDriver extends DurableObject<Env> {
         return;
       }
       // The repository's last hook: rather than leave GitHub delivering there, remove the webhook.
-      await this.#removeWebhook(kv.get<string>("account")!, webhook);
-      kv.delete(webhookKey(repo.id));
       kv.delete(repairedKey(repo.id));
+      await this.#deleteWebhook(kv.get<string>("account")!, webhook);
     });
     await this.#reschedule();
   }
 
   /**
    * The account is being disconnected, while its token still works: stop delivering for good, and
-   * delete its webhooks, which GitHub would otherwise keep delivering to.
+   * delete its webhooks, which GitHub would otherwise keep delivering to. Called again after GitHub
+   * failed to delete some, it tries those again.
+   * @returns Whether every webhook is gone, or beyond the account's deleting; false while GitHub may
+   *   yet delete one, which needs the account's token: the hourly check tries again meanwhile.
    */
-  async revoke(): Promise<void> {
+  async revoke(): Promise<boolean> {
     const kv = this.ctx.storage.kv;
     const account = kv.get<string>("account");
-    // Never used: a hook enabled from now on fails for want of the account's token.
-    if (account === undefined) return;
-    const webhooks: Webhook[] = [];
-    // Listed in full before any is deleted.
-    for (const [key, value] of Array.from(kv.list())) {
-      if (key.startsWith("webhook:")) webhooks.push(value as Webhook);
-      if (key.startsWith("caps:")) disposeStubs(value as Capabilities);
-      kv.delete(key);
+    // Never used, or done: a hook enabled from now on fails for want of the account's token.
+    if (account === undefined) return true;
+    if (!kv.get("revoked")) {
+      // Listed in full before any is deleted. The webhooks, and the account that deletes them, stay
+      // until they are gone.
+      for (const [key, value] of Array.from(kv.list())) {
+        if (key === "account" || key.startsWith("webhook:")) continue;
+        if (key.startsWith("caps:")) disposeStubs(value as Capabilities);
+        kv.delete(key);
+      }
+      kv.put("revoked", true);
     }
-    kv.put("revoked", true);
-    await this.ctx.storage.deleteAlarm();
-    // A change in flight finishes first, and an addition then deletes what it added.
-    await this.#webhookChanges.run(() =>
-      Promise.all(webhooks.map(webhook => this.#removeWebhook(account, webhook))));
+    // A change in flight finishes first, recording what it added for this to delete.
+    const gone = await this.#webhookChanges.run(async () => {
+      await Promise.all(this.#webhooks().map(webhook => this.#deleteWebhook(account, webhook)));
+      return this.#webhooks().length === 0;
+    });
+    if (gone) kv.delete("account");
+    await this.#reschedule();
+    return gone;
   }
 
   /**
@@ -338,16 +348,27 @@ export class GitHubHookDriver extends DurableObject<Env> {
     const kv = this.ctx.storage.kv;
     kv.put("checkAt", Date.now() + CHECK_INTERVAL_MS);
     const account = kv.get<string>("account");
+    if (account === undefined) return;
+    // Undefined while this deployment has hooks turned off, when only deletions go on.
     const url = this.#webhookUrl();
-    if (account === undefined || url === undefined) return;
     // In case a reconnect's notice to this driver was lost.
-    await this.#readViewer(account).catch((error: unknown) => {
-      logger.warn("failed to read who a GitHub account is", { event: "hooks.viewer.read.failed", error });
-    });
+    if (url !== undefined && !kv.get("revoked")) {
+      await this.#readViewer(account).catch((error: unknown) => {
+        logger.warn("failed to read who a GitHub account is", { event: "hooks.viewer.read.failed", error });
+      });
+    }
     const checked: { webhook: Webhook; failed: GitHubWebhookDeliveryResponse[] }[] = [];
     for (const webhook of this.#webhooks()) {
       try {
-        checked.push({ webhook, failed: await this.#checkWebhook(account, url, webhook) });
+        if (this.#registrations(webhook.repo).length === 0) {
+          // No hook needs it any more: GitHub failed to delete it as the last was disabled, or as
+          // the account was disconnected.
+          await this.#webhookChanges.run(async () => {
+            if (this.#registrations(webhook.repo).length === 0) await this.#deleteWebhook(account, webhook);
+          });
+          continue;
+        }
+        if (url !== undefined) checked.push({ webhook, failed: await this.#checkWebhook(account, url, webhook) });
       } catch (error) {
         // Tried again at the next check.
         logger.warn("failed to check a GitHub webhook", { event: "hooks.webhook.check.failed", error });
@@ -428,6 +449,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
    */
   async #ensureWebhook(repo: PinnedRepo, registrations: Registration[]): Promise<void> {
     const kv = this.ctx.storage.kv;
+    if (kv.get("revoked")) throw new Error(DISCONNECTED);
     const account = kv.get<string>("account")!;
     const url = this.#webhookUrl();
     if (url === undefined) throw new Error(HOOKS_NOT_CONFIGURED);
@@ -463,26 +485,33 @@ export class GitHubHookDriver extends DurableObject<Env> {
     } catch (error) {
       throw webhookRefusal(repo, error);
     }
-    const { id } = made;
-    if (kv.get("revoked")) {
-      // Disconnected meanwhile, so revoke() could not see this webhook to delete it.
-      await this.#removeWebhook(account, { id, repo });
-      throw new Error(DISCONNECTED);
-    }
-    kv.put<Webhook>(webhookKey(repo.id), { id, repo });
+    kv.put<Webhook>(webhookKey(repo.id), { id: made.id, repo });
+    // Disconnected meanwhile: revoke(), which waits for this change, deletes what it recorded.
+    if (kv.get("revoked")) throw new Error(DISCONNECTED);
     if (made.repaired) kv.put(repairedKey(repo.id), Date.now());
   }
 
   /**
-   * Delete a webhook from GitHub, best effort. One left behind, as when the account has lost admin
-   * rights over the repository, is answered 404 here, and its admins can delete it.
+   * Delete a webhook from GitHub, and its record once GitHub has, or can't: one beyond the account's
+   * deleting, as when it has lost admin rights over the repository, is answered 404 here, and the
+   * repository's admins can delete it. The record stays while GitHub may yet delete it if asked
+   * again, which revoke() and the hourly check do.
    */
-  async #removeWebhook(account: string, { id, repo }: Webhook): Promise<void> {
+  async #deleteWebhook(account: string, { id, repo }: Webhook): Promise<void> {
     try {
       await this.#api(account, repo, api => api.deleteRepoWebhook(repo.id, id));
     } catch (error) {
-      logger.warn("failed to delete a GitHub webhook", { event: "hooks.webhook.delete.failed", error });
+      if (retryable(error)) {
+        logger.warn("failed to delete a GitHub webhook, which is tried again", { event: "hooks.webhook.delete.failed", error });
+        return;
+      }
+      // 404: deleted already. Otherwise, only the repository's admins can delete it now.
+      if (!(error instanceof GitHubApiError && error.status === 404)) {
+        logger.error("left a GitHub webhook the account can't delete", { event: "hooks.webhook.delete.abandoned", error });
+      }
     }
+    // Only if still this one: a webhook added since, for a later hook, is another's to delete.
+    if (this.ctx.storage.kv.get<Webhook>(webhookKey(repo.id))?.id === id) this.ctx.storage.kv.delete(webhookKey(repo.id));
   }
 
   /** Read the GitHub user the account now is, whose own comments and reviews its hooks skip. */
@@ -563,6 +592,16 @@ const sameEvents = (actual: readonly string[], expected: readonly string[]) =>
   actual.length === expected.length && expected.every(event => actual.includes(event));
 
 const delivered = ({ status_code }: GitHubWebhookDeliveryResponse) => status_code >= 200 && status_code < 300;
+
+/**
+ * Whether a request GitHub failed may succeed if made again: GitHub erred or limited it, or never
+ * answered, rather than refusing it, and the account's token still works.
+ */
+function retryable(error: unknown): boolean {
+  if (error instanceof GitHubApiError) return error.status >= 500 || error.rateLimited;
+  // A confirmed expiry, which withAccountApi() wraps.
+  return !isCredentialsExpired((error as { cause?: unknown } | undefined)?.cause);
+}
 
 /**
  * Whether `webhook` delivers here as the driver configures it: active, to this deployment, as JSON,

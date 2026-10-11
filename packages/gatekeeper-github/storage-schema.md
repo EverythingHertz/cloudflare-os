@@ -183,13 +183,15 @@ Cache invalidation strategy:
 
 One per connected account, named by its `UserAccount` id; see `src/github-hooks.ts`.
 
-- `account` -> the `UserAccount` id, whose token adds and deletes the webhooks.
+- `account` -> the `UserAccount` id, whose token adds and deletes the webhooks; kept, once the
+  account is disconnected, until the last of them is gone.
 - `viewer` -> the GitHub user id the account last read as, whose own comments and reviews no hook
   is handed: read when a hook is enabled, when the account reconnects, and at each hourly check.
 - `secret` -> the HMAC key every webhook of this driver signs its deliveries with.
 - `webhook:<repoId>` -> `{ id, repo: { owner, repo, id } }`, the webhook this driver added to the
-  repository, from when its first hook is enabled until its last is disabled. Reached by the
-  repository's id, which survives a rename.
+  repository, from when its first hook is enabled until GitHub has deleted it, once its last is
+  disabled or the account disconnected, or can't: the hourly check, and another disconnect, try
+  again meanwhile. Reached by the repository's id, which survives a rename.
 - `repaired:<repoId>` -> when that webhook's configuration was last restored, by the hourly check
   or by enabling or disabling a hook there: what GitHub failed to deliver before then is
   redelivered whatever the refusal, which may have been the misconfiguration's. Deleted with the
@@ -207,7 +209,8 @@ One per connected account, named by its `UserAccount` id; see `src/github-hooks.
 - `queue:due:<time>:<hookKey>:<eventId>`, `queue:finished:<time>:<hookKey>:<eventId>` and
   `queue:indexed` -> the queue's indexes of those rows: by when each pending one is next due, and
   when each finished one finished, which the dedupe window counts from.
-- `revoked` -> set, with every other key deleted, once the account is disconnected.
+- `revoked` -> set, with every key but `account` and `webhook:` deleted, once the account is
+  disconnected.
 
 ## Simulation model
 

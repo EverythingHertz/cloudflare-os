@@ -274,13 +274,20 @@ export class GitHubApiError extends Error {
   status: number;
   details?: unknown;
   isAuthError: boolean;
+  /**
+   * Whether GitHub refused the request for a rate limit, primary or secondary: with a 429, or a 403
+   * that its rate-limit headers mark as one, rather than for want of permission.
+   */
+  rateLimited: boolean;
 
-  constructor(status: number, message: string, details?: unknown) {
+  constructor(status: number, message: string, details?: unknown, headers?: Headers) {
     super(message);
     this.name = "GitHubApiError";
     this.status = status;
     this.details = details;
     this.isAuthError = status === 401;
+    this.rateLimited = status === 429 ||
+      (status === 403 && (headers?.get("x-ratelimit-remaining") === "0" || headers?.has("retry-after") === true));
   }
 }
 
@@ -445,7 +452,7 @@ async function request<T>(
         message = errorMessage;
       }
     }
-    throw new GitHubApiError(response.status, message, parsed);
+    throw new GitHubApiError(response.status, message, parsed, response.headers);
   }
 
   const parsed = await parseBody(response);

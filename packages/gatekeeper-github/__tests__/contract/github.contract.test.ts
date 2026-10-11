@@ -154,7 +154,7 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
     });
   });
 
-  it("redelivers with the webhook's URL, encoding and secret as they are now, not as they were", async () => {
+  it("redelivers with the webhook's URL, encoding and secret as they are now, not as they were", async ({ skip }) => {
     const secrets = { was: newSecret(), now: newSecret() };
     const urls = { json: { was: newUrl(), now: newUrl() }, form: { was: newUrl(), now: newUrl() } };
     // One webhook sending JSON, and one sending forms, as someone may have switched it to.
@@ -181,10 +181,12 @@ describe.skipIf(!token || !repoName)("GitHub, as the GitHub gatekeeper's hooks r
     // The same payload under the same secret would carry the same signature.
     const signature = header(jsonFirst, "X-Hub-Signature-256");
     expect(header(jsonAgain, "X-Hub-Signature-256")).not.toBe(signature);
-    // Where the log's payload re-serializes to the bytes GitHub signed, the new secret can be named.
-    if (signature === sign(secrets.was, JSON.stringify(jsonFirst.request.payload))) {
-      expect(header(jsonAgain, "X-Hub-Signature-256")).toBe(sign(secrets.now, JSON.stringify(jsonAgain.request.payload)));
-    }
+    // Which secret signed it shows only where the log's payload re-serializes to the bytes GitHub
+    // signed, as the first delivery's signature tells; where it doesn't, the check says so, rather
+    // than passing on the rest.
+    skip(signature !== sign(secrets.was, JSON.stringify(jsonFirst.request.payload)),
+      "GitHub's delivery log doesn't give back the bytes it signed, so which secret signed the redelivery went unchecked.");
+    expect(header(jsonAgain, "X-Hub-Signature-256")).toBe(sign(secrets.now, JSON.stringify(jsonAgain.request.payload)));
   });
 
   it("refuses a second webhook at a URL one delivers to, which the gatekeeper adopts rather than adds", async () => {
