@@ -398,6 +398,22 @@ describe("accounts going away", () => {
     expect(x.subscriptions.size).toBe(0);
   });
 
+  it("subscribes to revocations again after X answered with errors in place of the subscription", async () => {
+    const x = new FakeX().install();
+    let erroring = true;
+    x.on("POST", /^\/2\/activity\/subscriptions$/, request => {
+      if (!erroring || JSON.parse(request.body!).event_type !== "oauth.revoke") return undefined;
+      erroring = false;
+      return json({ errors: [{ title: "Internal Error", detail: "Something went wrong.", type: "about:blank" }] });
+    });
+    const account = await seedAccount(x);
+    const mentions = binding({ userObjectId: account, resourceKind: "account" });
+    await mentions.subscribe([["subscribeMentions"]]);
+    expect(failure(await mentions.tryEnable())).toMatch(/Something went wrong/);
+    await mentions.enable();
+    expect(subscriptionsOf(x).map(([type]) => type)).toEqual(["oauth.revoke", "post.mention.create"]);
+  });
+
   it("undoes the subscription of a hook enabled as the account is disconnected", async () => {
     const x = new FakeX().install();
     const account = await seedAccount(x);

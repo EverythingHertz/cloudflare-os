@@ -594,9 +594,10 @@ export class XWebhookRegistry extends DurableObject<Env> {
   async #subscribeToRevocations(webhookId: string): Promise<void> {
     if (this.ctx.storage.kv.get("revokeSubscribed")) return;
     try {
-      await appApi(this.env).post("/2/activity/subscriptions", {
+      // X can answer 200 with errors in place of the subscription, which would make none.
+      requireData(await appApi(this.env).post<SubscriptionResponse>("/2/activity/subscriptions", {
         event_type: "oauth.revoke", filter: {}, webhook_id: webhookId, tag: TAG,
-      });
+      }), "subscription");
     } catch (error) {
       if (!isDuplicate(error)) throw error;
     }
