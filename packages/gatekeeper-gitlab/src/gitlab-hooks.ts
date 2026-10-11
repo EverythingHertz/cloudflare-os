@@ -159,7 +159,7 @@ type Unrecorded = { project: GitLabProjectPin; url: string };
 const registrationKey = (key: string) => `reg:${key}`;
 const capabilitiesKey = (key: string) => `caps:${key}`;
 const webhookKey = (projectId: number) => `webhook:${projectId}`;
-const unrecordedKey = (projectId: number) => `unrecorded:${projectId}`;
+const unrecordedKey = (projectId: number, url: string) => `unrecorded:${projectId}:${url}`;
 const secretKey = (projectId: number) => `secret:${projectId}`;
 
 /**
@@ -169,8 +169,8 @@ const secretKey = (projectId: number) => `secret:${projectId}`;
  * with), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows and `queue:` indexes, and
  * `revoked` once the account is disconnected, which refuses everything for good. A webhook stays on
  * record until GitLab has deleted it, or can't, and `account` with it; `unrecorded:` notes, per
- * project, a webhook GitLab was asked to add or change while its id is yet to be recorded, so that
- * one added though GitLab's answer was lost is found and deleted.
+ * project and URL, a webhook GitLab was asked to add or change while its id is yet to be recorded,
+ * so that one added though GitLab's answer was lost is found and deleted.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
@@ -378,10 +378,12 @@ export class GitLabHookDriver extends DurableObject<Env> {
     // Undefined while this deployment has hooks turned off, when only deletions go on.
     const url = this.#webhookUrl();
     for (const unrecorded of this.#unrecorded()) {
-      // A hook's webhook, which only failed to be recorded, once the hook is enabled after all.
-      if (this.#registrations(unrecorded.project).length > 0) continue;
+      // Unless it is the webhook of the hooks there, at the URL they deliver to, which just went
+      // unrecorded: one at another, as before WEBHOOK_ORIGIN changed, is no hook's.
+      const needed = () => this.#registrations(unrecorded.project).length > 0 && (url === undefined || unrecorded.url === url);
+      if (needed()) continue;
       await this.#webhookChanges.run(async () => {
-        if (this.#registrations(unrecorded.project).length === 0) await this.#deleteUnrecorded(account, unrecorded);
+        if (!needed()) await this.#deleteUnrecorded(account, unrecorded);
       }).catch((error: unknown) => {
         logger.warn("failed to delete a GitLab webhook", { event: "hooks.webhook.delete.failed", error });
       });
@@ -505,7 +507,7 @@ export class GitLabHookDriver extends DurableObject<Env> {
     const config = { url, signingToken: secret, triggers: webhookTriggers(registrations) };
     const recorded = kv.get<Webhook>(webhookKey(project.id));
     // Until the webhook GitLab answers with is recorded, in case its answer is lost.
-    kv.put<Unrecorded>(unrecordedKey(project.id), { project, url });
+    kv.put<Unrecorded>(unrecordedKey(project.id, url), { project, url });
     let webhook;
     try {
       webhook = await this.#api(account, async api => {
@@ -531,7 +533,7 @@ export class GitLabHookDriver extends DurableObject<Env> {
       throw new Error(SIGNING_UNSUPPORTED);
     }
     kv.put<Webhook>(webhookKey(project.id), { id: webhook.id, project });
-    kv.delete(unrecordedKey(project.id));
+    kv.delete(unrecordedKey(project.id, url));
     // Disconnected meanwhile: revoke(), which waits for this change, deletes what it recorded.
     if (kv.get("revoked")) throw new Error(DISCONNECTED);
   }
@@ -555,7 +557,7 @@ export class GitLabHookDriver extends DurableObject<Env> {
         await api.deleteProjectWebhook(project.id, found.id);
       }
     });
-    if (settled) this.ctx.storage.kv.delete(unrecordedKey(project.id));
+    if (settled) this.ctx.storage.kv.delete(unrecordedKey(project.id, url));
   }
 
   /**
