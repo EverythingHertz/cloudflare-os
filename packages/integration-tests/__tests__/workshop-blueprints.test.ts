@@ -26,13 +26,13 @@ import {
 
 let harness: Harness | undefined;
 const models = scriptedModelRouter();
-// Workers AI /run responses for the classifier test's account, served in order.
-const CLASSIFIER_ACCOUNT = "classifier-account";
-const classifierResponses: Response[] = [];
-const classifierHandler: Handler = (url, method) =>
-  method === "POST" && url.pathname === `/client/v4/accounts/${CLASSIFIER_ACCOUNT}/ai/run`
-    ? classifierResponses.shift() ?? null : null;
-const network = new NetworkInterceptor({ handlers: [models.handler, classifierHandler] });
+// Workers AI /run responses for the decision model test's account, served in order.
+const DECISION_ACCOUNT = "decision-account";
+const decisionResponses: Response[] = [];
+const decisionHandler: Handler = (url, method) =>
+  method === "POST" && url.pathname === `/client/v4/accounts/${DECISION_ACCOUNT}/ai/run`
+    ? decisionResponses.shift() ?? null : null;
+const network = new NetworkInterceptor({ handlers: [models.handler, decisionHandler] });
 
 beforeAll(async () => {
   network.install();
@@ -110,10 +110,10 @@ async function ask(gadget: RpcStub<GadgetClient>, prompt: string): Promise<strin
   return await facet.ask(prompt);
 }
 
-const CLASSIFIER_SERVER =
+const DECISION_SERVER =
     `import { DurableObject } from "cloudflare:workers";\n` +
     `export class Gadget extends DurableObject {\n` +
-    `  async classify(request) { return await this.env.CLASSIFIER.classify(request); }\n` +
+    `  async decide(request) { return await this.env.DECISION_MODEL.decide(request); }\n` +
     `}\n`;
 
 const userPrompt = (content: string) =>
@@ -1061,13 +1061,13 @@ it.concurrent("a gadget's LLM binding runs on its bound model, and an install us
   await source.deleteSelf();
 });
 
-it.concurrent("a gadget's classifier binding answers its questions", async () => {
+it.concurrent("a gadget's decision model binding answers its questions", async () => {
   using publicApi = connect(requireHarness().url);
-  using api = await signUp(publicApi, username("classifier"));
+  using api = await signUp(publicApi, username("decision"));
   const profile = { type: "agent" as const, id: "my-clef", name: "Clef" };
   await api.addModel(profile, {
     provider: "cloudflare", model: "@cf/cloudflare/clef",
-    accountId: CLASSIFIER_ACCOUNT, apiToken: "test-token",
+    accountId: DECISION_ACCOUNT, apiToken: "test-token",
   });
   using ws = await api.newGadget();
   const workpieces = new WorkpieceRecorder();
@@ -1077,10 +1077,10 @@ it.concurrent("a gadget's classifier binding answers its questions", async () =>
   using app = ws.createGadget("Triage", undefined, "APP");
   const gadgetId = await app.getId();
   await commitText(ws, workpieces, gadgetId, await headOf(workpieces, gadgetId),
-      "server.js", undefined, CLASSIFIER_SERVER);
-  using classifier = await ws.newAiModelGatekeeper(profile.id);
-  await app.bind("CLASSIFIER", await classifier.getId());
-  using facet = await app.connectToGadget() as RpcStub<{ classify(request: unknown): unknown }>;
+      "server.js", undefined, DECISION_SERVER);
+  using decisionModel = await ws.newAiModelGatekeeper(profile.id);
+  await app.bind("DECISION_MODEL", await decisionModel.getId());
+  using facet = await app.connectToGadget() as RpcStub<{ decide(request: unknown): unknown }>;
   const request = {
     state: { message: "My order never arrived." },
     questions: {
@@ -1088,17 +1088,18 @@ it.concurrent("a gadget's classifier binding answers its questions", async () =>
     },
   };
 
-  classifierResponses.push(Response.json({
+  decisionResponses.push(Response.json({
     success: true, result: { model: "clef", answers: { refund: { type: "noul", noul: 0.9 } } },
   }));
-  expect(await facet.classify(request)).toEqual({ refund: { type: "bool", probability: 0.9 } });
-  classifierResponses.push(Response.json({
+  expect(await facet.decide(request)).toEqual({ refund: { type: "bool", probability: 0.9 } });
+  decisionResponses.push(Response.json({
     success: false, errors: [{ code: 5006, message: "Invalid input" }],
   }, { status: 400 }));
-  await expect(facet.classify(request)).rejects.toThrow("Invalid input");
+  await expect(facet.decide(request)).rejects.toThrow("Invalid input");
 
-  const blueprint = await app.createBlueprint("Triage", "Triages with a classifier");
+  const blueprint = await app.createBlueprint("Triage", "Triages with a decision model");
   const published = await waitFor("the published blueprint", () => publicApi.getBlueprint(blueprint.id));
-  expect(published.metadata.bindings.CLASSIFIER).toMatchObject({ type: "aiModel", classifier: true });
+  expect(published.metadata.bindings.DECISION_MODEL)
+      .toMatchObject({ type: "aiModel", modelKind: "decision" });
   await ws.deleteSelf();
 });

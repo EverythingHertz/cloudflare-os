@@ -521,19 +521,13 @@ export interface AuthenticatedApi extends RpcTarget {
       subscriber: RpcStub<NotificationSubscriber>): Promise<RpcStub<{}>>;
 
   /**
-   * List the user's configured AI models that can chat. Classifier models can't, and are listed
-   * by `listClassifierModels()` instead.
+   * List the user's configured AI models of one kind, by default the language models, which can
+   * chat.
    *
    * Note that the list returned here could be different from a particular gadget's Overseer,
    * especially if the gadget is owned by someone else.
    */
-  listModels(): Promise<AiChatAuthorInfo[]>;
-
-  /**
-   * List the user's configured classifier models (see `isClassifierModel()`). Gadgets bind them
-   * through `Overseer.newAiModelGatekeeper()`; they can't chat.
-   */
-  listClassifierModels(): Promise<AiChatAuthorInfo[]>;
+  listModels(kind?: ModelKind): Promise<AiChatAuthorInfo[]>;
 
   /**
    * Adds a new model to the user's configured set. The ID must not name a model the user already
@@ -1847,6 +1841,13 @@ export type RedactedAiModelConfig = Omit<AiModelConfig,
  */
 export const WORKERS_AI_OUTPUT_LIMIT = 32768;
 
+/**
+ * What a model does, which decides where it can be used. A `"language"` model writes text: it can
+ * chat and back a `LanguageModelBinding`. A `"decision"` model answers typed questions with
+ * probabilities: gadgets can bind it as a `DecisionModelBinding`, but it can't chat.
+ */
+export type ModelKind = "language" | "decision";
+
 /** One entry of SUGGESTED_MODELS. */
 type SuggestedModel = {
   name: string;
@@ -1872,12 +1873,8 @@ type SuggestedModel = {
    */
   hidden?: true;
 
-  /**
-   * Marks a classifier (decision) model, which answers `ClassifierModelBinding.classify()`
-   * questions instead of chatting. Gadgets can bind it, but it is never offered for chats or
-   * agents.
-   */
-  classifier?: true;
+  /** The model's kind; absent means `"language"`. */
+  kind?: ModelKind;
 };
 
 // The literal is kept apart from the export so SuggestedModelId can derive the model ids from it.
@@ -1898,9 +1895,9 @@ const SUGGESTED_MODEL_CATALOG = {
       name: "DeepSeek V4 Pro 0813 (Workers AI)", contextWindow: 1048576,
       outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
-    "@cf/cloudflare/clef": {name: "Clef (Workers AI)", contextWindow: 65536, classifier: true},
+    "@cf/cloudflare/clef": {name: "Clef (Workers AI)", contextWindow: 65536, kind: "decision"},
     "@cf/cloudflare/clef-flash": {
-      name: "Clef Flash (Workers AI)", contextWindow: 65536, classifier: true,
+      name: "Clef Flash (Workers AI)", contextWindow: 65536, kind: "decision",
     },
   },
   "anthropic": {
@@ -1965,12 +1962,9 @@ export const SUGGESTED_MODELS: Record<AiModelProvider, Record<string, SuggestedM
 export type SuggestedModelId<P extends AiModelProvider = AiModelProvider> =
   { [K in P]: keyof (typeof SUGGESTED_MODEL_CATALOG)[K] & string }[P];
 
-/**
- * Whether a model, named by its provider and its ID on the provider's API, is a classifier (see
- * `SuggestedModel.classifier`), which only a `ClassifierModelBinding` can run.
- */
-export function isClassifierModel(provider: string, model: string): boolean {
-  return SUGGESTED_MODELS[provider as AiModelProvider]?.[model]?.classifier === true;
+/** The kind of a model, named by its provider and its ID on the provider's API. */
+export function modelKind(provider: string, model: string): ModelKind {
+  return SUGGESTED_MODELS[provider as AiModelProvider]?.[model]?.kind ?? "language";
 }
 
 /**
@@ -2626,9 +2620,8 @@ export interface Overseer extends RpcTarget {
 
   /**
    * Create a new gatekeeper for an AI model binding. The model can be any returned by
-   * `AuthenticatedApi.listModels()`, whose gatekeepers provide a `LanguageModelBinding`, or by
-   * `AuthenticatedApi.listClassifierModels()`, whose gatekeepers provide a
-   * `ClassifierModelBinding`.
+   * `AuthenticatedApi.listModels()`. A language model's gatekeeper provides a
+   * `LanguageModelBinding`, a decision model's a `DecisionModelBinding`.
    */
   newAiModelGatekeeper(modelId: string): Promise<GatekeeperClient<any>>;
 
@@ -2752,8 +2745,8 @@ export interface Overseer extends RpcTarget {
   listChats(): Promise<AiChatMetadata[]>;
 
   /**
-   * List available chat models; classifier models are left out. The first listed model should be
-   * the default, unless the user has chosen something else.
+   * List available language models; decision models are left out. The first listed model should
+   * be the default, unless the user has chosen something else.
    */
   listModels(): Promise<AiChatAuthorInfo[]>;
 
@@ -5049,8 +5042,8 @@ export type BlueprintBinding = {
    */
   suggestedModel?: {provider: string, modelName: string};
 
-  /** Set when the source binding is a classifier model, so installers pick among classifiers. */
-  classifier?: true;
+  /** The source binding's model kind, so installers pick one of that kind; absent: `"language"`. */
+  modelKind?: ModelKind;
 } | {
   /** An agent spawner binding. */
   type: "agentSpawner";

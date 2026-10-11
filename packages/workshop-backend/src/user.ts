@@ -1,5 +1,5 @@
 import { RpcStub } from "capnweb";
-import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, isClassifierModel, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, UserNotification, type DeviceSessionHandoffStart } from '@gadgets/workshop-shared/api';
+import { GadgetMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, RedactedAiModelConfig, ModelKind, modelKind, CollaboratorRole, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, GadgetMetadata, BlueprintMetadata, BlueprintLibrarySummary, BlueprintSource, BlueprintUserSummary, BLUEPRINT_SCREENSHOT_R2_PREFIX, GatekeeperVendorInfo, OutputSummary, ListOutputsResult, AUTH_ERROR_CODES, createAuthError, ConnectFlowStart, validateCommitEmail, NotificationSubscriber, UserNotification, type DeviceSessionHandoffStart } from '@gadgets/workshop-shared/api';
 import { ActionDescription, Gatekeeper, GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor, AccountDescription, VendorDescription, GatekeeperConnectCallback, ConnectHandoff, SupportedResource, ResourceConfiguratorFrame, AppUiContext, GatekeeperUiFrame } from "@gadgets/workshop-shared/gatekeeper";
 import { shouldAutoProvisionAccount, ambientGatekeeperMode } from "./provisioning-policy.js";
 import { CloudflareGatekeeperUser } from "@gadgets/workshop-shared/cloudflare-gatekeeper";
@@ -11,7 +11,7 @@ import {
 } from "./storage-schema/user-storage.js";
 import { recordAnalytics } from "./analytics";
 import { createWorkshopLogger } from "./observability";
-import { getGatewayModels, type GatewayModels, type ModelKind } from "./ai-gateway.js";
+import { getGatewayModels, type GatewayModels } from "./ai-gateway.js";
 import { utcDayKey, nextUtcMidnightIso, DailyQuotaResult } from "./ai-gateway-billing/limits/config.js";
 import type { AdminSettings } from "./admin-settings.js";
 import { deleteBlueprintContent } from "./blueprint-archive.js";
@@ -617,7 +617,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.profile.put(profile);
   }
 
-  async listModels(kind: ModelKind = "chat"): Promise<AiChatAuthorInfo[]> {
+  async listModels(kind: ModelKind = "language"): Promise<AiChatAuthorInfo[]> {
     return this.#listModels(await getGatewayModels(this.env), kind);
   }
 
@@ -634,7 +634,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     if (models && !models.userModels) return result;
     for (let model of this.storage.aiModels.list()) {
       if (!models?.get(model.profile.id) &&
-          isClassifierModel(model.config.provider, model.config.model) === (kind === "classifier")) {
+          modelKind(model.config.provider, model.config.model) === kind) {
         result.push(model.profile);
       }
     }
@@ -870,7 +870,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     let models = await getGatewayModels(this.env);
     let selectedModelId = existingChatModelId;
     if (selectedModelId === null || !this.#resolveModel(selectedModelId, models)) {
-      let offered = this.#listModels(models, "chat");
+      let offered = this.#listModels(models, "language");
       let preferredModel = this.storage.preferredModel.get();
       selectedModelId = (offered.find(model => model.id === preferredModel) ?? offered[0])?.id ?? null;
     }

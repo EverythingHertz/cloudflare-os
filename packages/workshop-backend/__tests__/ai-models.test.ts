@@ -9,7 +9,7 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { serializeAdminConfig } from "../src/admin-config.js";
 import { DEFAULT_ADMIN_CONFIG, type AdminConfig } from "../src/storage-schema/admin-settings-storage.js";
 import {
-  ClassifierModelGatekeeper, gatewayBuiltInReasoning, gatewayReasoningLevels, getClassifier,
+  DecisionModelGatekeeper, gatewayBuiltInReasoning, gatewayReasoningLevels, getDecisionModel,
   getModel, isRuntimeModel, LanguageModelGatekeeper, type ModelHandle,
 } from "../src/ai-models.js";
 
@@ -1513,12 +1513,12 @@ describe("LanguageModelGatekeeper.startSession", () => {
   });
 });
 
-// A classifier binding is revoked as a language model binding is (see refuseRevokedModel()).
-describe("ClassifierModelGatekeeper.startSession", () => {
-  it("refuses a classifier the admin disabled", async () => {
+// A decision model binding is revoked as a language model binding is (see refuseRevokedModel()).
+describe("DecisionModelGatekeeper.startSession", () => {
+  it("refuses a decision model the admin disabled", async () => {
     const admin = { ...DEFAULT_ADMIN_CONFIG, modelModes: { "@cf/cloudflare/clef": "disabled" } };
     const gatekeeper =
-        Object.create(ClassifierModelGatekeeper.prototype) as ClassifierModelGatekeeper;
+        Object.create(DecisionModelGatekeeper.prototype) as DecisionModelGatekeeper;
     Object.assign(gatekeeper, {
       env: env({
         CF_AI_GATEWAY_PROVIDERS: "cloudflare",
@@ -1732,7 +1732,7 @@ function bindingRunEnv(run: (...args: unknown[]) => Promise<unknown>): Cloudflar
   });
 }
 
-describe("getClassifier routing", () => {
+describe("getDecisionModel routing", () => {
   const CLEF_CONFIG: AiModelConfig = {
     provider: "cloudflare",
     model: "@cf/cloudflare/clef",
@@ -1766,7 +1766,7 @@ describe("getClassifier routing", () => {
     user: "owner-456", source: "model-binding", gadgetId: "gadget-789", automated: true,
   };
 
-  // pi's classifier takes no fetch from getClassifier on HTTP routes, so it uses the global one.
+  // pi's classify() takes no fetch from getDecisionModel on HTTP routes, so it uses the global one.
   beforeEach(() => {
     capturedRequests.length = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1777,16 +1777,16 @@ describe("getClassifier routing", () => {
   });
   afterEach(() => vi.unstubAllGlobals());
 
-  // Every flagged catalog entry must be one pi can run.
-  const classifierIds = Object.entries(SUGGESTED_MODELS.cloudflare)
-      .filter(([, model]) => model.classifier).map(([id]) => id);
+  // Every decision model in the catalog must be one pi can run.
+  const decisionModelIds = Object.entries(SUGGESTED_MODELS.cloudflare)
+      .filter(([, model]) => model.kind === "decision").map(([id]) => id);
 
-  it.each(classifierIds)("classifies with %s directly, with the config's own credentials",
+  it.each(decisionModelIds)("decides with %s directly, with the config's own credentials",
       async (model) => {
-    const classify = getClassifier(env({ CF_AI_GATEWAY: undefined }), { ...CLEF_CONFIG, model },
+    const decide = getDecisionModel(env({ CF_AI_GATEWAY: undefined }), { ...CLEF_CONFIG, model },
         INITIATOR);
 
-    expect((await classify(CONTEXT)).answers).toEqual(ANSWERS);
+    expect((await decide(CONTEXT)).answers).toEqual(ANSWERS);
     expect(capturedRequests).toHaveLength(1);
     const [request] = capturedRequests;
     expect(request.url).toBe("https://api.cloudflare.com/client/v4/accounts/user-account-id/ai/run");
@@ -1795,10 +1795,10 @@ describe("getClassifier routing", () => {
     expect(JSON.parse(request.body)).toEqual({ model, input: WIRE_INPUT });
   });
 
-  it("classifies through the platform gateway over HTTPS with the gateway token", async () => {
-    const classify = getClassifier(env(), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
+  it("decides through the platform gateway over HTTPS with the gateway token", async () => {
+    const decide = getDecisionModel(env(), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
 
-    expect((await classify(CONTEXT)).answers).toEqual(ANSWERS);
+    expect((await decide(CONTEXT)).answers).toEqual(ANSWERS);
     const [request] = capturedRequests;
     expect(request.url).toBe(
         "https://gateway.ai.cloudflare.com/v1/gateway-account-id/platform-gateway/workers-ai/run");
@@ -1809,14 +1809,14 @@ describe("getClassifier routing", () => {
   });
 
   describe("over the Workers AI binding", () => {
-    it("classifies through the platform gateway with the binding's run()", async () => {
+    it("decides through the platform gateway with the binding's run()", async () => {
       const runs: unknown[][] = [];
-      const classify = getClassifier(bindingRunEnv(async (...args) => {
+      const decide = getDecisionModel(bindingRunEnv(async (...args) => {
         runs.push(args);
         return CLEF_RESULT;
       }), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
 
-      expect((await classify(CONTEXT)).answers).toEqual(ANSWERS);
+      expect((await decide(CONTEXT)).answers).toEqual(ANSWERS);
       expect(runs).toEqual([[
         "@cf/cloudflare/clef", WIRE_INPUT,
         { gateway: { id: "platform-gateway", metadata: GATEWAY_METADATA } },
@@ -1825,11 +1825,11 @@ describe("getClassifier routing", () => {
     });
 
     it("reports a failed run() as an error result", async () => {
-      const classify = getClassifier(bindingRunEnv(async () => {
+      const decide = getDecisionModel(bindingRunEnv(async () => {
         throw new Error("3040: Capacity temporarily exceeded");
       }), CLEF_CONFIG, GADGET_INITIATOR, METADATA_CONTEXT);
 
-      expect(await classify(CONTEXT)).toMatchObject({
+      expect(await decide(CONTEXT)).toMatchObject({
         stopReason: "error",
         errorMessage: expect.stringContaining("Capacity temporarily exceeded"),
       });

@@ -1,6 +1,6 @@
 import {
   AdminGatewayProvider, AdminModel, AiChatAuthorInfo, AiModelConfig, AiModelProvider, GatewayModel,
-  GatewayModelMode, HTTPS_ONLY_PROVIDERS, ReasoningLevel, SUGGESTED_MODELS, isClassifierModel,
+  GatewayModelMode, HTTPS_ONLY_PROVIDERS, ModelKind, ReasoningLevel, SUGGESTED_MODELS, modelKind,
 } from "@gadgets/workshop-shared/api";
 import { readAdminConfig } from "./admin-config.js";
 import type { AdminConfig } from "./storage-schema/admin-settings-storage.js";
@@ -164,9 +164,6 @@ export function getAiGatewayConfig(env: Cloudflare.Env): AiGatewayConfig | null 
   return new AiGatewayConfig(env);
 }
 
-/** Which models a list offers: those that chat, or the classifiers (see isClassifierModel()). */
-export type ModelKind = "chat" | "classifier";
-
 /**
  * The models a deployment provides through AI Gateway (`gateway`), each in the mode its admin
  * gave it (see GatewayModelMode): the suggested models of every provider the deployment enables
@@ -256,8 +253,8 @@ export class GatewayModels {
    * entries.
    */
   list(kind: ModelKind): AiChatAuthorInfo[] {
-    return this.all.filter(model => model.mode === "enabled" &&
-            isClassifierModel(model.provider, model.id) === (kind === "classifier"))
+    return this.all.filter(model =>
+            model.mode === "enabled" && modelKind(model.provider, model.id) === kind)
         .map(({ id, name }) => ({ type: "agent", id, name }));
   }
 

@@ -443,16 +443,16 @@ describe("UserDurableObject gateway model modes", () => {
     }, DISABLED));
   });
 
-  // Chats, spawners and the external-message default all take listModels(), which no classifier
-  // can serve.
-  it("lists classifier models apart from chat models", () => inGatewayUser(async user => {
+  // Chats, spawners and the external-message default all take the language models, which no
+  // decision model can serve.
+  it("lists decision models apart from language models", () => inGatewayUser(async user => {
     await user.addModel({ ...PROFILE, id: "my-clef" },
         { provider: "cloudflare", model: "@cf/cloudflare/clef", apiToken: "" });
 
-    const classifierIds = ["@cf/cloudflare/clef", "@cf/cloudflare/clef-flash", "my-clef"];
-    expect((await user.listModels("classifier")).map(model => model.id)).toEqual(classifierIds);
-    const chatIds = await listedIds(user);
-    expect(chatIds).toContain("@cf/zai-org/glm-5.2");
-    expect(chatIds.filter(id => classifierIds.includes(id))).toEqual([]);
+    const decisionIds = ["@cf/cloudflare/clef", "@cf/cloudflare/clef-flash", "my-clef"];
+    expect((await user.listModels("decision")).map(model => model.id)).toEqual(decisionIds);
+    const languageIds = await listedIds(user);
+    expect(languageIds).toContain("@cf/zai-org/glm-5.2");
+    expect(languageIds.filter(id => decisionIds.includes(id))).toEqual([]);
   }, { addedProviders: ["cloudflare"] }));
 });

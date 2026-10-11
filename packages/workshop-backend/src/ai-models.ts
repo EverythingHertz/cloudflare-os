@@ -25,8 +25,8 @@ import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
 import { ApprovalQueue, Gatekeeper, ResourceDescription, stripTrailingSlashes } from '@gadgets/workshop-shared/gatekeeper';
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
-import { ClassifierAnswer, ClassifierModelBinding, ClassifierRequest } from "./classifier-model-binding";
-import CLASSIFIER_MODEL_BINDING_TYPES from "./classifier-model-binding.txt";
+import { DecisionAnswer, DecisionModelBinding, DecisionRequest } from "./decision-model-binding";
+import DECISION_MODEL_BINDING_TYPES from "./decision-model-binding.txt";
 import {
   AiChatAuthorInfo, AiModelConfig, AiModelProvider, BuiltInReasoning, GatewayModelCapabilities,
   REASONING_LEVELS, ReasoningLevel, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT,
@@ -877,25 +877,25 @@ function workersAiAccountUrl(config: AiModelConfig): string {
   return `https://api.cloudflare.com/client/v4/accounts/${config.accountId}/ai`;
 }
 
-/** Classifies with one resolved classifier model; see getClassifier(). */
-type Classifier = (context: ClassifierContext) => Promise<ClassifierResult>;
+/** Runs one resolved decision model; see getDecisionModel(). */
+type DecisionModel = (context: ClassifierContext) => Promise<ClassifierResult>;
 
 /**
- * Resolve a classifier model config (see isClassifierModel()) to a Classifier. It routes through
- * the platform's AI Gateway when one is configured, as getModel() routes chat models, and
+ * Resolve a decision model config (see modelKind()) to a DecisionModel. It routes through the
+ * platform's AI Gateway when one is configured, as getModel() routes language models, and
  * otherwise goes directly to Workers AI with the config's own Cloudflare credentials.
  */
-export function getClassifier(env: Cloudflare.Env, config: AiModelConfig,
-                              initiator: AiChatAuthorInfo,
-                              metadataContext?: GatewayMetadataContext): Classifier {
+export function getDecisionModel(env: Cloudflare.Env, config: AiModelConfig,
+                                 initiator: AiChatAuthorInfo,
+                                 metadataContext?: GatewayMetadataContext): DecisionModel {
   // pi's catalog entry supplies the API, cost and window; only the address varies by route.
   const catalog = (CLOUDFLARE_WORKERS_AI_CLASSIFIER_MODELS as
       Record<string, ClassifierModel<ClassifierApi>>)[config.model];
-  const classifierAt = (baseUrl: string, options: ClassifierOptions): Classifier =>
+  const modelAt = (baseUrl: string, options: ClassifierOptions): DecisionModel =>
       context => workersAiClassify({ ...catalog, baseUrl }, context, options);
   const gwConfig = getAiGatewayConfig(env);
   if (!gwConfig) {
-    return classifierAt(workersAiAccountUrl(config),
+    return modelAt(workersAiAccountUrl(config),
         { apiKey: config.apiToken, headers: config.extraHeaders });
   }
   const metadata = buildMetadata(initiator, metadataContext);
@@ -905,7 +905,7 @@ export function getClassifier(env: Cloudflare.Env, config: AiModelConfig,
     // requests take the binding's own run(), which reaches the same gateway. pi's System One
     // transport POSTs {model, input} as Workers AI's REST API takes them and reads back the REST
     // envelope; run() takes and returns the bare values. pi requires a key, which goes unsent.
-    return classifierAt(catalog.baseUrl, {
+    return modelAt(catalog.baseUrl, {
       apiKey: CLOUDFLARE_GATEWAY_BINDING_AUTH_SENTINEL,
       fetch: async (_url, init) => {
         const { model, input } = JSON.parse(init!.body as string);
@@ -917,8 +917,8 @@ export function getClassifier(env: Cloudflare.Env, config: AiModelConfig,
   // Unlike the chat route, /run wants a Workers AI credential as `Authorization`, and a request
   // sending this token there is refused even when the token grants Workers AI. Until AI Gateway
   // authenticates /run as it does chat, this route fails, so the docs have such deployments
-  // disable classifiers.
-  return classifierAt(
+  // disable decision models.
+  return modelAt(
       `https://gateway.ai.cloudflare.com/v1/${gwConfig.accountId}/${gwConfig.gateway}/workers-ai`, {
         apiKey: gwConfig.apiToken,
         headers: {
@@ -1032,22 +1032,22 @@ class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding
   }
 }
 
-export class ClassifierModelGatekeeper
+export class DecisionModelGatekeeper
     extends DurableObject<Cloudflare.Env, AiModelGatekeeperProps>
-    implements Gatekeeper<ClassifierModelBinding> {
+    implements Gatekeeper<DecisionModelBinding> {
   async describe(): Promise<ResourceDescription> {
     let modelConfig = this.ctx.props.config;
     return {
       url: `http://models.local/${modelConfig.provider}/${modelConfig.model}`,
       title: this.ctx.props.displayName,
-      snippet: "An AI classifier model.",
-      suggestedBindingName: "CLASSIFIER",
-      tsType: "ClassifierModelBinding",
+      snippet: "An AI decision model.",
+      suggestedBindingName: "DECISION_MODEL",
+      tsType: "DecisionModelBinding",
     };
   }
 
   async getTypeScriptTypes(): Promise<string> {
-    return CLASSIFIER_MODEL_BINDING_TYPES;
+    return DECISION_MODEL_BINDING_TYPES;
   }
 
   async getAutoApprovableActions() {
@@ -1055,10 +1055,10 @@ export class ClassifierModelGatekeeper
   }
 
   async startSession(approvalQueue: RpcStub<ApprovalQueue>)
-      : Promise<ClassifierModelBinding> {
+      : Promise<DecisionModelBinding> {
     let { config, initiator, metadata } = this.ctx.props;
     await refuseRevokedModel(this.env, this.ctx.props);
-    return new ClassifierModelBindingImpl(getClassifier(this.env, config, initiator, metadata));
+    return new DecisionModelBindingImpl(getDecisionModel(this.env, config, initiator, metadata));
   }
 
   applyAction(action: number): Promise<void> {
@@ -1073,7 +1073,8 @@ export class ClassifierModelGatekeeper
   }
 
   async addObserver(_id: string, _user: Fetcher): Promise<void> {
-    // Like an LLM, a classifier is not a restricted-access resource (see LanguageModelGatekeeper).
+    // Like an LLM, a decision model is not a restricted-access resource (see
+    // LanguageModelGatekeeper).
   }
 
   async removeObserver(_id: string): Promise<void> {
@@ -1082,13 +1083,13 @@ export class ClassifierModelGatekeeper
 }
 
 @validateRpc()
-class ClassifierModelBindingImpl extends RpcTarget implements ClassifierModelBinding {
-  constructor(private classifier: Classifier) {
+class DecisionModelBindingImpl extends RpcTarget implements DecisionModelBinding {
+  constructor(private model: DecisionModel) {
     super();
   }
 
-  async classify(request: ClassifierRequest): Promise<Record<string, ClassifierAnswer>> {
-    let result = await this.classifier(request);
+  async decide(request: DecisionRequest): Promise<Record<string, DecisionAnswer>> {
+    let result = await this.model(request);
     // pi reports a failure in the result; gadget code expects a rejection, as completeText()
     // gives the LLM binding.
     if (result.stopReason !== "stop") throw new Error(result.errorMessage);
