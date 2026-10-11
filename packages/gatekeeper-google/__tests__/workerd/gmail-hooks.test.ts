@@ -268,6 +268,40 @@ const disconnect = (connection: {props: {userObjectId: string}}) =>
   (testEnv.UserAccount.get(testEnv.UserAccount.idFromString(connection.props.userObjectId)) as unknown as
     {revoke(): Promise<void>}).revoke();
 
+/** Disconnect a connection's Google account while the driver can't be reached (see the test worker's). */
+async function disconnectUnreached(connection: {props: {userObjectId: string}}): Promise<void> {
+  await runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) => state.storage.kv.put("test:unreachable", true));
+  try {
+    await disconnect(connection);
+  } finally {
+    await runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) => state.storage.kv.delete("test:unreachable"));
+  }
+}
+
+/** The Google account a connection reads the mailbox as. */
+const accountOf = (connection: {props: {userObjectId: string}}) =>
+  testEnv.UserAccount.get(testEnv.UserAccount.idFromString(connection.props.userObjectId));
+
+/**
+ * Hold the account's trackHookDriver(), as the test worker's UserAccount does while told to, so a
+ * test can act while an enable waits on the account.
+ */
+async function holdTracking(connection: {props: {userObjectId: string}}) {
+  const account = accountOf(connection);
+  await runInDurableObject(account, (_instance: unknown, state: DurableObjectState) => {
+    state.storage.kv.put("test:holdTracking", true);
+  });
+  return {
+    /** Resolves once an enable is waiting on the account. */
+    waiting: () => vi.waitFor(() => runInDurableObject(account, (_instance: unknown, state: DurableObjectState) => {
+      if (!state.storage.kv.get("test:trackingHeld")) throw new Error("No enable is waiting on the account yet.");
+    }), {timeout: 5_000}),
+    release: () => runInDurableObject(account, (_instance: unknown, state: DurableObjectState) => {
+      state.storage.kv.delete("test:holdTracking");
+    }),
+  };
+}
+
 /** The hooks the mailbox's driver holds, and those with a delivery still to (re)try. */
 const driverHooks = () => runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) => ({
   registered: [...state.storage.kv.list({prefix: "reg:"})].length,
@@ -483,6 +517,84 @@ it("drops on disconnect a hook registered before accounts kept track, once its d
 
   await disconnect(ada);
   expect(await driverHooks()).toEqual({registered: 0, pending: 0});
+});
+
+it("drops at its daily check the hooks of an account whose disconnect couldn't reach it, while another account's go on", async () => {
+  const gmail = mockGmail();
+  const ada = await connect();
+  const bob = await connect();
+  await enable(ada);
+  await enable(bob);
+  await disconnectUnreached(ada);
+  expect(await driverHooks()).toEqual({registered: 2, pending: 0});
+
+  const message = arrive(gmail);
+  await later(24 * HOUR);
+  expect(await receivedIds(bob)).toEqual([message]);
+  expect(await receivedIds(ada)).toEqual([]);
+  expect(await driverHooks()).toEqual({registered: 1, pending: 0});
+});
+
+it("offers a hook what a history read took in while its enable waited on the account", async () => {
+  const gmail = mockGmail();
+  const ada = await connect();
+  await enable(ada);
+  const bob = await connect();
+  const tracking = await holdTracking(bob);
+  const enabling = bob.hooks.chatEnableHook();
+  await tracking.waiting();
+  // Read while Bob's enable waits, so for Ada's hook alone.
+  const message = arrive(gmail);
+  expect(await push(gmail)).toBe(204);
+  await settled();
+  expect(await receivedIds(ada)).toEqual([message]);
+
+  await tracking.release();
+  await enabling;
+  await settled();
+  expect(await receivedIds(bob)).toEqual([message]);
+  expect(await receivedIds(ada)).toEqual([message]);
+});
+
+it("refuses an enable that its account is disconnected during, registering nothing", async () => {
+  mockGmail();
+  const ada = await connect();
+  const tracking = await holdTracking(ada);
+  // Expected at once, as the enable is refused while the test is still acting.
+  const refused = expect(Promise.resolve(ada.hooks.chatEnableHook())).rejects.toThrow("This Google account has been disconnected.");
+  await tracking.waiting();
+  await disconnect(ada);
+  await refused;
+  expect(await driverHooks()).toEqual({registered: 0, pending: 0});
+  expect(await runInDurableObject(accountOf(ada), (_instance: unknown, state: DurableObjectState) =>
+    [...state.storage.kv.list({prefix: "hookDriver:"})].length)).toBe(0);
+});
+
+it("refuses an enable whose account's hooks were dropped while it waited on the account", async () => {
+  mockGmail();
+  const ada = await connect();
+  const tracking = await holdTracking(ada);
+  // Expected at once, as the enable is refused while the test is still acting.
+  const refused = expect(Promise.resolve(ada.hooks.chatEnableHook())).rejects.toThrow("This Google account has been disconnected.");
+  await tracking.waiting();
+  // As when the account is disconnected just after noting this driver, before the enable goes on.
+  await (driver() as unknown as {forgetAccount(userObjectId: string): Promise<void>}).forgetAccount(ada.props.userObjectId);
+  await tracking.release();
+  await refused;
+  expect(await driverHooks()).toEqual({registered: 0, pending: 0});
+});
+
+it("drops a hook registered before accounts kept track once its driver finds the account disconnected", async () => {
+  const gmail = mockGmail();
+  const ada = await connect();
+  await enable(ada);
+  // As a hook registered, and its account then disconnected, before this release.
+  await runInDurableObject(accountOf(ada), (_instance: unknown, state: DurableObjectState) => state.storage.deleteAll());
+  await runInDurableObject(driver(), (_instance: unknown, state: DurableObjectState) =>
+    state.storage.kv.delete(`tracked:${ada.props.userObjectId}`));
+  arrive(gmail);
+  expect(await push(gmail)).toBe(204);
+  await vi.waitFor(async () => expect(await driverHooks()).toEqual({registered: 0, pending: 0}), {timeout: 5_000});
 });
 
 it.each([["succeeds", 0], ["fails", 1]])(

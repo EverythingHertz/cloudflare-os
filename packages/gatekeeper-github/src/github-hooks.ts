@@ -26,7 +26,8 @@ import type {
   ApprovalQueue, HookController, HookInitiator, HookTargetMetadata,
 } from "@gadgets/workshop-shared/gatekeeper";
 import {
-  GitHubApiError, withAccountApi, type GitHubApi, type GitHubWebhookDeliveryResponse, type PinnedRepo,
+  GitHubApiError, withAccountApi,
+  type GitHubApi, type GitHubRepoWebhookResponse, type GitHubWebhookDeliveryResponse, type PinnedRepo,
 } from "./github-api";
 import { getBasePath, webhookOrigin, type Env } from "./github-env";
 import { parseWebhookEvent, type GitHubWebhookEvent, type WebhookPayload } from "./github-webhook-events";
@@ -61,8 +62,6 @@ export type GitHubHookProps = GitHubHookParams & {
   userObjectId: string;
   repo: PinnedRepo;
   events: GitHubEventKind[];
-  /** The connected account's GitHub user id: its own comments and reviews are not delivered. */
-  viewerId: number;
   delivery: RpcStub<GitHubHookDelivery>;
 };
 
@@ -136,11 +135,13 @@ const webhookKey = (repoId: number) => `webhook:${repoId}`;
 const repairedKey = (repoId: number) => `repaired:${repoId}`;
 
 /**
- * One per connected account, named by its `UserAccount` id. Storage: `account` (that id), `secret`
- * (the HMAC key its webhooks sign deliveries with), per repository `webhook:` and `repaired:` (when
- * the check last restored its configuration), `checkAt` (when to next check them on GitHub),
- * `reg:`/`caps:` per hook, the delivery queue's `msg:` rows, and `revoked` once the account is
- * disconnected, which refuses everything for good.
+ * One per connected account, named by its `UserAccount` id. Storage: `account` (that id), `viewer`
+ * (the GitHub user id the account last read as), `secret` (the HMAC key its webhooks sign
+ * deliveries with), per repository `webhook:` and `repaired:` (when its configuration was last
+ * restored), `checkAt` (when to next check them on GitHub), `redeliverFrom` (the repository the
+ * next check's redeliveries start with), `reg:`/`caps:` per hook, the delivery queue's `msg:` rows
+ * and `queue:` indexes, and `revoked` once the account is disconnected, which refuses everything
+ * for good.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
@@ -151,6 +152,12 @@ export class GitHubHookDriver extends DurableObject<Env> {
    * a removal still in flight would otherwise delete the webhook an addition just adopted.
    */
   #webhookChanges = new SerialTaskQueue();
+  /**
+   * Reads of who the account is, which run one at a time so that a reconnect's, made as the new
+   * user, is written last: a read still waiting on GitHub as the old one would otherwise land after
+   * it.
+   */
+  #viewerReads = new SerialTaskQueue();
   #queue = new HookDeliveryQueue<GitHubWebhookEvent>(this.ctx.storage.kv, () => {
     logger.warn("dropped a GitHub event after repeated delivery failures", { event: "hooks.delivery.dropped" });
   });
@@ -164,6 +171,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
     await this.#webhookChanges.run(async () => {
       // Disconnected while an earlier change ran.
       if (kv.get("revoked")) throw new Error(DISCONNECTED);
+      await this.#readViewer(userObjectId);
       const others = this.#registrations(repo).filter(([regKey]) => regKey !== registrationKey(key));
       await this.#ensureWebhook(repo, [registration, ...others.map(([, other]) => other)]);
       // Recorded in the same change, so a removal queued after it sees this hook.
@@ -229,6 +237,16 @@ export class GitHubHookDriver extends DurableObject<Env> {
   }
 
   /**
+   * The account's credentials were replaced, perhaps by another GitHub user's, whose own comments
+   * and reviews are then the ones its hooks skip (see UserAccount.commitReconnect()).
+   */
+  async reconnected(): Promise<void> {
+    const account = this.ctx.storage.kv.get<string>("account");
+    if (account === undefined || this.ctx.storage.kv.get("revoked")) return;
+    await this.#readViewer(account);
+  }
+
+  /**
    * Verify one webhook delivery and queue its event for each hook that watches for it.
    * @returns The HTTP status to answer GitHub with.
    */
@@ -272,9 +290,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
     }
     if (parsed.at < now - DELIVERED_RETENTION_MS) return 204;
     const { event, senderId } = parsed;
+    // Read before any hook is registered (see register()), and kept until the account disconnects.
+    const viewerId = kv.get<number>("viewer")!;
     let queued = false;
     for (const [regKey, registration] of this.#registrations({ id: repoId })) {
-      if (!watches(registration, event, senderId)) continue;
+      if (!watches(registration, event, senderId, viewerId)) continue;
       this.#queue.enqueue(regKey.slice("reg:".length), id, event, now);
       queued = true;
     }
@@ -320,6 +340,10 @@ export class GitHubHookDriver extends DurableObject<Env> {
     const account = kv.get<string>("account");
     const url = this.#webhookUrl();
     if (account === undefined || url === undefined) return;
+    // In case a reconnect's notice to this driver was lost.
+    await this.#readViewer(account).catch((error: unknown) => {
+      logger.warn("failed to read who a GitHub account is", { event: "hooks.viewer.read.failed", error });
+    });
     const checked: { webhook: Webhook; failed: GitHubWebhookDeliveryResponse[] }[] = [];
     for (const webhook of this.#webhooks()) {
       try {
@@ -329,13 +353,17 @@ export class GitHubHookDriver extends DurableObject<Env> {
         logger.warn("failed to check a GitHub webhook", { event: "hooks.webhook.check.failed", error });
       }
     }
-    const shares = fairShares(checked.map(({ failed }) => failed.length), MAX_REDELIVERIES_PER_CHECK);
+    // Started where the last check's split stopped: when more repositories need redeliveries than
+    // a check makes, those one check leaves out go first in the next.
+    const from = Math.max(0, checked.findIndex(({ webhook }) => webhook.repo.id === kv.get<number>("redeliverFrom")));
+    const { shares, next } = fairShares(checked.map(({ failed }) => failed.length), MAX_REDELIVERIES_PER_CHECK, from);
+    if (checked.length > 0) kv.put("redeliverFrom", checked[next]!.webhook.repo.id);
     for (const [i, { webhook: { id, repo }, failed }] of checked.entries()) {
       if (shares[i] === 0) continue;
       try {
         await this.#api(account, repo, async api => {
           for (const { id: deliveryId } of failed.slice(0, shares[i])) {
-            await api.redeliverRepoWebhookDelivery(repo.owner, repo.repo, id, deliveryId);
+            await api.redeliverRepoWebhookDelivery(repo.id, id, deliveryId);
           }
         });
       } catch (error) {
@@ -348,17 +376,17 @@ export class GitHubHookDriver extends DurableObject<Env> {
   /**
    * Bring `webhook` back to what its hooks need if it no longer matches: deleted, deactivated,
    * pointed elsewhere, sending form-encoded payloads, not verifying this deployment's certificate,
-   * subscribed to other events, or signing with another secret, which GitHub never shows but which
-   * fails deliveries here with 401.
+   * subscribed to other events, or signing with another secret or none: GitHub never shows the
+   * secret, but either fails deliveries here with 401.
    * @returns What GitHub failed to deliver to it lately, oldest first, to ask it to redeliver, as it
    *   never does itself.
    */
   async #checkWebhook(account: string, url: string, { id, repo }: Webhook): Promise<GitHubWebhookDeliveryResponse[]> {
     const read = await this.#api(account, repo, async api => {
       try {
-        const found = await api.getRepoWebhook(repo.owner, repo.repo, id);
+        const found = await api.getRepoWebhook(repo.id, id);
         const since = Date.now() - DELIVERY_LOOKBACK_MS;
-        return { found, deliveries: await api.listRepoWebhookDeliveries(repo.owner, repo.repo, id, since) };
+        return { found, deliveries: await api.listRepoWebhookDeliveries(repo.id, id, since) };
       } catch (error) {
         // Deleted, and its deliveries with it.
         if (error instanceof GitHubApiError && error.status === 404) return undefined;
@@ -366,9 +394,7 @@ export class GitHubHookDriver extends DurableObject<Env> {
       }
     });
     const events = webhookEvents(this.#registrations(repo).map(([, registration]) => registration));
-    const intact = read !== undefined && read.found.active === true && read.found.config.url === url
-      && read.found.config.content_type === "json" && String(read.found.config.insecure_ssl) === "0"
-      && sameEvents(read.found.events ?? [], events)
+    const intact = read !== undefined && deliversHere(read.found, url) && sameEvents(read.found.events ?? [], events)
       // By each delivery's latest attempt, so a 401 since redelivered successfully doesn't count.
       && !undelivered(read.deliveries).some(({ status_code }) => status_code === 401);
     if (!intact) {
@@ -412,35 +438,39 @@ export class GitHubHookDriver extends DurableObject<Env> {
     }
     const config = { url, secret, events: webhookEvents(registrations) };
     const recorded = kv.get<Webhook>(webhookKey(repo.id));
-    let id: number;
+    // `repaired` when it didn't deliver here until this restored it, as the hourly check would have.
+    let made: { id: number; repaired: boolean };
     try {
-      id = await this.#api(account, repo, async api => {
+      made = await this.#api(account, repo, async api => {
         if (recorded) {
           try {
-            return (await api.updateRepoWebhook(repo.owner, repo.repo, recorded.id, config)).id;
+            const repaired = !deliversHere(await api.getRepoWebhook(repo.id, recorded.id), url);
+            return { id: (await api.updateRepoWebhook(repo.id, recorded.id, config)).id, repaired };
           } catch (error) {
             if (!(error instanceof GitHubApiError && error.status === 404)) throw error;
           }
         }
         try {
-          return (await api.createRepoWebhook(repo.owner, repo.repo, config)).id;
+          return { id: (await api.createRepoWebhook(repo.id, config)).id, repaired: false };
         } catch (error) {
           if (!(error instanceof GitHubApiError && error.status === 422)) throw error;
-          const existing = (await api.listRepoWebhooks(repo.owner, repo.repo))
+          const existing = (await api.listRepoWebhooks(repo.id))
             .find(webhook => webhook.config.url === url);
           if (!existing) throw error;
-          return (await api.updateRepoWebhook(repo.owner, repo.repo, existing.id, config)).id;
+          return { id: (await api.updateRepoWebhook(repo.id, existing.id, config)).id, repaired: !deliversHere(existing, url) };
         }
       });
     } catch (error) {
       throw webhookRefusal(repo, error);
     }
+    const { id } = made;
     if (kv.get("revoked")) {
       // Disconnected meanwhile, so revoke() could not see this webhook to delete it.
       await this.#removeWebhook(account, { id, repo });
       throw new Error(DISCONNECTED);
     }
     kv.put<Webhook>(webhookKey(repo.id), { id, repo });
+    if (made.repaired) kv.put(repairedKey(repo.id), Date.now());
   }
 
   /**
@@ -449,10 +479,19 @@ export class GitHubHookDriver extends DurableObject<Env> {
    */
   async #removeWebhook(account: string, { id, repo }: Webhook): Promise<void> {
     try {
-      await this.#api(account, repo, api => api.deleteRepoWebhook(repo.owner, repo.repo, id));
+      await this.#api(account, repo, api => api.deleteRepoWebhook(repo.id, id));
     } catch (error) {
       logger.warn("failed to delete a GitHub webhook", { event: "hooks.webhook.delete.failed", error });
     }
+  }
+
+  /** Read the GitHub user the account now is, whose own comments and reviews its hooks skip. */
+  async #readViewer(account: string): Promise<void> {
+    await this.#viewerReads.run(async () => {
+      const { UserAccount } = this.ctx.exports;
+      const { user } = await withAccountApi(UserAccount.get(UserAccount.idFromString(account)), api => api.getViewer());
+      this.ctx.storage.kv.put("viewer", user.id);
+    });
   }
 
   #api<T>(account: string, repo: PinnedRepo, fn: (api: GitHubApi) => Promise<T>): Promise<T> {
@@ -504,11 +543,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
 }
 
 /**
- * Whether a hook on the event's repository watches for it. The facet re-checks the binding's
- * scope at delivery.
+ * Whether a hook on the event's repository watches for it, the account being GitHub user
+ * `viewerId`. The facet re-checks the binding's scope at delivery.
  */
-function watches({ number, events, viewerId }: Registration, event: GitHubWebhookEvent,
-                 senderId: number | undefined): boolean {
+function watches({ number, events }: Registration, event: GitHubWebhookEvent,
+                 senderId: number | undefined, viewerId: number): boolean {
   if (!events.includes(event.kind)) return false;
   if (number !== undefined && !("number" in event && event.number === number)) return false;
   // Never hand the account's own comments and reviews back to it, which a hook would answer.
@@ -526,9 +565,19 @@ const sameEvents = (actual: readonly string[], expected: readonly string[]) =>
 const delivered = ({ status_code }: GitHubWebhookDeliveryResponse) => status_code >= 200 && status_code < 300;
 
 /**
+ * Whether `webhook` delivers here as the driver configures it: active, to this deployment, as JSON,
+ * verifying its certificate. What it refused while it didn't may have been refused for that alone.
+ */
+function deliversHere(webhook: GitHubRepoWebhookResponse, url: string): boolean {
+  return webhook.active === true && webhook.config.url === url && webhook.config.content_type === "json"
+    && String(webhook.config.insecure_ssl) === "0";
+}
+
+/**
  * What to ask GitHub to redeliver, oldest first: each delivery whose latest attempt failed, unless
- * the worker refused it for good. A refusal made before `repairedAt`, when the check last restored
- * the webhook's configuration, may have been the misconfiguration's -- a form-encoded payload's
+ * the worker refused it for good. A refusal made before `repairedAt`, when the webhook's
+ * configuration was last restored, by the hourly check or by enabling or disabling a hook there,
+ * may have been the misconfiguration's -- a form-encoded payload's
  * 400, or another receiver's 404 -- so it is redelivered with the rest until it leaves the
  * lookback, since GitHub sends, encodes and signs a redelivery as the webhook is configured now.
  * `deliveries` are newest first. A redelivery of something already received is harmless: ingest()
@@ -545,22 +594,25 @@ function undelivered(deliveries: GitHubWebhookDeliveryResponse[], repairedAt = -
 }
 
 /**
- * Split `budget` among `demands` max-min fairly: one each in turn while any wants more, so one that
- * wants many can't crowd out one that wants a few.
+ * Split `budget` among `demands` max-min fairly: one each in turn from `start` while any wants
+ * more, so one that wants many can't crowd out one that wants a few.
+ * @returns Each share, and `next`, the demand after the last one given a share: where the next
+ *   split starts, so that what this one left out comes first then.
  */
-function fairShares(demands: number[], budget: number): number[] {
+function fairShares(demands: number[], budget: number, start = 0): { shares: number[]; next: number } {
   const shares = demands.map(() => 0);
-  for (let left = budget, gave = true; gave && left > 0;) {
-    gave = false;
-    for (const [i, demand] of demands.entries()) {
-      if (left > 0 && shares[i] < demand) {
-        shares[i]++;
-        left--;
-        gave = true;
-      }
+  let next = start;
+  for (let left = budget, i = start, idle = 0; left > 0 && idle < demands.length; i = (i + 1) % demands.length) {
+    if (shares[i]! < demands[i]!) {
+      shares[i]!++;
+      left--;
+      idle = 0;
+      next = (i + 1) % demands.length;
+    } else {
+      idle++;
     }
   }
-  return shares;
+  return { shares, next };
 }
 
 /** Why GitHub refused to add a webhook, in terms the user can act on. */
@@ -600,8 +652,11 @@ export async function handleWebhookRequest(request: Request, route: string, env:
     return new Response("Not Found", { status: 404 });
   }
   const name = request.headers.get("X-GitHub-Event");
+  if (!name || !request.body) return new Response("Bad Request", { status: 400 });
+  // Refused as a wrong signature is, which has the hourly check restore the webhook's secret:
+  // GitHub drops it when anyone updates the webhook without restating it.
   const signature = request.headers.get("X-Hub-Signature-256");
-  if (!name || !signature || !request.body) return new Response("Bad Request", { status: 400 });
+  if (!signature) return new Response("Unauthorized", { status: 401 });
   // An early refusal, sparing the driver; it enforces the cap itself as it reads.
   if (Number(request.headers.get("Content-Length")) > MAX_DELIVERY_BYTES) {
     return new Response("Payload Too Large", { status: 413 });

@@ -90,6 +90,11 @@ const SYNC_RETRY_MS = 5 * MINUTE_MS;
 /** Bounds one alarm's history read; the next alarm, set for at once, continues it. */
 const MAX_HISTORY_PAGES_PER_SYNC = 10;
 /**
+ * How often each account with hooks here is asked again whether it knows of this driver: hooks its
+ * disconnect failed to drop stay until then, when it answers no.
+ */
+const TRACKING_RECHECK_MS = 24 * HOUR_MS;
+/**
  * Labels whose mail no hook is delivered: the account's own mail, spam and trash, even on a label
  * binding to SPAM or TRASH, which lists them.
  */
@@ -109,8 +114,12 @@ type AddedMessage = { id: string; threadId: string; labelIds?: string[] };
 
 const registrationKey = (key: string) => `reg:${key}`;
 const capabilitiesKey = (key: string) => `caps:${key}`;
-/** Set once the account knows this driver holds hooks of its (see UserAccount.trackHookDriver()). */
+/** When the account last confirmed it knows this driver holds hooks of its (see UserAccount.trackHookDriver()). */
 const trackedKey = (userObjectId: string) => `tracked:${userObjectId}`;
+/** Set when a disconnected account's hooks are dropped, so that an enable it was making is refused. */
+const forgottenKey = (userObjectId: string) => `forgotten:${userObjectId}`;
+
+const DISCONNECTED = "This Google account has been disconnected.";
 
 /** The connection now reads another mailbox, so pushes for its new address never reach this driver. */
 class MailboxChangedError extends Error {
@@ -121,9 +130,9 @@ class MailboxChangedError extends Error {
 
 /**
  * One per mailbox, named by its lowercased address. Storage: `reg:`/`caps:` per hook, `tracked:`
- * per account, `watch`, `cursor` (the history ID read through), `syncAt` (when to read next), and
- * the delivery queue's `msg:` rows, whose message is a Gmail message ID. History IDs are compared
- * only as `BigInt`s.
+ * and `forgotten:` per account, `watch`, `cursor` (the history ID read through), `syncAt` (when to
+ * read next), and the delivery queue's rows, whose message is a Gmail message ID. History IDs are
+ * compared only as `BigInt`s.
  *
  * Every `await` here opens the input gate, so each storage write after one re-reads what it
  * depends on.
@@ -140,7 +149,10 @@ export class GmailHookDriver extends DurableObject<Env> {
     const profile = await this.#profile(api, registration.mailbox);
     const watch = kv.get<Watch>("watch");
     if (!watch || watch.renewAt <= Date.now() || watch.expiration <= Date.now()) await this.#watch(api);
+    await this.#track(registration.userObjectId, registration.mailbox);
 
+    // Nothing from here to the registration awaits, so neither a sync nor a disconnect can come
+    // between them.
     const cursor = kv.get<string>("cursor");
     if (cursor === undefined || BigInt(cursor) > BigInt(profile.historyId)) {
       // A sync that finished during this enable's awaits read past `since` without this hook; the
@@ -150,9 +162,6 @@ export class GmailHookDriver extends DurableObject<Env> {
     } else if (kv.get("syncAt") === undefined) {
       kv.put("syncAt", Date.now() + SAFETY_SYNC_INTERVAL_MS);
     }
-    // Recorded first, so that disconnecting the account reaches every hook it registers.
-    await this.#account(registration.userObjectId).trackHookDriver({ kind: "gmail", name: registration.mailbox });
-    kv.put(trackedKey(registration.userObjectId), true);
     const replaced = kv.get<Capabilities>(capabilitiesKey(key));
     kv.put<Registration>(registrationKey(key), { ...registration, since: profile.historyId });
     kv.put(capabilitiesKey(key), capabilities);
@@ -176,6 +185,7 @@ export class GmailHookDriver extends DurableObject<Env> {
 
   /** Drop the hooks of an account being disconnected (see UserAccount.revoke()). */
   async forgetAccount(userObjectId: string): Promise<void> {
+    this.ctx.storage.kv.put(forgottenKey(userObjectId), Date.now());
     for (const [regKey, registration] of this.#registrations()) {
       if (registration.userObjectId === userObjectId) await this.unregister(regKey.slice("reg:".length));
     }
@@ -335,19 +345,34 @@ export class GmailHookDriver extends DurableObject<Env> {
   }
 
   /**
-   * Tell each account with hooks here that this driver holds them, as register() does. A hook
-   * registered before accounts kept track has no record of it, which disconnecting its account
-   * needs to reach it; failing, it is told at the next alarm.
+   * Tell the account that this driver holds hooks of its, so that disconnecting it reaches them.
+   * Refuses an account disconnected already, or meanwhile: its hooks were dropped then.
+   */
+  async #track(userObjectId: string, mailbox: string): Promise<void> {
+    const tracked = await this.#account(userObjectId).trackHookDriver({ kind: "gmail", name: mailbox });
+    if (!tracked || this.ctx.storage.kv.get(forgottenKey(userObjectId)) !== undefined) throw new Error(DISCONNECTED);
+    this.ctx.storage.kv.put(trackedKey(userObjectId), Date.now());
+  }
+
+  /**
+   * Tell each account with hooks here that this driver holds them, as register() does, and again
+   * each TRACKING_RECHECK_MS. A hook registered before accounts kept track has no record of it,
+   * which disconnecting its account needs to reach it; failing, it is told at the next alarm. An
+   * account disconnected without dropping its hooks here, before it could be told or by a
+   * disconnect that couldn't reach this driver, has them dropped now.
    */
   async #trackAccounts(): Promise<void> {
     const kv = this.ctx.storage.kv;
-    const untracked = new Map(this.#registrations()
-      .filter(([, { userObjectId }]) => !kv.get(trackedKey(userObjectId)))
+    const due = new Map(this.#registrations()
+      .filter(([, { userObjectId }]) => (kv.get<number>(trackedKey(userObjectId)) ?? 0) <= Date.now() - TRACKING_RECHECK_MS)
       .map(([, { userObjectId, mailbox }]) => [userObjectId, mailbox]));
-    for (const [userObjectId, mailbox] of untracked) {
+    for (const [userObjectId, mailbox] of due) {
       try {
-        await this.#account(userObjectId).trackHookDriver({ kind: "gmail", name: mailbox });
-        kv.put(trackedKey(userObjectId), true);
+        if (await this.#account(userObjectId).trackHookDriver({ kind: "gmail", name: mailbox })) {
+          kv.put(trackedKey(userObjectId), Date.now());
+        } else {
+          await this.forgetAccount(userObjectId);
+        }
       } catch (error) {
         logger.warn("failed to note a Gmail hook driver with its account", { event: "gmail.hooks.track.failed", error });
       }

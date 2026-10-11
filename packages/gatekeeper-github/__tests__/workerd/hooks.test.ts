@@ -3,6 +3,7 @@
 // fetch mock below, and its signed webhook deliveries arrive through the worker's own fetch handler.
 
 import { SELF, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
 import type { HookDescription } from "@gadgets/workshop-shared/gatekeeper";
 import { afterEach, expect, it, vi } from "vitest";
 import type { GitHubSubscribeOptions } from "../../src/types";
@@ -11,7 +12,8 @@ import type { GatekeeperProps, Outcome } from "./worker";
 const OWNER = "acme";
 const REPO = "widgets";
 const REPO_ID = 1296269;
-const API = `/repos/${OWNER}/${REPO}`;
+/** Where the driver reaches the repository's webhooks: by its id, which a rename doesn't change. */
+const API = `/repositories/${REPO_ID}`;
 const HEAD = "b".repeat(40);
 const BASE = "a".repeat(40);
 const ZERO = "0".repeat(40);
@@ -20,7 +22,9 @@ const CREATED = new Date().toISOString();
 
 type Row = Record<string, unknown>;
 type Webhook = {
-  id: number; url: string; secret: string; events: string[]; active: boolean;
+  id: number; url: string; events: string[]; active: boolean;
+  /** Unset as GitHub leaves it when someone updates the webhook without restating it. */
+  secret: string | undefined;
   /** The name of the repository it is on, in `acme`. */
   repo: string;
   /** `"json"` or `"form"`, GitHub's `config.content_type`. */
@@ -51,6 +55,8 @@ const gizmos = {
   ...repository, id: 4242, name: "gizmos", full_name: `${OWNER}/gizmos`, html_url: `https://github.com/${OWNER}/gizmos`,
 };
 const REPOSITORIES: Record<string, typeof repository> = { [REPO]: repository, gizmos };
+/** What the fake keys a webhook by when it is on the repository that took `REPO`'s name (`nameReusedBy`). */
+const REUSED = "the repository named widgets since";
 
 function issue(number: number, overrides: Row = {}): Row {
   return {
@@ -101,6 +107,14 @@ async function hmac(secret: string, body: string): Promise<string> {
 
 /** GitHub, as far as hooks use it: the repository and who administers it, the viewer, webhooks. */
 class FakeGitHub {
+  /** Who the account's token belongs to. */
+  viewer = ADA;
+  /**
+   * While set, a read of who the account is that GitHub answers as this user stalls, counted in
+   * `stalledViewerReads`. Polled, as `stallDeletes` is.
+   */
+  stallViewerReadsAs: typeof ADA | undefined;
+  stalledViewerReads = 0;
   admin = true;
   /** Whether the account can still read the repository at all. */
   readable = true;
@@ -138,20 +152,21 @@ class FakeGitHub {
     const { pathname, searchParams } = new URL(request.url);
     const { method } = request;
     this.requests.push(`${method} ${pathname}`);
-    if (pathname === "/user") return Response.json(ADA);
+    if (pathname === "/user") {
+      const { viewer } = this;
+      if (this.stallViewerReadsAs === viewer) {
+        this.stalledViewerReads++;
+        while (this.stallViewerReadsAs === viewer) await scheduler.wait(1);
+      }
+      return Response.json(viewer);
+    }
     if (pathname === "/applications/test-client/token" && method === "DELETE") {
       return new Response(null, { status: 204 });
     }
-    const byId = /^\/repositories\/(\d+)$/.exec(pathname);
-    if (byId) {
-      const repo = Object.values(REPOSITORIES).find(({ id }) => id === Number(byId[1]));
-      if (!repo) throw new Error(`test: unexpected fetch ${method} ${request.url}`);
-      return this.#repository(request, repo);
-    }
-    const [, name = "", rest = ""] = new RegExp(`^/repos/${OWNER}/([^/]+)(/.*)?$`).exec(pathname) ?? [];
-    const repo = REPOSITORIES[name];
-    if (!repo) throw new Error(`test: unexpected fetch ${method} ${request.url}`);
-    if (rest === "") return this.#repository(request, name === REPO && this.nameReusedBy || repo);
+    const target = this.#target(pathname);
+    if (!target) throw new Error(`test: unexpected fetch ${method} ${request.url}`);
+    const { repo, key: name, rest } = target;
+    if (rest === "") return this.#repository(request, repo);
     if (rest === "/issues/42") return Response.json(issue(42));
     if (rest.startsWith("/hooks") && !this.admin) {
       return Response.json({ message: "Not Found" }, { status: 404 });
@@ -187,7 +202,10 @@ class FakeGitHub {
       if (method === "GET") {
         const { url, events, active, contentType, insecureSsl } = webhook;
         return Response.json({
-          id, active, events, config: { url, content_type: contentType, insecure_ssl: insecureSsl, secret: "********" },
+          id, active, events, config: {
+            url, content_type: contentType, insecure_ssl: insecureSsl,
+            ...webhook.secret === undefined ? {} : { secret: "********" },
+          },
         });
       }
       if (method === "PATCH") {
@@ -217,6 +235,24 @@ class FakeGitHub {
       return Response.json({}, { status: 202 });
     }
     throw new Error(`test: unexpected fetch ${method} ${request.url}`);
+  }
+
+  /**
+   * The repository a request names, as `/repositories/<id>` or `/repos/acme/<name>`, where a name
+   * taken over by `nameReusedBy` names that one; and the key its webhooks are held under.
+   */
+  #target(pathname: string): { repo: typeof repository; key: string; rest: string } | undefined {
+    const byId = /^\/repositories\/(\d+)(\/.*)?$/.exec(pathname);
+    if (byId) {
+      const id = Number(byId[1]);
+      if (id === this.nameReusedBy?.id) return { repo: this.nameReusedBy, key: REUSED, rest: byId[2] ?? "" };
+      const [key, repo] = Object.entries(REPOSITORIES).find(([, candidate]) => candidate.id === id) ?? [];
+      return key === undefined || repo === undefined ? undefined : { repo, key, rest: byId[2] ?? "" };
+    }
+    const [, name = "", rest = ""] = new RegExp(`^/repos/${OWNER}/([^/]+)(/.*)?$`).exec(pathname) ?? [];
+    if (name === REPO && this.nameReusedBy) return { repo: this.nameReusedBy, key: REUSED, rest };
+    const repo = REPOSITORIES[name];
+    return repo === undefined ? undefined : { repo, key: name, rest };
   }
 
   /** A read of `repo`, conditional on its ETag. */
@@ -294,7 +330,8 @@ class FakeGitHub {
       method: "POST",
       headers: {
         "Content-Type": contentType, "X-GitHub-Event": event, "X-GitHub-Delivery": guid,
-        "X-Hub-Signature-256": `sha256=${await hmac(secret, sent)}`,
+        // Unsigned without a secret, as GitHub sends.
+        ...secret === undefined ? {} : { "X-Hub-Signature-256": `sha256=${await hmac(secret, sent)}` },
       },
       body: sent,
     })).status;
@@ -688,7 +725,7 @@ it("refuses deliveries that aren't signed with the webhook's secret", async () =
     method: "POST", body: "{}",
     headers: { "X-GitHub-Event": "issues", "X-GitHub-Delivery": crypto.randomUUID() },
   });
-  expect(unsigned.status).toBe(400);
+  expect(unsigned.status).toBe(401);
   const elsewhere = await SELF.fetch(url.replace(/[0-9a-f]{64}$/, "f".repeat(64)), { method: "POST", body: "{}" });
   expect(elsewhere.status).toBe(404);
   // Signed, but for a repository this webhook isn't on, or not JSON at all.
@@ -697,7 +734,7 @@ it("refuses deliveries that aren't signed with the webhook's secret", async () =
   const [{ secret }] = github.webhooks.values();
   const garbled = await SELF.fetch(url, {
     method: "POST", body: "not json",
-    headers: { "X-GitHub-Event": "issues", "X-Hub-Signature-256": `sha256=${await hmac(secret, "not json")}` },
+    headers: { "X-GitHub-Event": "issues", "X-Hub-Signature-256": `sha256=${await hmac(secret!, "not json")}` },
   });
   expect(garbled.status).toBe(400);
   const oversized = new Uint8Array(5 * 1024 * 1024 + 1);
@@ -952,6 +989,97 @@ it("restores its webhook's payload encoding, and has GitHub redeliver what it re
   expect((await triage.read()).received).toEqual([expect.objectContaining({ info: expect.objectContaining({ id: "42" }) })]);
 });
 
+it.each<[string, (github: FakeGitHub, account: string) => Promise<unknown>]>([
+  ["told of the reconnect", async (_github, account) => {
+    const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
+    const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
+      state.storage.kv, { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] }, Date.now()));
+    await userAccount.commitReconnect(stageId);
+  }],
+  // As when the reconnect's notice to the driver was lost.
+  ["at the hourly check", (_github, account) => after(HOUR, account)],
+])("skips the comments of the GitHub user its account is now, after reconnecting as another, %s", async (_case, learn) => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe({ events: ["comment"] });
+  await triage.enable();
+
+  // Reconnected, now as Bob.
+  github.viewer = BOB;
+  await learn(github, account);
+  await github.deliver("issue_comment", comment(42, "From Bob, whom the account is now.", { sender: BOB }));
+  await github.deliver("issue_comment", comment(42, "From Ada, someone else now.", { sender: ADA }));
+  await settled(account);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({
+    kind: "comment", comment: expect.objectContaining({ bodyMarkdown: "From Ada, someone else now." }),
+  })]);
+});
+
+it("skips the comments of the GitHub user its account reconnected as while GitHub was slow to say who it was", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe({ events: ["comment"] });
+  await triage.enable();
+
+  // The hourly check asks who the account is, and GitHub is slow to answer Ada...
+  github.stallViewerReadsAs = ADA;
+  const checking = after(HOUR, account);
+  await vi.waitFor(() => expect(github.stalledViewerReads).toBe(1));
+  // ...until the account has reconnected as Bob.
+  github.viewer = BOB;
+  const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
+  const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(
+    state.storage.kv, { accessToken: "bob-token", scopes: ["repo", "admin:repo_hook", "read:user"] }, Date.now()));
+  const reconnecting = userAccount.commitReconnect(stageId);
+  // Time for the reconnect's own read to be answered first, were it made alongside the check's.
+  await scheduler.wait(300);
+  github.stallViewerReadsAs = undefined;
+  await Promise.all([checking, reconnecting]);
+
+  await github.deliver("issue_comment", comment(42, "From Bob, whom the account is now.", { sender: BOB }));
+  await github.deliver("issue_comment", comment(42, "From Ada, someone else now.", { sender: ADA }));
+  await settled(account);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({
+    kind: "comment", comment: expect.objectContaining({ bodyMarkdown: "From Ada, someone else now." }),
+  })]);
+});
+
+it.each<[string, (account: string) => Promise<() => Promise<unknown>>]>([
+  ["enabling another hook there", async account => {
+    const other = binding(account);
+    await other.subscribe();
+    return () => other.enable();
+  }],
+  ["disabling one of two there", async account => {
+    const other = binding(account);
+    await other.subscribe();
+    await other.enable();
+    return () => other.disable();
+  }],
+])("has GitHub redeliver what it refused before %s restored its webhook", async (_case, prepare) => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const change = await prepare(account);
+  const [webhook] = github.webhooks.values();
+
+  // Signed, but form-encoded, so refused as malformed; the change restores it before the check can.
+  webhook!.contentType = "form";
+  expect(await github.deliver("issues", issues("opened", 42))).toEqual([400]);
+  await change();
+  expect(github.webhooks.get(webhook!.id)).toMatchObject({ contentType: "json" });
+  await after(HOUR, account);
+
+  expect(github.pendingRedeliveries()).toEqual({ [REPO]: 1 });
+  expect(await github.redeliver()).toEqual([204]);
+  await settled(account);
+  expect((await triage.read()).received).toEqual([expect.objectContaining({ info: expect.objectContaining({ id: "42" }) })]);
+});
+
 it("goes on redelivering what was refused before the webhook's repair, until all of it is delivered", async () => {
   const github = new FakeGitHub();
   const account = await connectAccount();
@@ -1006,7 +1134,11 @@ it("has GitHub redeliver what another receiver refused while the webhook pointed
   expect(github.pendingRedeliveries()).toEqual({});
 });
 
-it("restores its webhook's secret, has GitHub redeliver what the wrong one signed, then leaves it", async () => {
+it.each<[string, string | undefined]>([
+  ["changes", "chosen-by-another-admin"],
+  // As GitHub does to a webhook anyone updates without restating its secret, leaving it unsigned.
+  ["removes", undefined],
+])("restores its webhook's secret when someone %s it, has GitHub redeliver what that refused, then leaves it", async (_, changed) => {
   const github = new FakeGitHub();
   const account = await connectAccount();
   const triage = binding(account);
@@ -1015,7 +1147,7 @@ it("restores its webhook's secret, has GitHub redeliver what the wrong one signe
   const [{ id, secret }] = github.webhooks.values();
   const { at, alarm } = clock(account);
 
-  github.webhooks.get(id)!.secret = "chosen-by-another-admin";
+  github.webhooks.get(id)!.secret = changed;
   await at(HOUR / 2, async () => expect(await github.deliver("issues", issues("opened", 42))).toEqual([401]));
   await at(HOUR, alarm);
   expect(github.webhooks.get(id)?.secret).toBe(secret);
@@ -1084,6 +1216,40 @@ it("shares a check's redeliveries among the account's repositories, the rest wai
 
   expect((await busy.read()).received).toHaveLength(25);
   expect((await quiet.read()).received).toHaveLength(3);
+});
+
+it("starts each check's redeliveries where the last check's stopped, when more repositories need them than one makes", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  // One more repository than a check makes redeliveries, twenty.
+  const names = [REPO, "gizmos"];
+  for (let i = names.length; i < 21; i++) {
+    const name = `spare${i}`;
+    REPOSITORIES[name] ??= {
+      ...repository, id: 7000 + i, name, full_name: `${OWNER}/${name}`, html_url: `https://github.com/${OWNER}/${name}`,
+    };
+    names.push(name);
+  }
+  for (const name of names) {
+    const hook = binding(account, { repo: name });
+    await hook.subscribe();
+    await hook.enable();
+  }
+  const { at, alarm } = clock(account);
+
+  // One failed delivery on each, which GitHub then fails again each time it is redelivered.
+  github.failDeliveriesWith = 503;
+  await at(0, async () => {
+    for (const name of names) await github.deliver("issues", { ...issues("opened", 42), repository: REPOSITORIES[name] });
+  });
+  await at(HOUR, alarm);
+  const first = github.pendingRedeliveries();
+  expect(Object.values(first)).toEqual(Array(20).fill(1));
+  const [left] = names.filter(name => !(name in first));
+  await github.redeliver();
+
+  await at(2 * HOUR, alarm);
+  expect(github.pendingRedeliveries()).toMatchObject({ [left!]: 1 });
 });
 
 it("asks again at the next check for the redeliveries GitHub refused to make", async () => {
@@ -1194,6 +1360,23 @@ it("asks after the repository by its id, which outlives a rename, not by a name 
   expect(await triage.read()).toMatchObject({ received: [], observations: [] });
 });
 
+it("keeps its webhook on the repository it watches, once another the account administers has taken its name", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+  const [webhook] = github.webhooks.values();
+
+  // Renamed, while its old name now names another repository the account may add webhooks to.
+  github.nameReusedBy = { ...gizmos, id: 999, name: REPO, full_name: `${OWNER}/${REPO}` };
+  await after(HOUR, account);
+  expect([...github.webhooks.values()].map(({ id, repo }) => [id, repo])).toEqual([[webhook!.id, REPO]]);
+  await triage.disable();
+  expect(github.deleted).toEqual([webhook!.id]);
+  expect(github.webhooks.size).toBe(0);
+});
+
 it("changes nothing while WEBHOOK_ORIGIN is unset: subscribe() refuses, and the webhook route is inert", async () => {
   const github = new FakeGitHub();
   const account = await connectAccount();
@@ -1221,6 +1404,16 @@ it("refuses to watch a repository whose webhooks the account can't manage", asyn
   await expect(binding(account).subscribe()).rejects.toThrow(
     "GitHub delivers events to a webhook, which only an admin of acme/widgets can add, and the connected " +
     "account is not one.");
+});
+
+it("revokes a disconnected account's token even when its hook driver can't be reached", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  await runInDurableObject(driver(account), (_instance, state) => state.storage.kv.put("test:unreachable", true));
+
+  // Disconnecting fails, as it should, but not before the token is revoked.
+  expect(await binding(account).hooks.revokeAccount(account)).toEqual({ error: "The test hook driver can't be reached." });
+  expect(github.requests).toContain("DELETE /applications/test-client/token");
 });
 
 it("deletes a disconnected account's webhooks and delivers nothing more", async () => {
