@@ -1,6 +1,6 @@
 import { WorkerEntrypoint, DurableObject, RpcTarget, RpcStub } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc } from "capnweb-validate";
-import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, Cursor, ActionKind, GitCache, type ActionDescription, type ConnectHandoff } from '@gadgets/workshop-shared/gatekeeper';
+import { GatekeeperUser, GatekeeperUserVerifier, GatekeeperVendor as GatekeeperVendorIface, Gatekeeper, ResourceDescription, ApprovalQueue, ObservationDescription, VendorDescription, GatekeeperConnectCallback, GatekeeperConnectOptions, AccountDescription, SupportedResource, ResourceConfiguratorFrame, GatekeeperUiFrame, Cursor, ActionKind, GitCache, type ActionDescription, type ConnectHandoff } from '@gadgets/workshop-shared/gatekeeper';
 import { buildDescription, codeSpan, plainInline } from "@gadgets/gatekeeper-kit/action-description";
 import { connectHandoffPageHtml, htmlResponse } from "@gadgets/gatekeeper-kit/connect-pages";
 import { commitStagedCredentials, stageCredentials } from "@gadgets/gatekeeper-kit/credential-stage";
@@ -86,6 +86,7 @@ import {
   DriveAccountConfiguratorUI,
   DriveFileConfiguratorUI,
   DriveFolderConfiguratorUI,
+  CreationFolderConfiguratorUI,
 } from "./google-configurators";
 import BIGQUERY_CONFIGURATOR_HTML from "./generated/bigquery-configurator-ui.txt";
 import CALENDAR_CONFIGURATOR_HTML from "./generated/calendar-configurator-ui.txt";
@@ -99,6 +100,7 @@ import GOOGLE_SLIDES_CONFIGURATOR_HTML from "./generated/google-slides-configura
 import DRIVE_ACCOUNT_CONFIGURATOR_HTML from "./generated/drive-account-configurator-ui.txt";
 import DRIVE_FILE_CONFIGURATOR_HTML from "./generated/drive-file-configurator-ui.txt";
 import DRIVE_FOLDER_CONFIGURATOR_HTML from "./generated/drive-folder-configurator-ui.txt";
+import CREATION_FOLDER_CONFIGURATOR_HTML from "./generated/creation-folder-configurator-ui.txt";
 import GOOGLE_LOGO_SVG from "./google-logo.svg";
 import { obsContext } from "./observability.js";
 import { AccessTokenCache, AccessTokenRequest, ACCESS_TOKEN_EXPIRY_SAFETY_MS } from "./auth-retry";
@@ -110,7 +112,7 @@ import {
   GOOGLE_DRIVE_RESOURCE, GOOGLE_SHEETS_RESOURCE, GOOGLE_SLIDES_RESOURCE, RESOURCE_BY_KIND,
   SUPPORTED_RESOURCES, creatableKind, nativeFileUrl,
   grantedResourceUrlPatterns, hasDriveResourceGrant, parseResourceUrl,
-  recordedResourceUrlPatterns, type RecordedResourceGrant,
+  placesCreatedFiles, recordedResourceUrlPatterns, type RecordedResourceGrant,
 } from "./resources";
 import {
   beginStoredOAuthFlow, claimStoredOAuthFlow, mergeGrantedResources, prepareOAuthFlow,
@@ -482,6 +484,11 @@ export class UserAccount extends DurableObject<Env> {
    */
   async getRequestableResourceUrlPatterns(): Promise<string[]> {
     return recordedResourceUrlPatterns(this.#recordedGrant());
+  }
+
+  /** Whether the gatekeeper can move a file it created in this account into a folder. */
+  async canPlaceCreatedFiles(): Promise<boolean> {
+    return placesCreatedFiles(this.#recordedGrant());
   }
 
   #recordedGrant(): RecordedResourceGrant {
@@ -933,6 +940,18 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
     }
 
     throw new Error(`Unsupported resource configurator type: ${resourceUrlPattern}`);
+  }
+
+  /** Where a new Doc, Sheet or Presentation goes: My Drive or a folder this account can add to. */
+  async startCreationConfigurator(resourceUrlPattern: string): Promise<GatekeeperUiFrame> {
+    creatableKind(resourceUrlPattern);
+    let account = this.ctx.exports.UserAccount.get(
+      this.ctx.exports.UserAccount.idFromString(this.ctx.props.userObjectId));
+    return {
+      iframeHtml: CREATION_FOLDER_CONFIGURATOR_HTML,
+      ui: new RpcStub(new CreationFolderConfiguratorUI(
+        async (opts?: AccessTokenRequest) => await account.getAccessToken(opts))),
+    };
   }
 
   async revoke(): Promise<void> {
@@ -1888,15 +1907,16 @@ export class GoogleDocGatekeeperImpl
     return this.#actions.run(() => this.#rejectAction(actionId));
   }
 
-  async applyCreation(creator: Fetcher<GatekeeperUserVerifier>)
+  async applyCreation(creator: Fetcher<GatekeeperUserVerifier>, configuration: string | null)
       : Promise<{class: DurableObjectClass<Gatekeeper<any>>, resourceUrl: string}> {
-    return this.#actions.run(() => this.#applyCreation(creator));
+    return this.#actions.run(() => this.#applyCreation(creator, configuration));
   }
 
-  async #applyCreation(creator: Fetcher<GatekeeperUserVerifier>)
+  async #applyCreation(creator: Fetcher<GatekeeperUserVerifier>, configuration: string | null)
       : Promise<{class: DurableObjectClass<Gatekeeper<any>>, resourceUrl: string}> {
     let { userObjectId, fileId, resourceUrl, getAccessToken: tokens } = await createFileOnce(
-        this.ctx, creator, "doc", (title, getToken) => new GoogleDocsApi(getToken).createDocument(title));
+        this.ctx, creator, "doc", configuration,
+        (title, getToken) => new GoogleDocsApi(getToken).createDocument(title));
     // Edits queued against the blank document name its tab, which the created one may not share.
     let [tab] = (await new GoogleDocsApi(tokens).getDocument(fileId)).tabs;
     this.ctx.storage.kv.put(CREATED_DOC_TAB_KEY, tab.tabId);
@@ -2456,10 +2476,11 @@ export class GoogleSheetsGatekeeperImpl
     );
   }
 
-  async applyCreation(creator: Fetcher<GatekeeperUserVerifier>)
+  async applyCreation(creator: Fetcher<GatekeeperUserVerifier>, configuration: string | null)
       : Promise<{class: DurableObjectClass<Gatekeeper<any>>, resourceUrl: string}> {
     return this.#creating.run(async () => {
-      let { userObjectId, fileId, resourceUrl } = await createFileOnce(this.ctx, creator, "sheets",
+      let { userObjectId, fileId, resourceUrl } = await createFileOnce(
+          this.ctx, creator, "sheets", configuration,
           (title, tokens) => new GoogleSheetsApi(tokens).createSpreadsheet(title));
       return {
         class: this.ctx.exports.GoogleSheetsGatekeeperImpl({props: {userObjectId, spreadsheetId: fileId}}),
