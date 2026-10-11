@@ -198,15 +198,15 @@ One per connected account, named by its `UserAccount` id; see `src/github-hooks.
 - `redeliverFrom` -> the repository id the next check's share of redeliveries starts with: the one
   after the last the previous check served.
 - `reg:<hookKey>` -> what one enabled hook watches: its repository, the issue or pull request it
-  is narrowed to, its event kinds, and the account's GitHub user id when it was subscribed, which
-  `viewer` supersedes.
+  is narrowed to, and its event kinds.
 - `caps:<hookKey>` -> `{ delivery, initiator }`: the facet's persistent delivery stub and the
   Workshop's `HookInitiator`.
 - `msg:<hookKey>:<eventId>` -> the kit's `HookDeliveryQueue` rows, named by the digest of the
   event's payload: an event pending delivery to one hook, or a finished one kept for a day to
   collapse redeliveries.
-- `queue:due:<time>:<hookKey>:<eventId>`, `queue:expires:<time>:<hookKey>:<eventId>` and
-  `queue:indexed` -> the queue's indexes of those rows, by when each is next due or forgotten.
+- `queue:due:<time>:<hookKey>:<eventId>`, `queue:finished:<time>:<hookKey>:<eventId>` and
+  `queue:indexed` -> the queue's indexes of those rows: by when each pending one is next due, and
+  when each finished one finished, which the dedupe window counts from.
 - `revoked` -> set, with every other key deleted, once the account is disconnected.
 
 ## Simulation model

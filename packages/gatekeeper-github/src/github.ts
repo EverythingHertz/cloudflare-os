@@ -1692,9 +1692,14 @@ export class GatekeeperUserImpl extends WorkerEntrypoint<Env, GatekeeperUserImpl
 
   async revoke(): Promise<void> {
     const { userObjectId } = this.ctx.props;
-    // First, while the account's token can still delete its webhooks.
-    await this.ctx.exports.GitHubHookDriver.getByName(userObjectId).revoke();
-    await this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(userObjectId)).revoke();
+    try {
+      // First, while the account's token can still delete its webhooks.
+      await this.ctx.exports.GitHubHookDriver.getByName(userObjectId).revoke();
+    } finally {
+      // The token is revoked even when its webhooks can't be: the driver going wrong mustn't leave
+      // a disconnected account's grant live.
+      await this.ctx.exports.UserAccount.get(this.ctx.exports.UserAccount.idFromString(userObjectId)).revoke();
+    }
   }
 
   async reconnect(): Promise<{ url: string }> {
@@ -3761,8 +3766,7 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
     }
     const pin = await this.#pinnedRepo();
     if (!pin) throw new Error(`Failed to look up ${owner}/${repo} on GitHub. Please try again.`);
-    const [{ permissions }, { user: viewer }] = await this.#readApi(api =>
-      Promise.all([api.getRepo(owner, repo), api.getViewer()]));
+    const { permissions } = await this.#readApi(api => api.getRepo(owner, repo));
     if (!permissions?.admin) {
       throw new Error(`GitHub delivers events to a webhook, which only an admin of ${owner}/${repo} ` +
         "can add, and the connected account is not one.");
@@ -3776,7 +3780,6 @@ export class GitHubGatekeeperImpl extends DurableObject<Env, GitHubGatekeeperImp
       userObjectId,
       repo: pin,
       events,
-      viewerId: viewer.id,
       delivery,
     } });
     const watched = number === undefined

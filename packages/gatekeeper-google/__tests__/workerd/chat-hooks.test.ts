@@ -58,6 +58,8 @@ function mockGoogle() {
      * because a promise settled across Durable Objects moves its waiter's I/O to the settler.
      */
     stallGet: undefined as {started: boolean; released: boolean} | undefined,
+    /** When set, subscriptions.create flags that it started and answers once released, polled as `stallGet` is. */
+    stallCreate: undefined as {started: boolean; released: boolean} | undefined,
     /**
      * The account's subscription to the space that Google holds but the driver never learned of,
      * as when a create's response is lost; Google refuses to create another while it exists.
@@ -83,6 +85,10 @@ function mockGoogle() {
     if (url.href === "https://www.googleapis.com/oauth2/v3/userinfo") return json({sub: subject});
     if (url.href === "https://workspaceevents.googleapis.com/v1/subscriptions" && method === "POST") {
       if (google.unrecorded) return json({error: {code: 409, status: "ALREADY_EXISTS"}}, 409);
+      if (google.stallCreate) {
+        google.stallCreate.started = true;
+        await vi.waitFor(() => expect(google.stallCreate!.released).toBe(true), {timeout: 10_000, interval: 5});
+      }
       google.creates++;
       return json({name: "operations/create", done: true, response: {
         name: `subscriptions/${google.subscriptionId ?? subject}`, state: "ACTIVE",
@@ -459,6 +465,44 @@ it.each([
     [...state.storage.kv.list({prefix: "reg:"})].length)).toBe(0);
 });
 
+it("refuses an enable whose account is disconnected while it subscribes, registering nothing", async () => {
+  const google = mockGoogle();
+  const ada = await connect("ada");
+  google.stallCreate = {started: false, released: false};
+  // Expected at once, as the enable is refused while the test is still acting.
+  const refused = expect(Promise.resolve(ada.hooks.chatEnableHook())).rejects.toThrow("This Google account has been disconnected.");
+  await vi.waitFor(() => expect(google.stallCreate!.started).toBe(true), {timeout: 5_000});
+  await (testEnv.UserAccount.get(testEnv.UserAccount.idFromString(ada.props.userObjectId)) as unknown as
+    {revoke(): Promise<void>}).revoke();
+  google.stallCreate.released = true;
+  await refused;
+  expect(await registeredAccounts()).toEqual([]);
+});
+
+it("subscribes afresh for an enable while the alarm drops the expired subscription no hook used", async () => {
+  mockGoogle();
+  const ada = await connect("ada");
+  await ada.hooks.chatEnableHook();
+  await ada.hooks.chatDisableHook();
+  // Unused, the subscription is dropped by the alarm at its expiry, here while an enable of the
+  // account's waits on the account. The runtime won't wake the driver for the faked clock.
+  const tracking = await whileTracking(ada, async () => {
+    vi.setSystemTime(Date.now() + 4 * 3_600_000);
+    try {
+      await runDurableObjectAlarm(driver());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  const enabling = ada.hooks.chatEnableHook();
+  await tracking.waitedFor();
+  await enabling;
+
+  expect(await push("ada", [chatMessage("bob")])).toBe(204);
+  await deliver();
+  expect((await ada.hooks.readHook()).received).toHaveLength(1);
+});
+
 it("retries a failed subscription renewal before the subscription lapses", async () => {
   const google = mockGoogle();
   const ada = await connect("ada");
@@ -523,6 +567,33 @@ it("keeps the subscription an enable creates while a renewal of the expired one 
   await push("replacement", [chatMessage("bob")]);
   await deliver();
   expect((await ada.hooks.readHook()).received).toHaveLength(1);
+});
+
+it("keeps the subscription an enable makes while the alarm renewing another was to drop the one it replaced", async () => {
+  const google = mockGoogle();
+  const ada = await connect("ada");
+  const bob = await connect("bob");
+  await ada.hooks.chatEnableHook();
+  await bob.hooks.chatEnableHook();
+  await bob.hooks.chatDisableHook();
+  google.stallGet = {started: false, released: false};
+
+  // Ada's subscription is due for renewal, and Bob's, which no hook uses, has expired. Bob enables
+  // again while the alarm's renewal of Ada's waits on Google, before it comes to Bob's.
+  vi.setSystemTime(Date.now() + 4 * 3_600_000);
+  try {
+    const alarm = runDurableObjectAlarm(driver());
+    await vi.waitFor(() => expect(google.stallGet!.started).toBe(true));
+    await bob.hooks.chatEnableHook();
+    google.stallGet.released = true;
+    await alarm;
+  } finally {
+    vi.useRealTimers();
+  }
+
+  expect(await push("bob", [chatMessage("carol")])).toBe(204);
+  await deliver();
+  expect((await bob.hooks.readHook()).received).toHaveLength(1);
 });
 
 it("renews at once a subscription that a re-enabled hook finds past its renewal time", async () => {

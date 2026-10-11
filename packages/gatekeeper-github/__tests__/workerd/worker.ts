@@ -13,7 +13,7 @@ import type {
   AccountDescription, ActionDescription, ConnectHandoff, GatekeeperUser, GitCache, HookController,
   HookDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { GitHubGatekeeperImpl, type GitHubVerifierApi } from "../../src/github.js";
+import { GitHubGatekeeperImpl, GitHubHookDriver as GitHubHookDriverImpl, type GitHubVerifierApi } from "../../src/github.js";
 import type { GitHubHookParams } from "../../src/github-hooks.js";
 import type {
   Cursor,
@@ -39,8 +39,19 @@ export * from "../../src/github.js";
 // Named as well, since the pool builds `ctx.exports` entrypoints only from exports it can see
 // statically, and the account, the facet and TestHooks mint these.
 export {
-  GatekeeperUserImpl, GitHubHookController, GitHubHookDriver, GitHubVerifier,
+  GatekeeperUserImpl, GitHubHookController, GitHubVerifier,
 } from "../../src/github.js";
+
+/**
+ * The account's hook driver, whose revoke() fails while its storage has `test:unreachable`, as when
+ * disconnecting the account can't reach it.
+ */
+export class GitHubHookDriver extends GitHubHookDriverImpl {
+  override async revoke(): Promise<void> {
+    if (this.ctx.storage.kv.get("test:unreachable")) throw new Error("The test hook driver can't be reached.");
+    await super.revoke();
+  }
+}
 
 /** What each `TestConnectCallback` was told, by its `props.name`. */
 export const connectCallbackEvents = new Map<string, string[]>();

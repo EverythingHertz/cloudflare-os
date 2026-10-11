@@ -62,11 +62,6 @@ export type GitHubHookProps = GitHubHookParams & {
   userObjectId: string;
   repo: PinnedRepo;
   events: GitHubEventKind[];
-  /**
-   * The connected account's GitHub user id when the hook was subscribed, whose own comments and
-   * reviews are not delivered, until the driver has read who the account is now.
-   */
-  viewerId: number;
   delivery: RpcStub<GitHubHookDelivery>;
 };
 
@@ -295,10 +290,11 @@ export class GitHubHookDriver extends DurableObject<Env> {
     }
     if (parsed.at < now - DELIVERED_RETENTION_MS) return 204;
     const { event, senderId } = parsed;
-    const viewerId = kv.get<number>("viewer");
+    // Read before any hook is registered (see register()), and kept until the account disconnects.
+    const viewerId = kv.get<number>("viewer")!;
     let queued = false;
     for (const [regKey, registration] of this.#registrations({ id: repoId })) {
-      if (!watches(registration, event, senderId, viewerId ?? registration.viewerId)) continue;
+      if (!watches(registration, event, senderId, viewerId)) continue;
       this.#queue.enqueue(regKey.slice("reg:".length), id, event, now);
       queued = true;
     }
@@ -380,8 +376,8 @@ export class GitHubHookDriver extends DurableObject<Env> {
   /**
    * Bring `webhook` back to what its hooks need if it no longer matches: deleted, deactivated,
    * pointed elsewhere, sending form-encoded payloads, not verifying this deployment's certificate,
-   * subscribed to other events, or signing with another secret, which GitHub never shows but which
-   * fails deliveries here with 401.
+   * subscribed to other events, or signing with another secret or none: GitHub never shows the
+   * secret, but either fails deliveries here with 401.
    * @returns What GitHub failed to deliver to it lately, oldest first, to ask it to redeliver, as it
    *   never does itself.
    */
@@ -656,8 +652,11 @@ export async function handleWebhookRequest(request: Request, route: string, env:
     return new Response("Not Found", { status: 404 });
   }
   const name = request.headers.get("X-GitHub-Event");
+  if (!name || !request.body) return new Response("Bad Request", { status: 400 });
+  // Refused as a wrong signature is, which has the hourly check restore the webhook's secret:
+  // GitHub drops it when anyone updates the webhook without restating it.
   const signature = request.headers.get("X-Hub-Signature-256");
-  if (!name || !signature || !request.body) return new Response("Bad Request", { status: 400 });
+  if (!signature) return new Response("Unauthorized", { status: 401 });
   // An early refusal, sparing the driver; it enforces the cap itself as it reads.
   if (Number(request.headers.get("Content-Length")) > MAX_DELIVERY_BYTES) {
     return new Response("Payload Too Large", { status: 413 });

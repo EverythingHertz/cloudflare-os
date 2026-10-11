@@ -111,10 +111,15 @@ export class ChatHookDriver extends DurableObject<Env> {
   });
 
   async register(key: string, registration: Registration, capabilities: Capabilities): Promise<void> {
-    const subscription = this.ctx.storage.kv.get<Subscription>(subscriptionKey(registration.authority));
-    if (!subscription || subscription.expireTime <= Date.now()) await this.#subscribe(registration);
-    // Nothing from here to the registration awaits, so a disconnect can't come between them.
     await this.#track(registration.userObjectId, registration.spaceName);
+    const subscription = this.ctx.storage.kv.get<Subscription>(subscriptionKey(registration.authority));
+    if (!subscription || subscription.expireTime <= Date.now()) {
+      await this.#subscribe(registration);
+      // Disconnected meanwhile, when its hooks were dropped.
+      if (this.ctx.storage.kv.get(forgottenKey(registration.userObjectId)) !== undefined) throw new Error(DISCONNECTED);
+    }
+    // Nothing from here to the registration awaits, so neither a disconnect nor the alarm, which
+    // drops an expired subscription no hook uses, can come between the subscription and it.
     const replaced = this.ctx.storage.kv.get<Capabilities>(capabilitiesKey(key));
     this.ctx.storage.kv.put(registrationKey(key), registration);
     this.ctx.storage.kv.put(capabilitiesKey(key), capabilities);
@@ -175,13 +180,15 @@ export class ChatHookDriver extends DurableObject<Env> {
     await this.#trackAccounts();
     const now = Date.now();
     await this.#queue.run(now, (hookKey, message) => this.#deliver(hookKey, message));
-    const registrations = [...this.#registrations()].map(([, registration]) => registration);
     // Listed up front: a request handled while a renewal awaits may list too, which would
-    // invalidate a live iterator.
-    const subscriptions = [...this.ctx.storage.kv.list<Subscription>({ prefix: "sub:" })];
-    for (const [key, subscription] of subscriptions) {
+    // invalidate a live iterator. Each is read again in its turn, as an enable handled meanwhile
+    // may have subscribed again, or come to use it.
+    const keys = [...this.ctx.storage.kv.list<Subscription>({ prefix: "sub:" })].map(([key]) => key);
+    for (const key of keys) {
+      const subscription = this.ctx.storage.kv.get<Subscription>(key);
+      if (!subscription) continue;
       const authority = key.slice("sub:".length);
-      const registration = registrations.find(candidate => candidate.authority === authority);
+      const registration = [...this.#registrations()].find(([, candidate]) => candidate.authority === authority)?.[1];
       if (!registration) {
         // Unused subscriptions simply lapse.
         if (subscription.expireTime <= now) this.ctx.storage.kv.delete(key);
