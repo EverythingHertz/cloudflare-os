@@ -1844,6 +1844,18 @@ it.each<[string, (account: string, triage: ReturnType<typeof binding>) => Promis
   expect(gitlab.webhooks.size).toBe(kept);
 });
 
+it("refuses a first enable that comes as its account is being disconnected, before the tokens are revoked", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+
+  // As GatekeeperUser.revoke() does first, its tokens still live for the moment after.
+  expect(await driver(account).revoke()).toBe(true);
+  await expect(triage.enable()).rejects.toThrow("This GitLab account has been disconnected.");
+  expect(gitlab.webhooks.size).toBe(0);
+});
+
 it("deletes a disconnected account's webhooks and delivers nothing more", async () => {
   const gitlab = new FakeGitLabHooks();
   gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
