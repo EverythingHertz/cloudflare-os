@@ -1463,6 +1463,26 @@ it.each<[string, number, Record<string, string>, boolean]>([
   expect(github.requests).toContain("DELETE /applications/test-client/token");
 });
 
+it("keeps a disconnecting account's token when its hook driver restarts before saying GitHub failed to delete a webhook", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+
+  github.failDeletesWith = 500;
+  await runInDurableObject(driver(account), (_instance, state) => state.storage.kv.put("test:restartAfterRevoke", true));
+  expect(await triage.hooks.revokeAccount(account)).toEqual({
+    error: "GitHub failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
+  });
+  expect(github.requests).not.toContain("DELETE /applications/test-client/token");
+
+  github.failDeletesWith = undefined;
+  await unwrap(triage.hooks.revokeAccount(account));
+  expect(github.webhooks.size).toBe(0);
+  expect(github.requests).toContain("DELETE /applications/test-client/token");
+});
+
 it.each<[string, (github: FakeGitHub) => void]>([
   ["is no longer an admin of the repository", github => { github.admin = false; }],
   // As when the repository's organization has since restricted the account's OAuth app.
