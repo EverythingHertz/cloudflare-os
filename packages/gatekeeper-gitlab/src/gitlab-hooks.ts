@@ -362,8 +362,9 @@ export class GitLabHookDriver extends DurableObject<Env> {
     const kv = this.ctx.storage.kv;
     kv.put("checkAt", Date.now() + CHECK_INTERVAL_MS);
     const account = kv.get<string>("account");
+    if (account === undefined) return;
+    // Undefined while this deployment has hooks turned off, when only deletions go on.
     const url = this.#webhookUrl();
-    if (account === undefined || url === undefined) return;
     const checked: { webhook: Webhook; failed: GitLabWebhookEventResponse[] }[] = [];
     for (const webhook of this.#webhooks()) {
       try {
@@ -375,7 +376,7 @@ export class GitLabHookDriver extends DurableObject<Env> {
           });
           continue;
         }
-        checked.push({ webhook, failed: await this.#checkWebhook(account, url, webhook) });
+        if (url !== undefined) checked.push({ webhook, failed: await this.#checkWebhook(account, url, webhook) });
       } catch (error) {
         // Tried again at the next check.
         logger.warn("failed to check a GitLab webhook", { event: "hooks.webhook.check.failed", error });
@@ -525,9 +526,9 @@ export class GitLabHookDriver extends DurableObject<Env> {
         logger.warn("failed to delete a GitLab webhook, which is tried again", { event: "hooks.webhook.delete.failed", error });
         return;
       }
-      // 404: deleted already.
+      // 404: deleted already. Otherwise, only the project's Maintainers can delete it now.
       if (!(error instanceof GitLabApiError && error.status === 404)) {
-        logger.warn("left a GitLab webhook the account can't delete", { event: "hooks.webhook.delete.abandoned", error });
+        logger.error("left a GitLab webhook the account can't delete", { event: "hooks.webhook.delete.abandoned", error });
       }
     }
     // Only if still this one: a webhook added since, for a later hook, is another's to delete.
