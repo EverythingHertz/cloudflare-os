@@ -229,8 +229,12 @@ export class GitHubHookDriver extends DurableObject<Env> {
   async revoke(): Promise<boolean> {
     const kv = this.ctx.storage.kv;
     const account = kv.get<string>("account");
-    // Never used, or done: a hook enabled from now on fails for want of the account's token.
-    if (account === undefined) return true;
+    if (account === undefined) {
+      // Never used, or done. Refused from now on all the same: a first enable could otherwise come
+      // between this answer and the token's revocation, and add a webhook nothing would delete.
+      kv.put("revoked", true);
+      return true;
+    }
     if (!kv.get("revoked")) {
       // Listed in full before any is deleted. The webhooks, and the account that deletes them, stay
       // until they are gone.
