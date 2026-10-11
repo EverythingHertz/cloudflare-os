@@ -303,6 +303,14 @@ describe("subscribing", () => {
       expect(state.storage.kv.get("sub:post.mention.create")).toBeUndefined());
   });
 
+  it("registers no second webhook while X answers the webhook listing with errors", async () => {
+    const { x } = await watchingMentions();
+    expect(x.webhooks.size).toBe(1);
+    x.on("GET", /^\/2\/webhooks$/, () => json({ errors: [{ title: "Internal Error", type: "about:blank" }] }));
+    expect(await runDurableObjectAlarm(env.X_WEBHOOK_REGISTRY.getByName("deployment"))).toBe(true);
+    expect(x.webhooks.size).toBe(1);
+  });
+
   it("keeps deleting a subscription X failed to delete, though an earlier revocation is delivered again", async () => {
     const { x, hook } = await watchingMentions();
     const revocation = { id: "revoke-1", createdAt: new Date(Date.now() - 1000).toISOString() };

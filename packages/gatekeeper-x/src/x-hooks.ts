@@ -603,6 +603,9 @@ export class XWebhookRegistry extends DurableObject<Env> {
   async #register(url: string): Promise<Webhook> {
     const api = appApi(this.env);
     const listed = await api.get<Webhook[]>("/2/webhooks");
+    // As for subscriptions: errors in place of the listing prove nothing, and taking them for none
+    // would register a second webhook beside the first.
+    if (listed.errors?.length) throw new XApiError(502, "X answered without listing the app's webhooks.");
     const existing = (listed.data ?? []).find(webhook => webhook.url === url);
     if (existing) {
       // Revalidating has X run its challenge again, which re-enables a webhook it gave up on.
