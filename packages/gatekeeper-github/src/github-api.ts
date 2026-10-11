@@ -275,8 +275,9 @@ export class GitHubApiError extends Error {
   details?: unknown;
   isAuthError: boolean;
   /**
-   * Whether GitHub refused the request for a rate limit, primary or secondary: with a 429, or a 403
-   * that its rate-limit headers mark as one, rather than for want of permission.
+   * Whether GitHub refused the request for a rate limit, primary or secondary, rather than for want
+   * of permission: with a 429, or a 403 that its rate-limit headers mark as one, or whose message
+   * does, as GitHub's docs say a secondary limit's may be told by alone.
    */
   rateLimited: boolean;
 
@@ -286,8 +287,8 @@ export class GitHubApiError extends Error {
     this.status = status;
     this.details = details;
     this.isAuthError = status === 401;
-    this.rateLimited = status === 429 ||
-      (status === 403 && (headers?.get("x-ratelimit-remaining") === "0" || headers?.has("retry-after") === true));
+    this.rateLimited = status === 429 || (status === 403 && (headers?.get("x-ratelimit-remaining") === "0" ||
+      headers?.has("retry-after") === true || /\bsecondary rate limit\b/i.test(message)));
   }
 }
 
