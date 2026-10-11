@@ -268,7 +268,9 @@ export class XHookDriver extends DurableObject<Env> {
     if (this.ctx.storage.kv.get("revoked")) return;
     const now = Date.now();
     let queued = false;
-    for (const [regKey, registration] of this.ctx.storage.kv.list<Registration>({ prefix: "reg:" })) {
+    // Read whole: enqueueing lists the queue's own storage, and only one kv.list() iterator can be
+    // live at a time.
+    for (const [regKey, registration] of Array.from(this.ctx.storage.kv.list<Registration>({ prefix: "reg:" }))) {
       if (!watches(registration, event)) continue;
       this.#queue.enqueue(regKey.slice("reg:".length), event.id, event, now);
       queued = true;
