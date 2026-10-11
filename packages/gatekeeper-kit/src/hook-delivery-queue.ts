@@ -31,11 +31,11 @@ type Row<Message> = Pending<Message> | Finished;
 const ROWS = "msg:";
 const rowKey = (hookKey: string, messageId: string) => `${ROWS}${hookKey}:${messageId}`;
 
-// Each row is indexed by when it next needs the queue: a pending one by when it is due, a finished
-// one by when it is forgotten. Index keys order by that time, so a run reads what has come due, and
-// nothing of the day's backlog besides.
+// Each row is indexed by a time that says when it next needs the queue: a pending one by when it is
+// due, a finished one by when it finished, which the dedupe window counts from. Index keys order by
+// that time, so a run reads what has come due, and nothing of the day's backlog besides.
 const DUE = "queue:due:";
-const EXPIRES = "queue:expires:";
+const FINISHED = "queue:finished:";
 /** Set once every row is indexed: rows stored before the indexes existed are indexed once. */
 const INDEXED = "queue:indexed";
 /** A time as index keys order it, in milliseconds: fifteen digits, enough until the year 33658. */
@@ -122,11 +122,13 @@ export class HookDeliveryQueue<Message> {
   async run(now: number, deliver: (hookKey: string, message: Message) => Promise<void>): Promise<void> {
     this.#index();
     // Each list is read in full before the loop below it deletes.
-    const expired = [...this.#kv.list<true>({ prefix: EXPIRES, end: through(EXPIRES, now), limit: MAX_FORGOTTEN_PER_RUN })];
+    const expired = [...this.#kv.list<true>({
+      prefix: FINISHED, end: through(FINISHED, now - DELIVERED_RETENTION_MS), limit: MAX_FORGOTTEN_PER_RUN,
+    })];
     for (const [entry] of expired) {
-      const { key, time } = entryRow(EXPIRES, entry);
+      const { key, time } = entryRow(FINISHED, entry);
       // An entry stays when its row was deleted, and a new one queued under its key.
-      if (this.#filedAt(key) === time) this.#kv.delete(key);
+      if (this.#finishedAt(key) === time) this.#kv.delete(key);
       this.#kv.delete(entry);
     }
     const listed = [...this.#kv.list<true>({ prefix: DUE, end: through(DUE, now), limit: MAX_DELIVERIES_PER_RUN })];
@@ -146,8 +148,9 @@ export class HookDeliveryQueue<Message> {
    */
   nextDue(): number | undefined {
     this.#index();
-    const times = [DUE, EXPIRES].flatMap(index =>
-      [...this.#kv.list<true>({ prefix: index, limit: 1 })].map(([entry]) => entryRow(index, entry).time));
+    const first = (index: string) =>
+      [...this.#kv.list<true>({ prefix: index, limit: 1 })].map(([entry]) => entryRow(index, entry).time);
+    const times = [...first(DUE), ...first(FINISHED).map(finishedAt => finishedAt + DELIVERED_RETENTION_MS)];
     return times.length === 0 ? undefined : Math.min(...times);
   }
 
@@ -180,10 +183,10 @@ export class HookDeliveryQueue<Message> {
     }
   }
 
-  /** When finished row `key` is to be forgotten, if it is a finished row. */
-  #filedAt(key: string): number | undefined {
+  /** When row `key` finished, if it is a finished row. */
+  #finishedAt(key: string): number | undefined {
     const row = this.#kv.get<Row<Message>>(key);
-    return row && "deliveredAt" in row ? row.deliveredAt + DELIVERED_RETENTION_MS : undefined;
+    return row && "deliveredAt" in row ? row.deliveredAt : undefined;
   }
 
   #putPending(key: string, row: Pending<Message>): void {
@@ -196,7 +199,7 @@ export class HookDeliveryQueue<Message> {
     const row = this.#kv.get<Row<Message>>(key);
     if (row && !("deliveredAt" in row)) this.#kv.delete(entryKey(DUE, row.at, key));
     this.#kv.put<Finished>(key, { deliveredAt });
-    this.#kv.put(entryKey(EXPIRES, deliveredAt + DELIVERED_RETENTION_MS, key), true);
+    this.#kv.put(entryKey(FINISHED, deliveredAt, key), true);
   }
 
   /** Index rows stored before the indexes existed, once. */
@@ -204,7 +207,7 @@ export class HookDeliveryQueue<Message> {
     if (this.#kv.get(INDEXED) !== undefined) return;
     const rows = [...this.#kv.list<Row<Message>>({ prefix: ROWS })];
     for (const [key, row] of rows) {
-      if ("deliveredAt" in row) this.#kv.put(entryKey(EXPIRES, row.deliveredAt + DELIVERED_RETENTION_MS, key), true);
+      if ("deliveredAt" in row) this.#kv.put(entryKey(FINISHED, row.deliveredAt, key), true);
       else this.#kv.put(entryKey(DUE, row.at, key), true);
     }
     this.#kv.put(INDEXED, true);

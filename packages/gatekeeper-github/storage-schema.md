@@ -204,8 +204,9 @@ One per connected account, named by its `UserAccount` id; see `src/github-hooks.
 - `msg:<hookKey>:<eventId>` -> the kit's `HookDeliveryQueue` rows, named by the digest of the
   event's payload: an event pending delivery to one hook, or a finished one kept for a day to
   collapse redeliveries.
-- `queue:due:<time>:<hookKey>:<eventId>`, `queue:expires:<time>:<hookKey>:<eventId>` and
-  `queue:indexed` -> the queue's indexes of those rows, by when each is next due or forgotten.
+- `queue:due:<time>:<hookKey>:<eventId>`, `queue:finished:<time>:<hookKey>:<eventId>` and
+  `queue:indexed` -> the queue's indexes of those rows: by when each pending one is next due, and
+  when each finished one finished, which the dedupe window counts from.
 - `revoked` -> set, with every other key deleted, once the account is disconnected.
 
 ## Simulation model

@@ -7,8 +7,8 @@ import { fakeKv, type FakeKv } from "./fake-kv";
 const MINUTE = 60_000;
 /** Set once the queue has indexed its rows (see the module's storage notes). */
 const INDEXED = "queue:indexed";
-/** What a finished `m1` leaves: its row, and the index entry that forgets it a day later. */
-const FINISHED_M1 = ["msg:hook:m1", expect.stringMatching(/^queue:expires:\d{15}:hook:m1$/), INDEXED];
+/** What a finished `m1` leaves: its row, and the index entry by which it is forgotten a day later. */
+const FINISHED_M1 = ["msg:hook:m1", expect.stringMatching(/^queue:finished:\d{15}:hook:m1$/), INDEXED];
 
 describe("HookDeliveryQueue", () => {
   beforeEach(() => {
