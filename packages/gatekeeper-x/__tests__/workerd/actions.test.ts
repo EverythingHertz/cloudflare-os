@@ -400,6 +400,18 @@ describe("engagement", () => {
     expect(t.x.following.size + t.x.muting.size).toBe(0);
   });
 
+  it("won't revert a follow whose prior state X left out of its answer", async () => {
+    const t = await setup();
+    t.x.following.add(`${ALICE.id}:${BOB.id}`);
+    // X describes Bob without the relationship, as a partial error can.
+    t.x.on("GET", new RegExp(`^/2/users/${BOB.id}(\\?|$)`), () => json({ data: { ...BOB } }));
+    await t.run([["getUser", "bob"], ["follow"]]);
+    const [{ actionId }] = await t.submitted();
+    unwrap(await t.apply(actionId));
+    expect(unwrap(await t.revert(actionId))).toMatchObject({ canRetry: false });
+    expect([...t.x.following]).toEqual([`${ALICE.id}:${BOB.id}`]);
+  });
+
   it("keeps a follow and a mute that were already there when undoing actions that changed nothing", async () => {
     const t = await setup();
     t.x.following.add(`${ALICE.id}:${BOB.id}`);
@@ -471,6 +483,20 @@ describe("Lists", () => {
     expect(await t.run([["getList", "~1"], ["getInfo"]])).toMatchObject({ id: lists[0].id });
   });
 
+  it("won't create a List again while X may not list the first yet", async () => {
+    const t = await setup();
+    await t.run([["createList", "Friends"]]);
+    t.x.loseAnswer("POST", /^\/2\/lists$/);
+    // X's owned Lists lag: the List is missing from the look before the send and the next two.
+    let looks = 0;
+    t.x.on("GET", /\/owned_lists/, () => ++looks <= 3 ? json({ meta: { result_count: 0 } }) : undefined);
+    const [{ actionId }] = await t.submitted();
+    expect(failure(await t.apply(actionId))).toMatch(/did not confirm whether this List was created/);
+    expect(failure(await t.apply(actionId))).toMatch(/doesn't show this List yet/);
+    unwrap(await t.apply(actionId));
+    expect(t.x.lists.size).toBe(1);
+  });
+
   it("won't create a lost List again while X answers the check with errors", async () => {
     const t = await setup();
     await t.run([["createList", "Friends"]]);
@@ -491,6 +517,7 @@ describe("Lists", () => {
 
   it("never binds a List just like it that was there before the first create", async () => {
     const t = await setup();
+    vi.useFakeTimers({ toFake: ["Date"] });
     t.x.lists.set("6", { id: "6", name: "Friends", private: false, owner_id: ALICE.id, created_at: new Date().toISOString() });
     await t.run([["createList", "Friends"]]);
     let failed = false;
@@ -501,14 +528,17 @@ describe("Lists", () => {
     });
     const [{ actionId }] = await t.submitted();
     expect(failure(await t.apply(actionId))).toMatch(/did not confirm whether this List was created/);
+    expect(failure(await t.apply(actionId))).toMatch(/doesn't show this List yet/);
+    vi.setSystemTime(Date.now() + 6 * 60 * 1000);
     unwrap(await t.apply(actionId));
     expect([...t.x.lists.keys()]).toHaveLength(2);
     unwrap(await t.revert(actionId));
     expect([...t.x.lists.keys()]).toEqual(["6"]);
   });
 
-  it("won't let a List X may have created be rejected, and creates it on the next approval if it didn't", async () => {
+  it("won't let a List X may have created be rejected, and creates it once X has had time to list it", async () => {
     const t = await setup();
+    vi.useFakeTimers({ toFake: ["Date"] });
     // A List of the same name from long ago is not the one this action created.
     t.x.lists.set("5", { id: "5", name: "Friends", owner_id: ALICE.id, created_at: "2020-01-01T00:00:00.000Z" });
     await t.run([["createList", "Friends"]]);
@@ -521,6 +551,8 @@ describe("Lists", () => {
     const [{ actionId }] = await t.submitted();
     expect(failure(await t.apply(actionId))).toMatch(/did not confirm whether this List was created/);
     expect(failure(await t.reject(actionId))).toMatch(/never confirmed whether this List was created/);
+    expect(failure(await t.apply(actionId))).toMatch(/doesn't show this List yet/);
+    vi.setSystemTime(Date.now() + 6 * 60 * 1000);
     unwrap(await t.apply(actionId));
     expect([...t.x.lists.values()].map(list => list.name)).toEqual(["Friends", "Friends"]);
     unwrap(await t.revert(actionId));

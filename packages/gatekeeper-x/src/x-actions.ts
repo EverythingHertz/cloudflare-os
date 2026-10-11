@@ -164,8 +164,8 @@ export type XActionHost = {
    * what to restore.
    */
   previous: {
-    get(id: number): ListDetails | boolean | undefined;
-    put(id: number, before: ListDetails | boolean): void;
+    get(id: number): ListDetails | boolean | "unknown" | undefined;
+    put(id: number, before: ListDetails | boolean | "unknown"): void;
     delete(id: number): void;
   };
   /** A send whose outcome X never reported, keyed by action and post index (0 for a List). */
@@ -359,19 +359,23 @@ function refuse(error: unknown, what: string): never {
  * Whether the account already followed or muted `userId`, so a revert restores that rather than
  * undoing a change that made none: read from X once, before the action's first effect, and kept for
  * its retries, which would otherwise read that effect back. A follow request already sent counts as
- * a follow.
+ * a follow. X can return the user without `connection_status` (a partial error), which says
+ * nothing: that is kept as unknown too, and the action then can't be reverted.
  */
 async function stateBefore(host: XActionHost, actionId: number, userId: string,
-                           relationship: "following" | "muting"): Promise<boolean> {
+                           relationship: "following" | "muting"): Promise<boolean | undefined> {
   const recorded = host.previous.get(actionId);
   if (typeof recorded === "boolean") return recorded;
+  if (recorded === "unknown") return undefined;
   const user = requireData(await host.read<WireUser>(1, api => api.get<WireUser>(`/2/users/${userId}`, {
     "user.fields": "connection_status",
   })), "user");
-  const status = user.connection_status ?? [];
-  const before = status.includes(relationship) || (relationship === "following" && status.includes("follow_request_sent"));
+  const status = user.connection_status;
+  const before = Array.isArray(status)
+    ? status.includes(relationship) || (relationship === "following" && status.includes("follow_request_sent"))
+    : "unknown";
   host.previous.put(actionId, before);
-  return before;
+  return before === "unknown" ? undefined : before;
 }
 
 async function toggle(host: XActionHost, op: (api: XApi, me: StoredIdentity) => Promise<unknown>,
@@ -425,10 +429,10 @@ function windowClosed(attempt: SendAttempt): boolean {
  * to show a new post. It fails the apply, keeping the attempt, so an approval after `conclusive`
  * looks again rather than sending a second.
  */
-function notShownYet(conclusive: number): Error {
+function notShownYet(conclusive: number, what: "post" | "List"): Error {
   const after = new Date(Math.ceil(conclusive / 60_000) * 60_000).toISOString().slice(11, 16);
-  return new Error("X doesn't show this post yet, and one it made can take a few minutes to appear, so it " +
-    `wasn't sent again. Approve it again after ${after} UTC to look once more.`);
+  return new Error(`X doesn't show this ${what} yet, and one it made can take a few minutes to appear, so it ` +
+    `wasn't ${what === "post" ? "sent" : "created"} again. Approve it again after ${after} UTC to look once more.`);
 }
 
 /**
@@ -538,7 +542,7 @@ async function publishOne(host: XActionHost, draft: StoredDraft, replyTo: string
       host.attempts.delete(attemptKey);
       return landed;
     }
-    if (!conclusive) throw notShownYet(prior.at + RECONCILE_WINDOW_MS + CLOCK_SKEW_MS);
+    if (!conclusive) throw notShownYet(prior.at + RECONCILE_WINDOW_MS + CLOCK_SKEW_MS, "post");
   }
 
   const mediaIds: string[] = [];
@@ -918,7 +922,12 @@ export const actions = defineActions<XActionHost, XActions>({
     apply: async (payload, host, ctx) => {
       const attemptKey = `${ctx.id}:0`;
       const prior = host.attempts.get(attemptKey);
+      // Judged before the look, as for a post: X can take minutes to list a new List.
+      const conclusive = prior !== undefined && windowClosed(prior);
       let createdId = prior && await findCreatedList(host, payload, prior);
+      if (createdId === undefined && prior !== undefined && !conclusive) {
+        throw notShownYet(prior.at + RECONCILE_WINDOW_MS + CLOCK_SKEW_MS, "List");
+      }
       if (createdId === undefined) {
         // Lists can share every detail, so those already there are noted before the first send.
         const existing = prior?.existing ?? (await matchingLists(host, payload)).map(list => list.id);
