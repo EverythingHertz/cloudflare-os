@@ -1406,6 +1406,16 @@ it("refuses to watch a repository whose webhooks the account can't manage", asyn
     "account is not one.");
 });
 
+it("revokes a disconnected account's token even when its hook driver can't be reached", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  await runInDurableObject(driver(account), (_instance, state) => state.storage.kv.put("test:unreachable", true));
+
+  // Disconnecting fails, as it should, but not before the token is revoked.
+  expect(await binding(account).hooks.revokeAccount(account)).toEqual({ error: "The test hook driver can't be reached." });
+  expect(github.requests).toContain("DELETE /applications/test-client/token");
+});
+
 it("deletes a disconnected account's webhooks and delivers nothing more", async () => {
   const github = new FakeGitHub();
   const account = await connectAccount();
