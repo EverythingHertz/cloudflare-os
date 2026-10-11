@@ -111,10 +111,15 @@ export class ChatHookDriver extends DurableObject<Env> {
   });
 
   async register(key: string, registration: Registration, capabilities: Capabilities): Promise<void> {
-    const subscription = this.ctx.storage.kv.get<Subscription>(subscriptionKey(registration.authority));
-    if (!subscription || subscription.expireTime <= Date.now()) await this.#subscribe(registration);
-    // Nothing from here to the registration awaits, so a disconnect can't come between them.
     await this.#track(registration.userObjectId, registration.spaceName);
+    const subscription = this.ctx.storage.kv.get<Subscription>(subscriptionKey(registration.authority));
+    if (!subscription || subscription.expireTime <= Date.now()) {
+      await this.#subscribe(registration);
+      // Disconnected meanwhile, when its hooks were dropped.
+      if (this.ctx.storage.kv.get(forgottenKey(registration.userObjectId)) !== undefined) throw new Error(DISCONNECTED);
+    }
+    // Nothing from here to the registration awaits, so neither a disconnect nor the alarm, which
+    // drops an expired subscription no hook uses, can come between the subscription and it.
     const replaced = this.ctx.storage.kv.get<Capabilities>(capabilitiesKey(key));
     this.ctx.storage.kv.put(registrationKey(key), registration);
     this.ctx.storage.kv.put(capabilitiesKey(key), capabilities);
