@@ -131,15 +131,18 @@ account is a Maintainer or Owner of the project. An account's hooks on one proje
 webhook, which is deleted when the last of them is disabled, or when the account is disconnected.
 Should GitLab fail to delete it, the hourly check tries again, and a disconnect that leaves it
 fails, keeping the account connected, with the tokens that can delete it, until disconnecting again
-finds it gone. Each webhook signs its deliveries with its own signing token, which only GitLab and this deployment
-hold (Standard Webhooks, which GitLab added in 19.0; the older secret token is sent in the clear,
-so it is not used): a delivery whose signature or timestamp doesn't check out is refused, as is one
-naming a project other than the one whose webhook signed it, and one GitLab repeats is ignored. A
-project's Maintainers can still have GitLab sign anything, through a custom template, so a comment
-is delivered as GitLab has it, read back by its id. An event is delivered only while the account
-can still read the issue, merge request or repository it concerns, which the project alone doesn't
-show: a Guest of a private project reads it, but not its merge requests or code. The webhook never
-asks for confidential issues or internal comments.
+finds it gone. Each webhook signs its deliveries with its own signing token, which only GitLab and
+this deployment hold (Standard Webhooks, which GitLab added in 19.0; the older secret token is sent
+in the clear, so it is not used): a delivery whose signature or timestamp doesn't check out is
+refused, as is one naming a project other than the one whose webhook signed it, and one GitLab
+repeats is ignored. A project's Maintainers can still have GitLab sign anything, through a custom
+template, which the hourly check removes but they can add again. So a comment is delivered as
+GitLab has it, read back by its id, and only once, while it is new; an issue's or merge request's
+details are read from GitLab too, but which one changed, how, and by whom are as the webhook
+reported them, as is everything about a review or push. An event is delivered only while the
+account can still read the issue, merge request or repository it concerns, which the project alone
+doesn't show: a Guest of a private project reads it, but not its merge requests or code. The
+webhook never asks for confidential issues or internal comments.
 
 The project's other Maintainers can see the webhook, though not its token. Every hour the worker
 checks each webhook on GitLab, and restores one that someone has deleted, pointed elsewhere,

@@ -842,13 +842,17 @@ export type GitLabEventKind = GitLabEvent["kind"];
 export type GitLabEventBase = {
   /** The event's id: the same for each delivery of it. */
   id: string;
-  /** Who caused the event, when GitLab names someone. */
+  /**
+   * Who caused the event, when GitLab names someone: for a comment, its author as GitLab has it;
+   * otherwise, as the webhook reported it.
+   */
   actor: GitLabActor | null;
 }
 
 /** An issue was opened, closed, or reopened. */
 export type GitLabIssueEvent = GitLabEventBase & {
   kind: "issue";
+  /** As the webhook reported it. */
   action: "opened" | "closed" | "reopened";
   /** The issue as GitLab reports it when the event is delivered, which may be after later changes. */
   info: GitLabIssueDetails;
@@ -859,7 +863,10 @@ export type GitLabIssueEvent = GitLabEventBase & {
 /** A merge request was opened, closed, merged, reopened, marked ready, or pushed to. */
 export type GitLabMergeRequestEvent = GitLabEventBase & {
   kind: "mergeRequest";
-  /** `readyForReview` means it stopped being a draft; `pushed` that its source branch moved. */
+  /**
+   * As the webhook reported it: `readyForReview` means it stopped being a draft; `pushed` that its
+   * source branch moved.
+   */
   action: "opened" | "closed" | "merged" | "reopened" | "readyForReview" | "pushed";
   /** The merge request as GitLab reports it when the event is delivered, which may be after later changes. */
   info: GitLabMergeRequestDetails;
@@ -925,7 +932,7 @@ export type GitLabTagEvent = GitLabEventBase & {
   project: GitLabProject;
 }
 
-/** The issue or merge request a comment or review event concerns, as of the event. */
+/** The issue or merge request a comment or review event concerns, as GitLab has it when the event is delivered. */
 export type GitLabEventSubject = GitLabIssuableRef & {
   /** Whether it is an issue or a merge request: GitLab numbers them separately. */
   kind: "issue" | "mergeRequest";

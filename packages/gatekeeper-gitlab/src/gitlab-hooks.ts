@@ -295,7 +295,8 @@ export class GitLabHookDriver extends DurableObject<Env> {
     // A webhook still being added, or that failed to be: no hook watches it yet.
     if (!kv.get(webhookKey(projectId))) return 404;
     // The signed id names the event, so a retry, a resend, or a replay inside the signature's
-    // tolerance collapses into its first delivery.
+    // tolerance collapses into its first delivery; and a comment is named by its own id too, so
+    // that one a template has GitLab announce again collapses as well.
     const parsed = parseWebhookEvent(delivery.event, delivery.id, projectId, payload, instanceUrl(this.env));
     if (!parsed) return 204;
     const { event, senderId } = parsed;
@@ -317,7 +318,7 @@ export class GitLabHookDriver extends DurableObject<Env> {
     let queued = false;
     for (const [regKey, registration] of this.#registrations({ id: projectId })) {
       if (!watches(registration, event, senderId, viewerId)) continue;
-      this.#queue.enqueue(regKey.slice("reg:".length), delivery.id, event, now);
+      this.#queue.enqueue(regKey.slice("reg:".length), event.kind === "comment" ? `note:${event.noteId}` : delivery.id, event, now);
       queued = true;
     }
     if (queued) await this.#wakeBy(now);

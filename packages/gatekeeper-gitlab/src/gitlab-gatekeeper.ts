@@ -33,6 +33,7 @@ import {
   type TreeDiffSource,
 } from "@gadgets/gatekeeper-kit/git-diff";
 import { commitDetailsFromGitObject, isCommitOid, parseGitCommitPayload } from "@gadgets/gatekeeper-kit/git-objects";
+import { DELIVERED_RETENTION_MS } from "@gadgets/gatekeeper-kit/hook-delivery-queue";
 import { asVerifier } from "@gadgets/gatekeeper-kit/observers";
 import {
   GitRefUpdateRejectedError,
@@ -1591,7 +1592,9 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
    * The comment a comment event names, as GitLab has it now: a custom template lets the project's
    * Maintainers have GitLab sign any payload, so a payload's words and author prove nothing.
    * Undefined if GitLab no longer has it, or it is not a person's, is internal, or is the account's
-   * own, which a hook would answer: whoever the account is now, which a reconnect can change.
+   * own, which a hook would answer: whoever the account is now, which a reconnect can change. Or if
+   * it was posted longer ago than the driver remembers a comment it delivered: GitLab announces a
+   * comment as it is posted, so that is an old one a template announced again.
    */
   async #readNote({ target, noteId, discussionId }: Extract<GitLabWebhookEvent, { kind: "comment" }>):
       Promise<GitLabNoteResponse | undefined> {
@@ -1601,7 +1604,8 @@ export class GitLabGatekeeperImpl extends DurableObject<Env, GitLabGatekeeperImp
       this.#userAccount().getUser(),
     ]);
     const note = discussion.notes.find(found => found.id === noteId);
-    if (!note || note.system || note.internal || note.author?.id === user.id) {
+    if (!note || note.system || note.internal || note.author?.id === user.id ||
+        Date.parse(note.created_at) < Date.now() - DELIVERED_RETENTION_MS) {
       logger.info("dropped a GitLab comment event that GitLab's record of the comment does not bear out", {
         event: "hooks.delivery.unconfirmed",
       });

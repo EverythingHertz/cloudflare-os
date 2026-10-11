@@ -799,6 +799,28 @@ it("gives a comment's event the comment as GitLab has it, never as its payload c
   expect(gitlab.gitlab.requests.slice(asked)).toEqual([]);
 });
 
+it("delivers a comment once, while it is new, however often a template has GitLab announce it", async () => {
+  const gitlab = new FakeGitLabHooks();
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe({ events: ["comment"] });
+  await triage.enable();
+
+  // A comment, announced as it is posted, and then again by a template, under a fresh delivery id.
+  await gitlab.deliver("Note Hook", noteHook("Issue", 42, "It still crashes.", { id: 7 }));
+  await gitlab.deliver("Note Hook", noteHook("Issue", 42, "It still crashes.", { id: 7 }));
+  // One posted two days ago, which only a template would announce now.
+  const old = noteHook("Issue", 42, "From last week.", { id: 9 });
+  (old.object_attributes as Row).created_at = new Date(Date.now() - 2 * 24 * HOUR).toISOString();
+  gitlab.keepNote(old);
+  await gitlab.deliver("Note Hook", noteHook("Issue", 42, "From last week.", { id: 9 }), { kept: false });
+  await settled(account);
+
+  expect((await triage.read()).received).toEqual([expect.objectContaining({
+    comment: expect.objectContaining({ id: "7", bodyMarkdown: "It still crashes." }),
+  })]);
+});
+
 it("gives a hook on one issue only that issue's events, never the merge request numbered alike", async () => {
   const gitlab = new FakeGitLabHooks();
   const account = await connectAccount();
