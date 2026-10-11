@@ -610,10 +610,14 @@ function configuredTriggers(webhook: GitLabProjectWebhookResponse): string[] {
 
 /**
  * Whether a request GitLab failed may succeed if made again: GitLab erred or limited it, or never
- * answered, rather than refusing it, and the account's token still works.
+ * answered, rather than refusing it, and the account's token still works. A redirect is GitLab not
+ * answering: an access proxy in front of it, such as Cloudflare Access without a valid service
+ * token, turning the request away to a login page.
  */
 function retryable(error: unknown): boolean {
-  if (error instanceof GitLabApiError) return error.status >= 500 || error.status === 429;
+  if (error instanceof GitLabApiError) {
+    return error.status >= 500 || error.status === 429 || (error.status >= 300 && error.status < 400);
+  }
   // A confirmed expiry, which withAccountApi() wraps.
   return !isCredentialsExpired((error as { cause?: unknown } | undefined)?.cause);
 }

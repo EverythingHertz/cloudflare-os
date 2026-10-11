@@ -1606,11 +1606,13 @@ it("revokes a disconnected account's tokens even when its hook driver can't be r
   expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
 });
 
-it.each<[string, boolean]>([
-  ["fails to delete", false],
+it.each<[string, number, boolean]>([
+  ["GitLab fails to delete one", 500, false],
   // Asked again, GitLab has no such webhook.
-  ["loses its answer to deleting", true],
-])("keeps a disconnecting account connected, with its tokens, until its webhooks are gone, when GitLab %s one", async (_, deleted) => {
+  ["GitLab loses its answer to deleting one", 500, true],
+  // As Cloudflare Access does in GitLab's stead, without a valid service token.
+  ["a proxy redirects the deletion of one", 302, false],
+])("keeps a disconnecting account connected, with its tokens, until its webhooks are gone, when %s", async (_, status, deleted) => {
   const gitlab = new FakeGitLabHooks();
   gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
   const account = await connectAccount();
@@ -1619,7 +1621,7 @@ it.each<[string, boolean]>([
   await triage.enable();
   const [webhook] = gitlab.webhooks.values();
 
-  gitlab.failDeletesWith = 500;
+  gitlab.failDeletesWith = status;
   gitlab.deleteDespiteFailure = deleted;
   expect(await triage.hooks.revokeAccount(account)).toEqual({
     error: "GitLab failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
