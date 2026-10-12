@@ -1528,6 +1528,8 @@ it("keeps a disconnecting account's token when its hook driver restarts before s
 
 it.each<[string, (github: FakeGitHub) => void]>([
   ["is no longer an admin of the repository", github => { github.admin = false; }],
+  // At once, without a disconnect failing for want of the token first.
+  ["has lost its token, as GitHub's refusal shows", github => { github.failDeletesWith = 401; }],
   // As when the repository's organization has since restricted the account's OAuth app.
   ["is refused by GitHub", github => { github.failDeletesWith = 403; }],
 ])("lets a disconnect finish without a webhook the account can no longer delete, as when it %s", async (_, refuse) => {

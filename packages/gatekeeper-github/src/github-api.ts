@@ -1,4 +1,4 @@
-import { isCredentialsExpired, type RefreshCredentials } from "@gadgets/gatekeeper-kit/credentials";
+import { CredentialsExpiredError, isCredentialsExpired, type RefreshCredentials } from "@gadgets/gatekeeper-kit/credentials";
 import {
   isInvalidGrant, mergeOAuthTokens, OAuthClient, oauthRefresh,
 } from "@gadgets/gatekeeper-kit/oauth-client";
@@ -1611,7 +1611,13 @@ export async function withAccountApi<T>(
         throw error;
       }
       const verdict = await account.reportTokenRejected(presented);
-      if (verdict === "expired") throw new Error(CREDENTIALS_EXPIRED_MESSAGE, { cause: error });
+      if (verdict === "expired") {
+        // Shaped like the known expiry above: the marked error as its cause is how callers tell an
+        // expiry from a token renewed mid-request.
+        // oxlint-disable-next-line eslint/preserve-caught-error -- kept as the marked error's cause.
+        throw new Error(CREDENTIALS_EXPIRED_MESSAGE,
+          { cause: new CredentialsExpiredError(CREDENTIALS_EXPIRED_MESSAGE, { cause: error }) });
+      }
       if (verdict !== "superseded") throw error;
       if (replays > 0) continue;
       throw new Error("GitHub credentials were renewed during this request. Please retry it.",
