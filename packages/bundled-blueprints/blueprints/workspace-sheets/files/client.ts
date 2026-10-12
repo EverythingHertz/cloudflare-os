@@ -4622,7 +4622,7 @@ function formulaRangesFollowCut(value: string, formulaSheetId: string, cutSheetI
 }
 // Cuts follow cell identities, not relative offsets. Resolve against the original sheet before
 // rebasing a moved formula, and retain lock flags for subsequent copies and fills.
-function remapCutFormula(value: string, formulaSourceSheetId: string, formulaTargetSheetId: string, cutSheetId: string, moves: Map<string, { sheetId: string; ref: string }>, unchangedSources: Set<string>): string {
+function remapCutFormula(value: string, formulaSourceSheetId: string, formulaTargetSheetId: string, cutSheetId: string, moves: Map<string, { sheetId: string; ref: string }>, unchangedSources: Set<string>, sheetPrefixes: Map<string, string>): string | null {
   let result = "", start = 0;
   for (const reference of formulaReferences(value)) {
     let replacement = "", end = 0, referencedSheetId = formulaSourceSheetId, resultSheetId = formulaTargetSheetId;
@@ -4638,7 +4638,20 @@ function remapCutFormula(value: string, formulaSourceSheetId: string, formulaTar
         const ref = parseRef(destination?.ref || sourceRef);
         const locks = /^(\$?)[A-Z]+(\$?)\d+$/i.exec(body);
         if (ref && locks) {
-          const prefix = sheetId === resultSheetId && bang < 0 ? "" : "'" + model.sheets[sheetId].name.replace(/'/g, "''") + "'!";
+          let prefix = "";
+          if (sheetId !== resultSheetId || bang >= 0) {
+            const cached = sheetPrefixes.get(sheetId);
+            if (cached !== undefined) prefix = cached;
+            else {
+              prefix = "'" + model.sheets[sheetId].name.replace(/'/g, "''") + "'!";
+              // Retain the existing quote grammar; never persist a qualifier it reads as text.
+              try {
+                const ast = parseFormula(prefix + "A1");
+                if (ast.k !== "ref" || ast.ref !== prefix + "A1") return null;
+              } catch (error) { if (isErr(error)) return null; throw error; }
+              sheetPrefixes.set(sheetId, prefix);
+            }
+          }
           text = prefix + locks[1] + colToLetter(ref.c) + locks[2] + (ref.r + 1);
         }
       }
@@ -4679,7 +4692,8 @@ const sourceHeight = useSnapshot?.cells.length ?? values!.length;
 const sourceWidth = Math.max(1, ...(useSnapshot?.cells ?? values!).map((row) => row.length));
 const targetRanges = selectionRanges();
 const destinationRefs = new Set();
-if (moving && useSnapshot) {
+const formulaUpdates: { sheetId: string; ref: string; value: string }[] | null = moving ? [] : null;
+if (moving && useSnapshot && formulaUpdates) {
   // Build the exact clipped, single-use move map before touching destinations or history.
   for (const target of targetRanges) for (let i = 0; i < sourceHeight; i++) for (let j = 0; j < sourceWidth; j++) {
     const row = target.r1 + i, column = target.c1 + j;
@@ -4694,13 +4708,24 @@ if (moving && useSnapshot) {
   }
   const rangeMoves = indexCutRangeMoves(useSnapshot.sheetId, moves, unchangedSources);
   const rangeChecks = new Map<string, boolean>();
+  const sheetPrefixes = new Map<string, string>();
+  const qualifierError = "Cannot cut formulas requiring a sheet qualifier unsupported by the formula grammar; rename the sheet and retry";
   let safe = true;
   for (const row of useSnapshot.cells) for (const snapshot of row) {
-    if (snapshot?.value?.startsWith("=") && moves.has(snapshot.sourceRef) && !formulaRangesFollowCut(snapshot.value, useSnapshot.sheetId, useSnapshot.sheetId, rangeMoves, rangeChecks)) safe = false;
+    const destination = snapshot && moves.get(snapshot.sourceRef);
+    if (!snapshot?.value?.startsWith("=") || !destination) continue;
+    if (!formulaRangesFollowCut(snapshot.value, useSnapshot.sheetId, useSnapshot.sheetId, rangeMoves, rangeChecks)) { safe = false; continue; }
+    const value = remapCutFormula(snapshot.value, useSnapshot.sheetId, destination.sheetId, useSnapshot.sheetId, moves, unchangedSources, sheetPrefixes);
+    if (value === null) { saveStatus.set("bad", qualifierError); return; }
+    if (value !== snapshot.value) formulaUpdates.push({ sheetId: destination.sheetId, ref: destination.ref, value });
   }
   for (const sheetId of model.sheetOrder) for (const [ref, cell] of Object.entries(model.cells[sheetId] || {})) {
     if (destinationRefs.has(sheetId + "!" + ref) || sheetId === useSnapshot.sheetId && unchangedSources.has(ref) && moves.has(ref)) continue;
-    if (cell.value?.startsWith("=") && !formulaRangesFollowCut(cell.value, sheetId, useSnapshot.sheetId, rangeMoves, rangeChecks)) safe = false;
+    if (!cell.value?.startsWith("=")) continue;
+    if (!formulaRangesFollowCut(cell.value, sheetId, useSnapshot.sheetId, rangeMoves, rangeChecks)) { safe = false; continue; }
+    const value = remapCutFormula(cell.value, sheetId, sheetId, useSnapshot.sheetId, moves, unchangedSources, sheetPrefixes);
+    if (value === null) { saveStatus.set("bad", qualifierError); return; }
+    if (value !== cell.value) formulaUpdates.push({ sheetId, ref, value });
   }
   if (!safe) { saveStatus.set("bad", "Cannot cut part of a referenced range; move the whole range together"); return; }
 }
@@ -4742,18 +4767,14 @@ for (const target of targetRanges) {
     }
   }
 }
-if (moving && useSnapshot) {
+if (moving && useSnapshot && formulaUpdates) {
   // Clear only unchanged sources that were actually pasted, never an overlapping destination.
   for (const sourceRef of moves.keys()) {
     if (unchangedSources.has(sourceRef) && !destinationRefs.has(useSnapshot.sheetId + "!" + sourceRef)) clearStoredCell(useSnapshot.sheetId, sourceRef);
   }
-  // The complete map is known only after all destinations are written. Both moved formulas and
-  // formulas elsewhere in the workbook must follow references into cells actually removed.
-  for (const sheetId of model.sheetOrder) for (const [ref, cell] of Object.entries(model.cells[sheetId] || {})) {
-    if (!cell.value?.startsWith("=")) continue;
-    const formulaSourceSheetId = destinationRefs.has(sheetId + "!" + ref) ? useSnapshot.sheetId : sheetId;
-    const value = remapCutFormula(cell.value, formulaSourceSheetId, sheetId, useSnapshot.sheetId, moves, unchangedSources);
-    if (value === cell.value) continue;
+  // Apply reference rewrites checked against the original workbook before changing any cells.
+  for (const { sheetId, ref, value } of formulaUpdates) {
+    const cell = model.cells[sheetId][ref];
     recordCell(sheetId, ref);
     cell.value = value;
     queueCellOp(sheetId, ref, value, cell.fmt, cell.version || 0);

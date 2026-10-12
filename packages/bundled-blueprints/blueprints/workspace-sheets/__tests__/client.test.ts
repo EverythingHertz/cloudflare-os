@@ -103,6 +103,57 @@ const pivotOption = (value: string) => [...document.querySelectorAll<HTMLLabelEl
   .find(label => label.querySelector("span")?.textContent === value)!.querySelector<HTMLInputElement>("input")!;
 
 describe("Sheets client regressions", () => {
+  it("rejects an unrepresentable generated sheet qualifier before mutation and retains the cut for retry", async () => {
+    initial.sheets.sheet.name = "Data\\";
+    initial.cells.sheet.A1.value = "=A2";
+    initial.cells.sheet.A2.value = "42";
+    initial.cells.other.A1 = { value: "Destination", fmt: null, version: 1 };
+    initial.sheets.sheet.comments = [{ id: "source-comment", ref: "A1", text: "Source comment", createdAt: 1, resolved: false }];
+    initial.sheets.other.comments = [{ id: "destination-comment", ref: "A1", text: "Destination comment", createdAt: 1, resolved: false }];
+    await mount();
+    const clipboard = new Map<string, string>();
+    const transfer = (type: "cut" | "paste") => {
+      const event = new Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", { value: {
+        setData: (format: string, value: string) => clipboard.set(format, value),
+        getData: (format: string) => clipboard.get(format) || "",
+      } });
+      element(".grid-scroll").dispatchEvent(event);
+    };
+    select("A1");
+    transfer("cut");
+    element<HTMLElement>('.tab[data-id="other"]').click();
+    await frame();
+    select("A1");
+    transfer("paste");
+    await frame();
+    expect(cell("A1").querySelector(".cv")!.textContent).toBe("Destination");
+    expect(cell("A1").querySelector(".cell-comment-tooltip")!.textContent).toBe("Destination comment");
+    expect(element<HTMLButtonElement>('button[title="Undo (Ctrl+Z)"]').disabled).toBe(true);
+    expect(element<HTMLButtonElement>('button[title="Redo (Ctrl+Y)"]').disabled).toBe(true);
+    element<HTMLElement>('.tab[data-id="sheet"]').click();
+    await frame();
+    expect(cell("A1").querySelector(".cv")!.textContent).toBe("42");
+    expect(cell("A1").querySelector(".cell-comment-tooltip")!.textContent).toBe("Source comment");
+    const remote = structuredClone(initial);
+    remote.sheets.sheet.name = "Data";
+    peer(remote);
+    element<HTMLElement>('.tab[data-id="other"]').click();
+    await frame();
+    select("A1");
+    transfer("paste");
+    await frame();
+    expect(cell("A1").querySelector(".cv")!.textContent).toBe("42");
+    expect(cell("A1").querySelector(".cell-comment-tooltip")!.textContent).toContain("Source comment");
+    element<HTMLButtonElement>('button[title="Undo (Ctrl+Z)"]').click();
+    await frame();
+    expect(cell("A1").querySelector(".cv")!.textContent).toBe("Destination");
+    expect(cell("A1").querySelector(".cell-comment-tooltip")!.textContent).toBe("Destination comment");
+    element<HTMLButtonElement>('button[title="Redo (Ctrl+Y)"]').click();
+    await frame();
+    expect(cell("A1").querySelector(".cv")!.textContent).toBe("42");
+  });
+
   it("fills only initially visible rows and preserves hidden records through undo and redo", async () => {
     for (const [ref, value] of Object.entries({ A2: "keep", A3: "drop", A4: "keep", A5: '=IF(B4="old","drop","keep")', A6: "keep",
       B2: "new", B3: "preserve", B4: "old", B5: "Also hidden", B6: "Last old" })) {
