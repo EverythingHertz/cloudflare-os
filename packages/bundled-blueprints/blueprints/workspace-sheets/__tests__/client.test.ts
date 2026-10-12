@@ -99,7 +99,63 @@ const startDrag = () => {
   pointer(window, "pointermove", 200, 140);
 };
 
+const pivotOption = (value: string) => [...document.querySelectorAll<HTMLLabelElement>(".pivot-filter-option")]
+  .find(label => label.querySelector("span")?.textContent === value)!.querySelector<HTMLInputElement>("input")!;
+
 describe("Sheets client regressions", () => {
+  it("fills only initially visible rows and preserves hidden records through undo and redo", async () => {
+    for (const [ref, value] of Object.entries({ A2: "keep", A3: "drop", A4: "keep", A5: '=IF(B4="old","drop","keep")', A6: "keep",
+      B2: "new", B3: "preserve", B4: "old", B5: "Also hidden", B6: "Last old" })) {
+      initial.cells.sheet[ref] = { value, fmt: null, version: 1 };
+    }
+    initial.sheets.sheet.filter = { ...filter({ 0: ["s:keep"] }), endRow: 5, rowOrder: [1, 2, 3, 4, 5] };
+    await mount();
+    select("B2");
+    const handle = element(".fill-handle");
+    pointer(handle, "pointerdown", 0, 0);
+    subscriber.operation({ type: "operation", senderId: "peer", revision: 1, deletes: [], replacedSheets: [], lastModified: 1,
+      structure: { title: initial.title, sheetOrder: initial.sheetOrder, sheets: structuredClone(initial.sheets) },
+      upserts: [{ sheetId: "sheet", ref: "C1", cell: { value: "Peer change", fmt: null, version: 1 } }],
+    });
+    // jsdom has no hit testing; the actual pointer handlers receive the visible destination.
+    const hitTest = Object.getOwnPropertyDescriptor(document, "elementFromPoint");
+    Object.defineProperty(document, "elementFromPoint", { configurable: true, value: () => cell("B6") });
+    try {
+      pointer(handle, "pointermove", 0, 0);
+      pointer(handle, "pointerup", 0, 0);
+    } finally {
+      if (hitTest) Object.defineProperty(document, "elementFromPoint", hitTest);
+      else Reflect.deleteProperty(document, "elementFromPoint");
+    }
+    await frame();
+    expect(["B2", "B3", "B4", "B5", "B6"].map(ref => cell(ref).textContent)).toEqual(["new", "preserve", "new", "Also hidden", "new"]);
+    const grid = element(".grid-scroll");
+    grid.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    await frame();
+    expect(["B2", "B3", "B4", "B5", "B6"].map(ref => cell(ref).textContent)).toEqual(["new", "preserve", "old", "Also hidden", "Last old"]);
+    grid.dispatchEvent(new KeyboardEvent("keydown", { key: "y", ctrlKey: true, bubbles: true, cancelable: true }));
+    await frame();
+    expect(["B2", "B3", "B4", "B5", "B6"].map(ref => cell(ref).textContent)).toEqual(["new", "preserve", "new", "Also hidden", "new"]);
+  });
+
+  it("keeps an unchecked pivot group excluded when selected criteria contain a removed source value", async () => {
+    for (const [ref, value] of Object.entries({ A2: "East", A3: "West", A4: "South", B2: "10", B3: "20", B4: "30" })) {
+      initial.cells.sheet[ref] = { value, fmt: null, version: 1 };
+    }
+    initial.sheets.other.pivot = { sourceSheetId: "sheet", sourceRange: "A1:B4", rowField: "Kind", columnField: "", valueField: "Sales",
+      aggregate: "sum", showRowTotals: true, showColumnTotals: true, filterField: "Kind", filterValues: ["East", "North"] };
+    await mount();
+    [...document.querySelectorAll<HTMLButtonElement>(".sidebar-menu-item")].find(button => button.querySelector(".sidebar-menu-label")?.textContent === "Pivot tables")!.click();
+    element<HTMLButtonElement>(".chart-list-item").click();
+    expect(pivotOption("East").checked).toBe(true);
+    expect(pivotOption("South").checked).toBe(false);
+    pivotOption("West").click();
+    await frame();
+    expect(pivotOption("South").checked).toBe(false);
+    expect([cell("A2").textContent, cell("A3").textContent]).toEqual(["East", "West"]);
+    expect(cell("B4").textContent).toBe("30");
+  });
+
   it("clears only visible selected records and preserves hidden data through undo and redo", async () => {
     initial.cells.sheet.A2.value = "keep";
     initial.cells.sheet.A3.value = "drop";

@@ -2302,7 +2302,7 @@ const chosen = new Set(allSelected ? options : selected);
 const list = el("div", { class: "pivot-filter-values" });
 const note = el("div", { class: "pivot-note" });
 const apply = () => {
-  const next = chosen.size === options.length ? [] : (chosen.size ? [...chosen] : ["__PIVOT_NONE__"]);
+  const next = options.every(value => chosen.has(value)) ? [] : (chosen.size ? [...chosen] : ["__PIVOT_NONE__"]);
   const oversizedValue = next.some((value) => value.length > 8192);
   if (next.length > MAX_FILTER_SELECTIONS || oversizedValue) {
     saveStatus.set("bad", oversizedValue ? "Selected pivot values are limited to 8,192 characters" : `Select at most ${MAX_FILTER_SELECTIONS} values, or clear the filter instead`);
@@ -3474,19 +3474,26 @@ function applyFillDrag() {
   fillDrag = null; clearFillPreview();
   if (target.r1 === source.r1 && target.r2 === source.r2 && target.c1 === source.c1 && target.c2 === source.c2) { positionActiveOverlays(); return; }
   const sourceRows = source.r2 - source.r1 + 1, sourceColumns = source.c2 - source.c1 + 1;
+  // Filter formulas may depend on filled cells; capture visibility before the first write.
+  const visibleRows = model.sheets[sheetId]?.filter
+    ? Array.from({ length: target.r2 - target.r1 + 1 }, (_, offset) => rowPassesFilter(target.r1 + offset, sheetId))
+    : null;
   beginBatch();
-  for (let row = target.r1; row <= target.r2; row++) for (let column = target.c1; column <= target.c2; column++) {
-    if (row >= source.r1 && row <= source.r2 && column >= source.c1 && column <= source.c2) continue;
-    const sourceRow = source.r1 + modulo(row - source.r1, sourceRows);
-    const sourceColumn = source.c1 + modulo(column - source.c1, sourceColumns);
-    const sourceRef = rcToRef(sourceRow, sourceColumn), destinationRef = rcToRef(row, column);
-    const snapshot = snapshots[sourceRef], existing = (model.cells[sheetId] || {})[destinationRef];
-    recordCell(sheetId, destinationRef);
-    if (snapshot) {
-      const value = shiftedCopyFormula(snapshot.value, sourceRef, destinationRef, false);
-      model.cells[sheetId][destinationRef] = { value, fmt: snapshot.fmt ? { ...snapshot.fmt } : null, version: existing?.version || 0 };
-      queueCellOp(sheetId, destinationRef, value, snapshot.fmt || null, model.cells[sheetId][destinationRef].version);
-    } else clearStoredCell(sheetId, destinationRef);
+  for (let row = target.r1; row <= target.r2; row++) {
+    if (visibleRows && !visibleRows[row - target.r1]) continue;
+    for (let column = target.c1; column <= target.c2; column++) {
+      if (row >= source.r1 && row <= source.r2 && column >= source.c1 && column <= source.c2) continue;
+      const sourceRow = source.r1 + modulo(row - source.r1, sourceRows);
+      const sourceColumn = source.c1 + modulo(column - source.c1, sourceColumns);
+      const sourceRef = rcToRef(sourceRow, sourceColumn), destinationRef = rcToRef(row, column);
+      const snapshot = snapshots[sourceRef], existing = (model.cells[sheetId] || {})[destinationRef];
+      recordCell(sheetId, destinationRef);
+      if (snapshot) {
+        const value = shiftedCopyFormula(snapshot.value, sourceRef, destinationRef, false);
+        model.cells[sheetId][destinationRef] = { value, fmt: snapshot.fmt ? { ...snapshot.fmt } : null, version: existing?.version || 0 };
+        queueCellOp(sheetId, destinationRef, value, snapshot.fmt || null, model.cells[sheetId][destinationRef].version);
+      } else clearStoredCell(sheetId, destinationRef);
+    }
   }
   commitBatch(); rebuildEngine(); setSelection({ r: target.r1, c: target.c1 }, { r: target.r2, c: target.c2 }); renderGrid(); schedulePivotRefreshes();
 }
