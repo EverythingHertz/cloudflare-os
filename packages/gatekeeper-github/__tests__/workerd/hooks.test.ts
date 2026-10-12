@@ -421,6 +421,14 @@ const settled = (account: string) => vi.waitFor(() => runInDurableObject(driver(
   if (due.length > 0) throw new Error(`${due.length} deliveries due`);
 }), { timeout: 10_000, interval: 25 });
 
+/**
+ * Wait until a disconnect has reached the account's driver, which from then on refuses whatever is
+ * in flight. A loaded CI runner can take longer than any fixed wait to get it there.
+ */
+const fenced = (account: string) => vi.waitFor(() => runInDurableObject(driver(account), (_instance, state) => {
+  if (!state.storage.kv.get("revoked")) throw new Error("not yet disconnected");
+}), { timeout: 10_000, interval: 25 });
+
 /** Run the driver's alarm at `ms` from now, on a faked clock the runtime itself never wakes for. */
 async function after(ms: number, account: string): Promise<void> {
   vi.setSystemTime(Date.now() + ms);
@@ -1612,8 +1620,8 @@ it.each<[string, (github: FakeGitHub) => () => number, number]>([
   const refused = expect(triage.enable()).rejects.toThrow("This GitHub account has been disconnected.");
   await vi.waitFor(() => expect(stalled()).toBe(1));
   const disconnecting = triage.hooks.revokeAccount(account);
-  // Time for the disconnect to reach the driver, where it waits for the enable.
-  await scheduler.wait(100);
+  // Until the disconnect has reached the driver, where it waits for the enable.
+  await fenced(account);
   github.stallCreates = false;
   github.stallViewerReadsAs = undefined;
   await refused;
@@ -1699,7 +1707,7 @@ it("keeps on record the webhook an enable added as its account was disconnected,
   const refused = expect(triage.enable()).rejects.toThrow("This GitHub account has been disconnected.");
   await vi.waitFor(() => expect(github.stalledCreates).toBe(1));
   const disconnecting = triage.hooks.revokeAccount(account);
-  await scheduler.wait(100);
+  await fenced(account);
   github.failDeletesWith = 500;
   github.stallCreates = false;
   await refused;
