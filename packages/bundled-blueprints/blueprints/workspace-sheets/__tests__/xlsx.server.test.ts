@@ -4,6 +4,8 @@ import { MutationQueue, SubscriberRegistry } from "@gadgets/bundled-blueprints/l
 import { ExportHandler, Gadget } from "../files/server.ts";
 import type { Cell, CellFmt, CellMap, CollaboratorInfo, Operation, SheetsDocument, SheetMeta, SheetFilter, SheetChart, SheetComment, SheetPivot, SubscriberCallbacks, OperationEvent } from "../files/lib/protocol.ts";
 import { workbookToXlsx } from "../files/lib/xlsx.ts";
+import { chartPositionBounds, clampChartCoordinate } from "../files/lib/chartPosition.ts";
+import { moveFilterFormula } from "../files/lib/filterSort.ts";
 import { createZip, crc32 } from "@gadgets/bundled-blueprints/libraries/zip/server";
 
 // Complete the workbook header while retaining the actual stored model in every normal fixture.
@@ -176,11 +178,10 @@ function registryOf(...stubs: SubscriberCallbacks[]): Registry {
 }
 
 // A Gadget over in-memory storage, for exercising the mutation queue without a Durable Object.
-function inMemoryGadget(subscribers: Registry = registryOf()): Gadget {
-  const stored = new Map<string, unknown>([
-    ["meta", {revision: 0, title: "Test", sheetOrder: ["sheet"], sheets: {sheet: sheet("Sheet")}, lastModified: 0}],
-    ["cells:sheet", {}],
-  ]);
+function inMemoryGadget(subscribers: Registry = registryOf(), stored = new Map<string, unknown>([
+  ["meta", {revision: 0, title: "Test", sheetOrder: ["sheet"], sheets: {sheet: sheet("Sheet")}, lastModified: 0}],
+  ["cells:sheet", {}],
+])): Gadget {
   return Object.assign(Object.create(Gadget.prototype), {
     ctx: {
       storage: {
@@ -1133,6 +1134,132 @@ describe("Workspace Sheets document snapshots", () => {
     expect(callback.dup).not.toHaveBeenCalled();
     expect(fixture.subscribers.size).toBe(0);
     await expect(fixture.applyOperation(setCell("A1", "still works"))).resolves.toMatchObject({status: "applied"});
+  });
+
+  it("restores boundary-crossing formulas after sorting, persistence and a Gadget restart", async () => {
+    const stored = new Map<string, unknown>();
+    const fixture = inMemoryGadget(registryOf(), stored);
+    const filter: SheetFilter = {
+      row: 0, endRow: 3, columns: [0, 1], criteria: {}, rowOrder: [3, 1, 2],
+      sort: {column: 0, direction: "asc"}, sortFormulas: {
+        B4: {value: "=A1", row: 3},
+        A1: {value: "=A1", row: 1}, C2: {value: "=A1", row: 1}, b2: {value: "=A1", row: 1},
+        A2: {value: "literal", row: 1}, A3: {value: "=" + "x".repeat(8192), row: 2},
+        B2: {value: "=A1", row: 0}, B3: {value: "=A1", row: 4},
+      },
+    };
+    await fixture.applyOperation({structure: {sheetOrder: ["sheet"], sheets: {sheet: sheet("Sheet", {filter})}},
+      sheetReplacements: [{sheetId: "sheet", cells: {A1: cell("10"), A2: cell("a"), A3: cell("b"), A4: cell("c"), B2: cell("=#REF!")}}],
+    });
+    const restarted = inMemoryGadget(registryOf(), structuredClone(stored));
+    const saved = await restarted.getDocument();
+    expect(saved.sheets.sheet.filter?.sortFormulas).toEqual({B4: {value: "=A1", row: 3}});
+    const restored = moveFilterFormula(saved.cells.sheet.B2.value, saved.sheets.sheet.filter?.sortFormulas?.B4, 1, 3);
+    await restarted.applyOperation({structure: {sheetOrder: ["sheet"], sheets: {sheet: {...saved.sheets.sheet,
+      filter: {...saved.sheets.sheet.filter!, rowOrder: [1, 2, 3], sort: null},
+    }}}, sheetReplacements: [{sheetId: "sheet", cells: {
+      A1: saved.cells.sheet.A1, A2: saved.cells.sheet.A3, A3: saved.cells.sheet.A4, A4: saved.cells.sheet.A2,
+      B4: {...saved.cells.sheet.B2, value: restored.value},
+    }}]});
+    const cleared = await restarted.getDocument();
+    expect(cleared.cells.sheet.B4.value).toBe("=A1");
+    expect(cleared.sheets.sheet.filter?.sortFormulas).toBeUndefined();
+    const {entries} = await readZip(await handler().export(restarted, "xlsx"));
+    expect(cellXml(text(entries, "xl/worksheets/sheet1.xml"), "B4")).toContain("<f>A1</f>");
+  });
+
+  it.each([{rowOrder: [3, 3, 2]}, {rowOrder: [99, 1, 2]}])("discards stale formula origins when filter row identities are invalid: $rowOrder", async ({rowOrder}) => {
+    const fixture = inMemoryGadget();
+    await fixture.applyOperation({structure: {sheetOrder: ["sheet"], sheets: {sheet: sheet("Sheet", {filter: {
+      row: 0, endRow: 3, columns: [0, 1], rowOrder, sort: {column: 0, direction: "asc"},
+      sortFormulas: {B4: {value: "=A1", row: 3}},
+    }})}}});
+    const filter = (await fixture.getDocument()).sheets.sheet.filter;
+    expect(filter?.rowOrder).toEqual([1, 2, 3]);
+    expect(filter?.sortFormulas).toBeUndefined();
+  });
+
+  it("persists chart positions beyond 5000px through a Gadget restart and exports row 251", async () => {
+    const stored = new Map<string, unknown>();
+    const fixture = inMemoryGadget(registryOf(), stored);
+    const result = await fixture.applyOperation({senderId: "test", structure: {
+      sheetOrder: ["sheet"],
+      sheets: {sheet: sheet("Sheet", {rows: 400, cols: 80, charts: [{id: "scrolled", range: "A1:B2", x: 6040, y: 6040}]})},
+    }, cellOps: [{sheetId: "sheet", ref: "B2", value: "1", baseVersion: 0}]});
+    expect(result.status).toBe("applied");
+    const saved = await fixture.getDocument();
+    expect(saved.sheets.sheet.charts?.[0]).toMatchObject({x: 6040, y: 6040});
+
+    // Fresh Gadget/queue/registry with an independent copy of the persisted storage, not the
+    // first instance's document or a mocked getDocument/export implementation.
+    const restarted = inMemoryGadget(registryOf(), structuredClone(stored));
+    expect(await restarted.getDocument()).toEqual(saved);
+    const {entries} = await readZip(await handler().export(restarted, "xlsx"));
+    const drawing = text(entries, "xl/drawings/drawing1.xml");
+    // Subtract the 44px/22px headers: column 66 + 16px and row 251 + 18px.
+    expect(drawing).toContain('<xdr:from><xdr:col>65</xdr:col><xdr:colOff>152400</xdr:colOff><xdr:row>250</xdr:row><xdr:rowOff>171450</xdr:rowOff></xdr:from>');
+  });
+
+  it("uses resized sheet bounds for client-agreed chart coordinates, persistence and XLSX anchors", async () => {
+    const stored = new Map<string, unknown>();
+    const fixture = inMemoryGadget(registryOf(), stored);
+    const incoming = sheet("Sheet", {
+      rows: 100, cols: 20,
+      // Resizes beyond the sheet and invalid sizes must not enlarge the accepted position.
+      colWidths: {0: 2000, 1: 2000, 2: 2000, 3: Infinity, 4: 7, 5: 2001, 20: 2000},
+      rowHeights: {0: 2000, 1: 2000, 2: 2000, 3: NaN, 4: 7, 5: 2001, 100: 2000},
+      charts: [
+        {id: "resized", range: "A1:B2", x: 6040, y: 6040},
+        {id: "outside", range: "A1:B2", x: Number.MAX_VALUE, y: Number.MAX_VALUE, width: 5000, height: 5000},
+        {id: "negative", range: "A1:B2", x: -50, y: -50, width: 0, height: 0},
+        {id: "nonfinite", range: "A1:B2", x: NaN, y: Infinity},
+        {id: "fractional", range: "A1:B2", x: 6040.4, y: 6040.6},
+      ],
+    });
+    const bounds = chartPositionBounds(incoming);
+    expect(bounds).toEqual({minX: 48, maxX: 7607, minY: 28, maxY: 8349});
+    const clientPositions = incoming.charts!.map(chart => ({
+      x: clampChartCoordinate(chart.x, bounds.minX, bounds.maxX, 96),
+      y: clampChartCoordinate(chart.y, bounds.minY, bounds.maxY, 44),
+    }));
+    expect(clientPositions).toEqual([
+      {x: 6040, y: 6040}, {x: 7607, y: 8349}, {x: 48, y: 28}, {x: 96, y: 44}, {x: 6040, y: 6041},
+    ]);
+    await fixture.applyOperation({senderId: "test", structure: {sheetOrder: ["sheet"], sheets: {sheet: incoming}},
+      cellOps: [{sheetId: "sheet", ref: "B2", value: "1", baseVersion: 0}],
+    });
+    const restarted = inMemoryGadget(registryOf(), structuredClone(stored));
+    const reloaded = await restarted.getDocument();
+    expect(reloaded.sheets.sheet.charts?.map(chart => ({x: chart.x, y: chart.y}))).toEqual(clientPositions);
+    expect(reloaded.sheets.sheet.colWidths).toEqual({0: 2000, 1: 2000, 2: 2000, 20: 2000});
+    expect(reloaded.sheets.sheet.rowHeights).toEqual({0: 2000, 1: 2000, 2: 2000, 100: 2000});
+    expect(reloaded.sheets.sheet.charts?.[1]).toMatchObject({width: 1200, height: 900});
+    expect(reloaded.sheets.sheet.charts?.[2]).toMatchObject({width: 280, height: 200});
+    const {entries} = await readZip(await handler().export(restarted, "xlsx"));
+    const drawing = text(entries, "xl/drawings/drawing1.xml");
+    expect(drawing).toContain('<xdr:from><xdr:col>2</xdr:col><xdr:colOff>19011900</xdr:colOff><xdr:row>3</xdr:row><xdr:rowOff>171450</xdr:rowOff></xdr:from>');
+    // An out-of-sheet top-left stops at the last pixel in the last legal cell on both axes.
+    expect(drawing).toContain('<xdr:from><xdr:col>19</xdr:col><xdr:colOff>866775</xdr:colOff><xdr:row>99</xdr:row><xdr:rowOff>219075</xdr:rowOff></xdr:from>');
+  });
+
+  it("bounds chart defaults and rounded coordinates inside a small resized sheet", async () => {
+    const stored = new Map<string, unknown>();
+    const fixture = inMemoryGadget(registryOf(), stored);
+    const incoming = sheet("Small", {rows: 1, cols: 1, colWidths: {0: 8}, rowHeights: {0: 8}, charts: [
+      {id: "default", range: "A1", x: NaN, y: Infinity},
+      {id: "minimum", range: "A1", x: -1, y: -1},
+      {id: "rounded", range: "A1", x: 49.6, y: 28.4},
+    ]});
+    expect(chartPositionBounds(incoming)).toEqual({minX: 48, maxX: 51, minY: 28, maxY: 29});
+    await fixture.applyOperation({structure: {sheetOrder: ["sheet"], sheets: {sheet: incoming}},
+      cellOps: [{sheetId: "sheet", ref: "A1", value: "1", baseVersion: 0}],
+    });
+    const restarted = inMemoryGadget(registryOf(), structuredClone(stored));
+    expect((await restarted.getDocument()).sheets.sheet.charts?.map(chart => ({x: chart.x, y: chart.y}))).toEqual([
+      {x: 51, y: 29}, {x: 48, y: 28}, {x: 50, y: 28},
+    ]);
+    const {entries} = await readZip(await handler().export(restarted, "xlsx"));
+    expect(text(entries, "xl/drawings/drawing1.xml")).toContain('<xdr:from><xdr:col>0</xdr:col><xdr:colOff>66675</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>66675</xdr:rowOff></xdr:from>');
   });
 
   it("clamps chart and pivot ranges to their sheet and rejects ones clients could not walk", async () => {

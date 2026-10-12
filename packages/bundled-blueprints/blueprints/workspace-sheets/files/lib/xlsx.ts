@@ -639,8 +639,7 @@ function prepareComments(sheet: NamedSheet): PreparedComment[] {
 function anchorPosition(pixels: number, sizes: Dims | undefined, defaultPixels: number, maximum: number): Anchor {
   const source = sizes && typeof sizes === "object" ? sizes : {};
   let index = 0;
-  // The grid stores positions up to 5000px; anything else is malformed and lands at the origin.
-  let remaining = Number.isFinite(pixels) && pixels <= 5000 ? Math.max(0, Math.round(pixels)) : 0;
+  let remaining = Number.isFinite(pixels) ? Math.max(0, Math.round(pixels)) : 0;
   for (;;) {
     const size = pixelDimension(source[index]) ?? defaultPixels;
     if (remaining < size || index >= maximum - 1) return {index, offset: Math.min(remaining, size - 1) * EMU_PER_PIXEL};

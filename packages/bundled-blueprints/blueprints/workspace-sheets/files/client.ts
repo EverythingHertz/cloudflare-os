@@ -52,6 +52,8 @@ import type {
   SubscriberEvent,
 } from "./lib/protocol.ts";
 import { type Ast, CellError, ERR, cycleReferenceToken, formulaCursorInQuote, formulaReferences, isErr, parseFormula, serializeAst, shiftFormulaReferences, tokenize, unwrapParens } from "./lib/formula.ts";
+import { moveFilterFormula } from "./lib/filterSort.ts";
+import { chartPositionBounds, clampChartCoordinate } from "./lib/chartPosition.ts";
 
 // The bindings the Workshop's iframe bootstrap defines before this module runs: the RPC stub to
 // this gadget's Durable Object, and Cap'n Web's RpcTarget for the callbacks it is handed.
@@ -1525,6 +1527,15 @@ let ackedStructureRevision = -1;
 let inFlightStructure: Structure | null = null; // structure sent in the save awaiting its response
 function structureSnapshot(): Structure { return { title: model.title, sheetOrder: model.sheetOrder.slice(), sheets: JSON.parse(JSON.stringify(model.sheets)) }; }
 function queueStructure() {
+  for (const sheetId of model.sheetOrder) {
+    const sheet = model.sheets[sheetId];
+    if (!sheet?.charts?.length) continue;
+    const bounds = chartPositionBounds(sheet);
+    for (const chart of sheet.charts) {
+      chart.x = clampChartCoordinate(chart.x, bounds.minX, bounds.maxX, 96);
+      chart.y = clampChartCoordinate(chart.y, bounds.minY, bounds.maxY, 44);
+    }
+  }
   if (wholesaleBaseRevision === null) wholesaleBaseRevision = model.revision;
   pendingStructure = structureSnapshot();
   scheduleSave();
@@ -2760,10 +2771,11 @@ event.preventDefault(); event.stopPropagation();
 selectChart(chart, card);
 const startClientX = event.clientX, startClientY = event.clientY;
 const startX = chart.x ?? 96, startY = chart.y ?? 44;
+const bounds = chartPositionBounds(curSheet());
 let nextX = startX, nextY = startY;
 const move = (moveEvent: PointerEvent) => {
-  nextX = Math.max(0, Math.round(startX + moveEvent.clientX - startClientX));
-  nextY = Math.max(0, Math.round(startY + moveEvent.clientY - startClientY));
+  nextX = clampChartCoordinate(startX + moveEvent.clientX - startClientX, bounds.minX, bounds.maxX, 96);
+  nextY = clampChartCoordinate(startY + moveEvent.clientY - startClientY, bounds.minY, bounds.maxY, 44);
   card.style.left = nextX + "px"; card.style.top = nextY + "px";
 };
 const up = () => {
@@ -2936,6 +2948,7 @@ function resetFilterSortBaseline() {
   const endRow = filter.endRow ?? curSheet().rows - 1;
   filter.rowOrder = Array.from({ length: Math.max(0, endRow - filter.row) }, (_, index) => filter.row + 1 + index);
   filter.sort = null;
+  delete filter.sortFormulas;
 }
 function toggleFilterRow() {
   const sheet = curSheet();
@@ -2955,9 +2968,8 @@ if (!filter) return;
 const columns = filterColumns(filter);
 const rows: FilterRow[] = [];
 const endRow = filter.endRow ?? curSheet().rows - 1;
-const baseline = filter.rowOrder?.length === endRow - filter.row
-  ? filter.rowOrder
-  : Array.from({ length: endRow - filter.row }, (_, index) => filter.row + 1 + index);
+if (filter.rowOrder?.length !== endRow - filter.row) resetFilterSortBaseline();
+const baseline = filter.rowOrder;
 for (let row = filter.row + 1; row <= endRow; row++) {
   const rowCells: Record<number, Cell> = {};
   for (const col of columns) {
@@ -2968,13 +2980,22 @@ for (let row = filter.row + 1; row <= endRow; row++) {
   rows.push({ rowCells, rowComments, originalOrder: baseline[row - filter.row - 1], currentRow: row });
 }
 rows.sort(compare);
+const sortFormulas: NonNullable<SheetFilter["sortFormulas"]> = {};
 curSheet().comments = sheetComments().filter((comment) => { const position = parseRef(comment.ref); return !position || position.r <= filter.row || position.r > endRow || !columns.includes(position.c); });
 for (let index = 0; index < rows.length; index++) {
   const row = filter.row + 1 + index;
   for (const col of columns) {
     const ref = rcToRef(row, col), source = rows[index].rowCells[col];
-    // Rows move as in Excel's sort: relative references travel with the formula.
-    if (source) curCells()[ref] = { value: shiftedCopyFormula(source.value, rcToRef(rows[index].currentRow, col), ref, false), fmt: source.fmt, version: getCell(ref)?.version || 0 };
+    // Sort from the original formula: an earlier move may have erased a relative ref as #REF!.
+    if (source) {
+      if (source.value.startsWith("=")) {
+        const originalRef = rcToRef(rows[index].originalOrder, col);
+        const moved = moveFilterFormula(source.value, filter.sortFormulas?.[originalRef], rows[index].currentRow, row);
+        if (moved.sortFormula !== undefined) sortFormulas[originalRef] = moved.sortFormula;
+        source.value = moved.value;
+      }
+      curCells()[ref] = { value: source.value, fmt: source.fmt, version: getCell(ref)?.version || 0 };
+    }
     else delete curCells()[ref];
   }
   for (const comment of rows[index].rowComments) {
@@ -2983,6 +3004,8 @@ for (let index = 0; index < rows.length; index++) {
 }
 filter.rowOrder = rows.map((entry) => entry.originalOrder);
 filter.sort = nextSort;
+if (nextSort && Object.keys(sortFormulas).length) filter.sortFormulas = sortFormulas;
+else delete filter.sortFormulas;
 queueStructure(); queueReplacement(activeSheetId); rebuildEngine(); renderGrid();
 undoStack.length = 0; redoStack.length = 0; updateUndoButtons();
 schedulePivotRefreshes(); }

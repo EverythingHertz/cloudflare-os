@@ -1,6 +1,7 @@
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 import { MutationQueue, SubscriberRegistry } from "@gadgets/bundled-blueprints/libraries/sync/server";
 import { workbookToXlsx } from "./lib/xlsx.ts";
+import { chartPositionBounds, clampChartCoordinate } from "./lib/chartPosition.ts";
 import type {
   Cell,
   CellConflict,
@@ -350,17 +351,18 @@ function sanitizeDims(dims: unknown): Dims {
 
 function sheetMeta(s: Partial<SheetMeta> & Pick<SheetMeta, "id">): SheetMeta {
   const rows = clampInt(s.rows, 1, 50000, DEFAULT_ROWS), cols = clampInt(s.cols, 1, 702, DEFAULT_COLS);
+  const colWidths = sanitizeDims(s.colWidths), rowHeights = sanitizeDims(s.rowHeights);
   return {
     id: String(s.id),
     name: String(s.name || "Sheet").slice(0, 60),
     rows,
     cols,
-    colWidths: sanitizeDims(s.colWidths),
-    rowHeights: sanitizeDims(s.rowHeights),
+    colWidths,
+    rowHeights,
     frozenRows: clampInt(s.frozenRows, 0, 50, 0),
     frozenCols: clampInt(s.frozenCols, 0, 50, 0),
     filter: sanitizeFilter(s.filter, rows, cols),
-    charts: sanitizeCharts(s.charts, rows, cols),
+    charts: sanitizeCharts(s.charts, {rows, cols, colWidths, rowHeights}),
     comments: sanitizeComments(s.comments),
     pivot: sanitizePivot(s.pivot),
   };
@@ -409,14 +411,15 @@ function sanitizeComments(comments: unknown): SheetComment[] {
   }).filter((comment) => comment.text.trim());
 }
 
-function sanitizeCharts(charts: unknown, rows: number, cols: number): SheetChart[] {
+function sanitizeCharts(charts: unknown, sheet: Pick<SheetMeta, "rows" | "cols" | "colWidths" | "rowHeights">): SheetChart[] {
   if (!Array.isArray(charts)) return [];
+  const bounds = chartPositionBounds(sheet);
   return charts.slice(0, 50).map((value: unknown, index): SheetChart => {
     const chart = value as Partial<Record<keyof SheetChart, unknown>> | null | undefined;
     return {
       id: String(chart?.id || "chart_" + index).slice(0, 80),
       type: chart?.type === "line" || chart?.type === "pie" || chart?.type === "area" || chart?.type === "stackedBar" ? chart.type : "line",
-      range: sanitizeRange(chart?.range, rows, cols, true),
+      range: sanitizeRange(chart?.range, sheet.rows, sheet.cols, true),
       title: String(chart?.title || "").slice(0, 200),
       xAxisTitle: String(chart?.xAxisTitle || "").slice(0, 120),
       yAxisTitle: String(chart?.yAxisTitle || "").slice(0, 120),
@@ -424,8 +427,8 @@ function sanitizeCharts(charts: unknown, rows: number, cols: number): SheetChart
       firstRowHeaders: chart?.firstRowHeaders !== false,
       firstColLabels: chart?.firstColLabels !== false,
       smooth: chart?.smooth === true,
-      x: clampInt(chart?.x, 48, 5000, 96),
-      y: clampInt(chart?.y, 28, 5000, 44),
+      x: clampChartCoordinate(chart?.x, bounds.minX, bounds.maxX, 96),
+      y: clampChartCoordinate(chart?.y, bounds.minY, bounds.maxY, 44),
       width: clampInt(chart?.width, 280, 1200, 520),
       height: clampInt(chart?.height, 200, 900, 320),
     };
@@ -455,15 +458,37 @@ function sanitizeFilter(value: unknown, rows: number, cols: number): SheetFilter
     : Array.from({ length: cols }, (_, column) => column);
   const expectedRows = Math.max(0, endRow - row);
   const incomingOrder = Array.isArray(filter.rowOrder) ? filter.rowOrder.map(Number) : [];
-  const rowOrder = incomingOrder.length === expectedRows && incomingOrder.every(Number.isFinite)
-    ? incomingOrder.map((value) => Math.round(value))
-    : Array.from({ length: expectedRows }, (_, index) => row + 1 + index);
+  const validOrder = incomingOrder.length === expectedRows
+    && incomingOrder.every((identity) => Number.isInteger(identity) && identity > row && identity <= endRow)
+    && new Set(incomingOrder).size === expectedRows;
+  const rowOrder = validOrder ? incomingOrder : Array.from({ length: expectedRows }, (_, index) => row + 1 + index);
   const incomingSort = filter.sort && typeof filter.sort === "object" ? filter.sort as Record<string, unknown> : {};
   const sortColumn = Number(incomingSort.column);
   const sort: SheetFilter["sort"] = Number.isInteger(sortColumn) && columns.includes(sortColumn) && (incomingSort.direction === "asc" || incomingSort.direction === "desc")
     ? { column: sortColumn, direction: incomingSort.direction }
     : null;
-  return { row, endRow, columns, criteria, rowOrder, sort };
+  const result: SheetFilter = { row, endRow, columns, criteria, rowOrder, sort };
+  const originals = filter.sortFormulas;
+  if (sort && validOrder && originals && typeof originals === "object" && !Array.isArray(originals)
+    && (Object.getPrototypeOf(originals) === Object.prototype || Object.getPrototypeOf(originals) === null)) {
+    const selectedColumns = new Set(columns);
+    const sortFormulas: NonNullable<SheetFilter["sortFormulas"]> = {};
+    for (const [ref, value] of Object.entries(originals)) {
+      const match = /^([A-Z]{1,2})([1-9]\d{0,4})$/.exec(ref);
+      if (!match || !value || typeof value !== "object" || Array.isArray(value)) continue;
+      const originalRow = Number(match[2]) - 1;
+      let column = 0;
+      for (const letter of match[1]) column = column * 26 + letter.charCodeAt(0) - 64;
+      const formula = value as Partial<NonNullable<SheetFilter["sortFormulas"]>[string]>;
+      if (originalRow <= row || originalRow > endRow || !selectedColumns.has(column - 1)
+        || typeof formula.value !== "string" || !formula.value.startsWith("=") || formula.value.length > 8192
+        || typeof formula.row !== "number" || !Number.isInteger(formula.row) || formula.row <= row || formula.row > endRow) continue;
+      // A lossy shift cannot be inverted; preserve both the exact text and where it was written.
+      sortFormulas[ref] = { value: formula.value, row: formula.row };
+    }
+    if (Object.keys(sortFormulas).length) result.sortFormulas = sortFormulas;
+  }
+  return result;
 }
 
 const FMT_KEYS = new Set(["b", "i", "u", "s", "c", "bg", "a", "nf", "d", "fs", "wrap"]);

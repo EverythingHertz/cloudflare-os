@@ -40,8 +40,8 @@ A lightweight, persistent spreadsheet Gadget with a familiar grid interface, for
 - Double-quoted formula text uses Excel-style doubled quotes (`""`) to embed a quote; backslashes always remain literal, including before the closing quote. For example, `="C:\"&A1` keeps its existing meaning. Backslash-double-quote escapes are intentionally unsupported so persisted workbook calculations do not change. Single-quoted text accepts doubled apostrophes or `\'`; quoted sheet names accept the same apostrophe escapes, such as `='Owner\'s Sheet'!A1`. XLSX export converts those single-quoted forms to Excel spelling.
 - Ranges accept whitespace around `:` (for example `=SUM(A1 : B1)`). Quoted sheet prefixes keep literal backslashes, such as `='C:\Data'!A1`; copying, editing, and cutting cells preserve the referenced sheet.
 - Use the name box to jump to a cell or range such as `D12` or `A1:C8`.
-- Use the filter toolbar button to detect the current data table automatically. The app identifies the likely header row (including tables below a title row) and adds dropdowns only to columns containing data. Selecting a range first explicitly sets the filter range and its top row as the header.
-- Highlight a data range and use the chart toolbar button to create a line, pie, area, or stacked bar chart. The right-side settings panel controls chart type, range, titles, headers, labels, and legend; it can be collapsed at any time. Drag a chart by its header to reposition it. **Copy SVG** uses a rich clipboard format that may not be accepted by every destination.
+- Use the filter toolbar button to detect the current data table automatically. The app identifies the likely header row (including tables below a title row) and adds dropdowns only to columns containing data. Selecting a range first explicitly sets the filter range and its top row as the header. **Clear sort** restores the original row order and formula references, even when an intermediate move produced `#REF!`; it does not undo edits made while sorted.
+- Highlight a data range and use the chart toolbar button to create a line, pie, area, or stacked bar chart. The right-side settings panel controls chart type, range, titles, headers, labels, and legend; it can be collapsed at any time. Drag a chart by its header to reposition it. Its top-left stays within the sheet's pixel bounds, including resized rows and columns; positions beyond 5,000 pixels survive saving, reload, and XLSX export. **Copy SVG** uses a rich clipboard format that may not be accepted by every destination.
 - Select a cell and use the comment toolbar button or right-click → **Comment** to add a comment in place. Comment markers reveal text on hover. The layered right sidebar shows top-level **Charts**, **Pivot tables**, and **Comments** destinations when available, with back navigation into their lists and details.
 - Select a table including its header row and use the pivot toolbar button or right-click → **Create pivot table**. The result is generated on a new sheet with distinct pivot styling and automatically sized columns; configure row, column, value, aggregation, and optional multi-value filters from the Pivot tables section of the sidebar.
 - Pivot field names use up to 8,192 header characters plus a unique duplicate suffix. Selected pivot/filter values retain all 8,192 characters; longer computed values cannot be selected as criteria. Pivot output, including totals and spare grid space, stays within worksheet dimensions.
@@ -183,10 +183,17 @@ Formatting keys accepted by the server are `b` (bold), `i` (italic), `u` (underl
 ### Populate and filter a table
 
 Filter row and column indices are zero-based. `row` is the header row, `endRow` is the last
-data row, and `rowOrder` lists the original data-row indices for reversible sorting.
+data row, and `rowOrder` is a permutation of the original data-row indices for reversible sorting.
 `criteria` is keyed by column index and selects **evaluated-value tokens**, not the displayed
 label or formatted text. For example, `Complete` is `s:Complete`, and a currency-formatted
 number 10 is `n:10`, not `s:$10.00`.
+
+While sorted, optional `sortFormulas` preserves formula text and its zero-based capture row, keyed
+by the original row identity's A1 reference: for example, `B4: { value: "=A1", row: 3 }`. The capture
+row can differ from the original row after an edit; this retains the edit's relative-reference
+semantics through later sorts. Preserve this metadata from `getDocument()` when changing another
+setting. Clearing sort or establishing a new structural baseline removes it. Previously persisted
+`#REF!` formulas without a capture cannot reconstruct reference components that were already lost.
 
 The token prefixes are `s:` for text, `n:` for numbers, `b:1`/`b:0` for booleans, `e:` followed
 by a formula error such as `e:#DIV/0!`, and `z:` for blanks. Omitted criteria or an empty array
@@ -314,7 +321,7 @@ only subsequent local changes are replayed from the sheet's sent snapshot.
 - Structural edits and sorting clear local undo/redo history. The browser saves their whole-sheet
   replacements against a base revision; if another save wins first, the stale operation is rejected
   and the browser reloads the current document instead of overwriting concurrent edits.
-- Sorting moves formulas with their rows and shifts their relative references, as Excel does.
+- Sorting moves formulas with their rows and shifts their relative references, as Excel does. Filter sorts retain their raw formula origins until Clear sort, so an out-of-grid intermediate shift does not irreversibly erase a reference. Subsequent formula edits replace only that cell's origin; text edits and deletions do not revive stale formulas.
 - Formula reference adjustment during row/column changes is limited to references on the current sheet; chart ranges and pivot sources on the edited sheet move with it.
 - Formula support is broad but is not intended to be fully compatible with Excel or Google Sheets.
 - Frozen row/column metadata exists in the model, but the current UI does not expose controls for it.
@@ -373,8 +380,9 @@ range, reading headers and labels the way the grid does, with the grid's palette
 and legend setting. As in the grid, a column with no numeric value is not a series - a column holding
 formulas is kept, since they are not evaluated here - and Excel's limit of 255 series applies to the
 columns that remain. Series reference the worksheet directly, so Excel computes them on open. A chart
-is positioned at the cell under its grid coordinates, at the same pixel size. Charts without a usable
-data range or series are skipped.
+is positioned at the cell under its grid coordinates, at the same pixel size, without a 5,000-pixel
+coordinate ceiling. Its top-left is bounded by the sheet's actual row/column sizes, using the same
+bounds as the browser and persistence. Charts without a usable data range or series are skipped.
 
 Pivot tables export as their materialized output cells (with their formatting), not as Excel pivot
 tables: the pivot's source definition is dropped and the values no longer refresh.

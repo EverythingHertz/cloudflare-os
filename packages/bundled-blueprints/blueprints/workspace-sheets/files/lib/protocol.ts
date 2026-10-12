@@ -43,6 +43,12 @@ export interface FilterSort {
   direction: "asc" | "desc";
 }
 
+/** Exact raw formula and the zero-based data row where it was captured, including later edits while sorted. */
+export interface FilterSortFormula {
+  value: string;
+  row: number;
+}
+
 /**
  * A sheet's filter region: zero-based header/end rows and columns, selected evaluated-value tokens
  * by column, and the original row identities retained while sorting so clearing sort restores them.
@@ -57,6 +63,8 @@ export interface SheetFilter {
   criteria: Record<string, string[]>;
   rowOrder: number[];
   sort: FilterSort | null;
+  /** Captured formulas keyed by their original row identity's A1 cell; omitted before sorting or after a baseline reset. */
+  sortFormulas?: Record<string, FilterSortFormula>;
 }
 
 /** The chart renderers supported by the Sheets client and workbook exporter. */
