@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { GadgetStub, SheetChart, SheetFilter, SheetMeta, SheetsDocument, SubscriberCallbacks } from "../files/lib/protocol.ts";
+import { MutationQueue, SubscriberRegistry } from "@gadgets/bundled-blueprints/libraries/sync/server";
+import { Gadget } from "../files/server.ts";
+import type { CollaboratorInfo, GadgetStub, SheetChart, SheetFilter, SheetMeta, SheetsDocument, SubscriberCallbacks } from "../files/lib/protocol.ts";
 
 // oxlint-disable-next-line typescript/no-extraneous-class -- the host's RpcTarget is a marker base class.
 class RpcTarget {}
@@ -102,7 +104,247 @@ const startDrag = () => {
 const pivotOption = (value: string) => [...document.querySelectorAll<HTMLLabelElement>(".pivot-filter-option")]
   .find(label => label.querySelector("span")?.textContent === value)!.querySelector<HTMLInputElement>("input")!;
 
+// Exercise authoritative optimistic concurrency, with cloned RPC/storage boundaries rather than
+// echoing client operations. Disabling delivery models the peer callback arriving after the reply.
+const serverHost = (deliverOperations = true) => {
+  initial.cells.sheet.A1.value = "old";
+  delete initial.cells.sheet.B1;
+  const { cells, ...meta } = structuredClone(initial);
+  const stored = new Map<string, unknown>([["meta", meta], ...Object.entries(cells).map(([id, values]) => ["cells:" + id, values] as [string, unknown])]);
+  const server: Gadget = Object.assign(Object.create(Gadget.prototype), {
+    ctx: { storage: {
+      get: async (name: string) => structuredClone(stored.get(name)),
+      put: async (name: string, value: unknown) => { stored.set(name, structuredClone(value)); },
+      delete: async (name: string) => stored.delete(name),
+    } },
+    mutations: new MutationQueue(),
+    subscribers: new SubscriberRegistry<SubscriberCallbacks, CollaboratorInfo>(),
+  });
+  const host: GadgetStub = {
+    async subscribe(callback, client) {
+      subscriber = callback;
+      const callbacks: SubscriberCallbacks = {
+        operation(event) { if (deliverOperations) return callback.operation(structuredClone(event)); },
+        presence(event) { return callback.presence(structuredClone(event)); },
+      };
+      return structuredClone(await server.subscribe(Object.assign(callbacks, {
+        dup() { return this; },
+        onRpcBroken() {},
+        [Symbol.dispose]() {},
+      }), client));
+    },
+    async applyOperation(operation) { return structuredClone(await server.applyOperation(structuredClone(operation))); },
+    async getDocument() { return structuredClone(await server.getDocument()); },
+    async updatePresence(presence) { server.updatePresence(presence); },
+    async leavePresence(clientId) { server.leavePresence(clientId); },
+  };
+  vi.stubGlobal("gadget", host);
+  return { server, host };
+};
+const sourceUpdate = (server: Gadget, value: string | null, baseVersion: number) => server.applyOperation({
+  senderId: "peer", cellOps: [{ sheetId: "sheet", ref: "A1", value, fmt: null, baseVersion }],
+});
+const acknowledgementGate = () => {
+  let release!: () => void;
+  const promise = new Promise<void>(resolve => { release = resolve; });
+  return { promise, release };
+};
+const cutTo = (source: string, destination: string) => {
+  const clipboard = new Map<string, string>();
+  const transfer = (type: "cut" | "paste") => {
+    const event = new Event(type, { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", { value: {
+      setData: (format: string, value: string) => clipboard.set(format, value),
+      getData: (format: string) => clipboard.get(format) || "",
+    } });
+    element(".grid-scroll").dispatchEvent(event);
+  };
+  select(source); transfer("cut"); select(destination); transfer("paste");
+};
+const editCell = (ref: string, value: string) => {
+  select(ref); key(element(".grid-scroll"), "F2");
+  const editor = element<HTMLTextAreaElement>("textarea.cell-editor");
+  editor.value = value;
+  editor.dispatchEvent(new Event("input", { bubbles: true }));
+  key(editor, "Enter");
+};
+
 describe("Sheets client regressions", () => {
+  it.each([false, true])("preserves a peer's cut source and the pasted destination when acknowledgement is lost: %s", async lostAcknowledgement => {
+    const { server, host } = serverHost(false);
+    const send = host.applyOperation.bind(host);
+    const acknowledgement = acknowledgementGate();
+    let first = true;
+    host.applyOperation = async operation => {
+      if (!first) return send(operation);
+      first = false;
+      await sourceUpdate(server, "new", 1);
+      const result = await send(operation);
+      await acknowledgement.promise;
+      if (lostAcknowledgement) throw new Error("reply lost after commit");
+      return result;
+    };
+    await mount();
+    cutTo("A1", "B1");
+    await vi.advanceTimersByTimeAsync(200);
+    const committed = await server.getDocument();
+    expect([committed.cells.sheet.A1.value, committed.cells.sheet.B1.value]).toEqual(["new", "old"]);
+    acknowledgement.release();
+    await vi.advanceTimersByTimeAsync(200);
+    const saved = await server.getDocument();
+    expect([saved.cells.sheet.A1.value, saved.cells.sheet.B1.value]).toEqual(["new", "old"]);
+    expect([cell("A1").textContent, cell("B1").textContent]).toEqual(["new", "old"]);
+  });
+
+  it("still rebases an ordinary explicit deletion onto the peer's authoritative version", async () => {
+    const { server, host } = serverHost(false);
+    const send = host.applyOperation.bind(host);
+    let first = true;
+    host.applyOperation = async operation => {
+      if (first) { first = false; await sourceUpdate(server, "new", 1); }
+      return send(operation);
+    };
+    await mount();
+    select("A1"); key(element(".grid-scroll"), "Delete");
+    await vi.advanceTimersByTimeAsync(300);
+    expect((await server.getDocument()).cells.sheet.A1).toBeUndefined();
+    expect(cell("A1").textContent).toBe("");
+  });
+
+  it.each(["edit", "delete"])("retains a newer local %s queued while a cut source conflict awaits acknowledgement", async action => {
+    const { server, host } = serverHost();
+    const send = host.applyOperation.bind(host);
+    const acknowledgement = acknowledgementGate();
+    let first = true;
+    host.applyOperation = async operation => {
+      if (!first) return send(operation);
+      first = false;
+      await sourceUpdate(server, "new", 1);
+      const result = await send(operation);
+      await acknowledgement.promise;
+      return result;
+    };
+    await mount();
+    cutTo("A1", "B1");
+    await vi.advanceTimersByTimeAsync(200);
+    if (action === "edit") editCell("A1", "newer local edit");
+    else { select("A1"); key(element(".grid-scroll"), "Delete"); }
+    acknowledgement.release();
+    await vi.advanceTimersByTimeAsync(300);
+    const saved = await server.getDocument();
+    expect(saved.cells.sheet.A1?.value).toBe(action === "edit" ? "newer local edit" : undefined);
+    expect(saved.cells.sheet.B1.value).toBe("old");
+    expect(cell("A1").textContent).toBe(action === "edit" ? "newer local edit" : "");
+    expect(cell("B1").textContent).toBe("old");
+  });
+
+  it.each(["newest", null])("does not restore a stale cut conflict over a later peer source update: %s", async latest => {
+    const { server, host } = serverHost();
+    const send = host.applyOperation.bind(host);
+    const acknowledgement = acknowledgementGate();
+    let first = true;
+    host.applyOperation = async operation => {
+      if (!first) return send(operation);
+      first = false;
+      await sourceUpdate(server, "new", 1);
+      const result = await send(operation);
+      await acknowledgement.promise;
+      return result;
+    };
+    await mount();
+    cutTo("A1", "B1");
+    await vi.advanceTimersByTimeAsync(200);
+    await sourceUpdate(server, latest, 2);
+    acknowledgement.release();
+    await vi.advanceTimersByTimeAsync(200);
+    const saved = await server.getDocument();
+    expect(saved.cells.sheet.A1?.value).toBe(latest ?? undefined);
+    expect(saved.cells.sheet.B1.value).toBe("old");
+    expect(cell("A1").textContent).toBe(latest ?? "");
+    expect(cell("B1").textContent).toBe("old");
+  });
+
+  it.each([{ lost: false, deliver: true }, { lost: true, deliver: true }, { lost: true, deliver: false }])("keeps a recreated peer source after an accepted cut (lost reply: $lost, peer callback: $deliver)", async ({ lost, deliver }) => {
+    const { server, host } = serverHost(deliver);
+    const send = host.applyOperation.bind(host);
+    const acknowledgement = acknowledgementGate();
+    let first = true;
+    host.applyOperation = async operation => {
+      const result = await send(operation);
+      if (first) {
+        first = false;
+        await acknowledgement.promise;
+        if (lost) throw new Error("reply lost after deletion committed");
+      }
+      return result;
+    };
+    await mount();
+    cutTo("A1", "B1");
+    await vi.advanceTimersByTimeAsync(200);
+    await sourceUpdate(server, "new", 0);
+    acknowledgement.release();
+    await vi.advanceTimersByTimeAsync(200);
+    const saved = await server.getDocument();
+    expect([saved.cells.sheet.A1.value, saved.cells.sheet.B1.value]).toEqual(["new", "old"]);
+    expect([cell("A1").textContent, cell("B1").textContent]).toEqual(["new", "old"]);
+  });
+
+  it("does not rebase a pending conditional cut deletion from an earlier edit acknowledgement", async () => {
+    const { server, host } = serverHost();
+    const send = host.applyOperation.bind(host);
+    const acknowledgement = acknowledgementGate();
+    let first = true;
+    host.applyOperation = async operation => {
+      const result = await send(operation);
+      if (first) { first = false; await acknowledgement.promise; }
+      return result;
+    };
+    await mount();
+    editCell("A1", "cut text");
+    await vi.advanceTimersByTimeAsync(200);
+    cutTo("A1", "B1");
+    await sourceUpdate(server, "new", 2);
+    acknowledgement.release();
+    await vi.advanceTimersByTimeAsync(300);
+    const saved = await server.getDocument();
+    expect([saved.cells.sheet.A1.value, saved.cells.sheet.B1.value]).toEqual(["new", "cut text"]);
+    expect([cell("A1").textContent, cell("B1").textContent]).toEqual(["new", "cut text"]);
+  });
+
+  it("keeps a newer explicit edit made while an ambiguous cut recovery document is in flight", async () => {
+    const { server, host } = serverHost(false);
+    const send = host.applyOperation.bind(host);
+    const getDocument = host.getDocument.bind(host);
+    const recoveryStarted = acknowledgementGate();
+    const recovery = acknowledgementGate();
+    let first = true;
+    host.applyOperation = async operation => {
+      const result = await send(operation);
+      if (first) {
+        first = false;
+        await sourceUpdate(server, "new", 0);
+        throw new Error("reply lost after deletion committed");
+      }
+      return result;
+    };
+    host.getDocument = async () => {
+      const snapshot = await getDocument();
+      recoveryStarted.release();
+      await recovery.promise;
+      return snapshot;
+    };
+    await mount();
+    cutTo("A1", "B1");
+    await vi.advanceTimersByTimeAsync(240);
+    await recoveryStarted.promise;
+    editCell("A1", "newer local edit");
+    recovery.release();
+    await vi.advanceTimersByTimeAsync(300);
+    const saved = await server.getDocument();
+    expect([saved.cells.sheet.A1.value, saved.cells.sheet.B1.value]).toEqual(["newer local edit", "old"]);
+    expect([cell("A1").textContent, cell("B1").textContent]).toEqual(["newer local edit", "old"]);
+  });
+
   it("rejects an unrepresentable generated sheet qualifier before mutation and retains the cut for retry", async () => {
     initial.sheets.sheet.name = "Data\\";
     initial.cells.sheet.A1.value = "=A2";
@@ -205,6 +447,92 @@ describe("Sheets client regressions", () => {
     expect(pivotOption("South").checked).toBe(false);
     expect([cell("A2").textContent, cell("A3").textContent]).toEqual(["East", "West"]);
     expect(cell("B4").textContent).toBe("30");
+  });
+
+  it.each(["click", "shift", "additive", "drag"] as const)("keeps full-column bounds and a visible typing target after a filtered header %s", async (mode) => {
+    initial.sheets.sheet.rows = 4;
+    for (const [ref, value] of Object.entries({ A2: "keep", A3: "keep", A4: "drop", B4: "preserve",
+      C1: "Third", C2: "30", C3: "40", C4: "Also hidden", D1: "Fourth", D2: "50", D3: "60", D4: "Last hidden" })) {
+      initial.cells.sheet[ref] = { value, fmt: null, version: 1 };
+    }
+    initial.sheets.sheet.filter = { ...filter({ 0: ["s:keep"] }), endRow: 3, rowOrder: [1, 2, 3] };
+    await mount();
+    const grid = element(".grid-scroll");
+    pointer(element('th.colhead[data-col="1"]'), "mousedown", 0, 0);
+    if (mode === "drag") pointer(element('th.colhead[data-col="2"]'), "mousemove", 0, 0);
+    pointer(window, "mouseup", 0, 0);
+    if (mode === "shift" || mode === "additive") {
+      element(`th.colhead[data-col="${mode === "shift" ? 2 : 3}"]`).dispatchEvent(new MouseEvent("mousedown", {
+        button: 0, shiftKey: mode === "shift", ctrlKey: mode === "additive", bubbles: true, cancelable: true,
+      }));
+      pointer(window, "mouseup", 0, 0);
+    }
+    const columns = mode === "click" ? [1] : mode === "additive" ? [1, 3] : [1, 2];
+    const target = mode === "click" ? "B3" : mode === "additive" ? "D3" : "C3";
+    const bounds = mode === "click" ? "B1:B4" : mode === "additive" ? "2 ranges" : "B1:C4";
+    expect(element<HTMLInputElement>("input.namebox").value).toBe(bounds);
+    expect([...document.querySelectorAll<HTMLElement>("th.colhead.full")].map(header => Number(header.dataset.col))).toEqual(columns);
+    expect(element<HTMLTableCellElement>("td.cell.active").dataset.ref).toBe(target);
+    expect(cell(target).parentElement!.style.display).toBe("");
+    expect(cell("B4").parentElement!.style.display).toBe("none");
+    expect(cell("B4").classList.contains("sel")).toBe(true);
+    const clipboard = new Map<string, string>();
+    const copy = new Event("copy", { bubbles: true, cancelable: true });
+    Object.defineProperty(copy, "clipboardData", { value: { setData: (format: string, value: string) => clipboard.set(format, value) } });
+    grid.dispatchEvent(copy);
+    expect(clipboard.get("text/plain")).toBe(Array.from({ length: 4 }, (_, row) => columns
+      .map(column => initial.cells.sheet[`${String.fromCharCode(65 + column)}${row + 1}`].value).join("\t")).join("\n"));
+    key(grid, "x"); // no queued paint between selecting the header and beginning an edit
+    expect(element<HTMLTextAreaElement>("textarea.cell-editor").value).toBe("x");
+    expect(element<HTMLInputElement>("input.namebox").value).toBe(bounds);
+    key(element("textarea.cell-editor"), "Enter");
+    await frame();
+    expect(cell(target).textContent).toBe("x");
+    expect(["B4", "C4", "D4"].map(ref => cell(ref).textContent)).toEqual(["preserve", "Also hidden", "Last hidden"]);
+  });
+
+  it.each([true, false])("uses a visible full-column editing target with all data hidden=%s without changing unfiltered targets", async (allHidden) => {
+    initial.sheets.sheet.rows = 4;
+    initial.cells.sheet.B4 = { value: "preserve", fmt: null, version: 1 };
+    initial.sheets.sheet.filter = allHidden ? { ...filter({ 0: ["x:__none__"] }), endRow: 3, rowOrder: [1, 2, 3] } : null;
+    await mount();
+    pointer(element('th.colhead[data-col="1"]'), "mousedown", 0, 0);
+    pointer(window, "mouseup", 0, 0);
+    const target = allHidden ? "B1" : "B4";
+    expect(element<HTMLInputElement>("input.namebox").value).toBe("B1:B4");
+    expect(element<HTMLTableCellElement>("td.cell.active").dataset.ref).toBe(target);
+    expect(cell(target).parentElement!.style.display).toBe("");
+    key(element(".grid-scroll"), "x");
+    key(element("textarea.cell-editor"), "Enter");
+    await frame();
+    expect(cell(target).textContent).toBe("x");
+    if (allHidden) expect(cell("B4").textContent).toBe("preserve");
+  });
+
+  it("retains full-column bounds across peer visibility changes and horizontal keyboard extension, then deletes only visible cells", async () => {
+    initial.sheets.sheet.rows = 4;
+    initial.cells.sheet.A2.value = "keep";
+    initial.cells.sheet.A3.value = "keep";
+    initial.cells.sheet.A4 = { value: "drop", fmt: null, version: 1 };
+    initial.cells.sheet.B4 = { value: "preserve", fmt: null, version: 1 };
+    initial.sheets.sheet.filter = { ...filter({ 0: ["s:keep"] }), endRow: 3, rowOrder: [1, 2, 3] };
+    await mount();
+    pointer(element('th.colhead[data-col="1"]'), "mousedown", 0, 0);
+    pointer(window, "mouseup", 0, 0);
+    subscriber.operation({ type: "operation", senderId: "peer", revision: 1, deletes: [], replacedSheets: [], lastModified: 1,
+      upserts: [{ sheetId: "sheet", ref: "A3", cell: { value: "drop", fmt: null, version: 2 } }],
+    });
+    expect(element<HTMLTableCellElement>("td.cell.active").dataset.ref).toBe("B2");
+    expect(element<HTMLInputElement>("input.namebox").value).toBe("B1:B4");
+    const grid = element(".grid-scroll");
+    grid.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", shiftKey: true, bubbles: true, cancelable: true }));
+    expect(element<HTMLInputElement>("input.namebox").value).toBe("A1:B4");
+    key(grid, "Delete");
+    await frame();
+    expect(["A1", "A2", "B1", "B2"].map(ref => cell(ref).textContent)).toEqual(["", "", "", ""]);
+    expect(["A3", "B3", "A4", "B4"].map(ref => cell(ref).textContent)).toEqual(["drop", "20", "drop", "preserve"]);
+    expect(element<HTMLInputElement>("input.namebox").value).toBe("A1:B4");
+    expect(element<HTMLTableCellElement>("td.cell.active").dataset.ref).toBe("A1");
   });
 
   it("clears only visible selected records and preserves hidden data through undo and redo", async () => {

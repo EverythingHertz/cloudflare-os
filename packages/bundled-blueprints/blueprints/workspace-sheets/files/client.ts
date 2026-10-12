@@ -1334,11 +1334,12 @@ let activeSheetId: string = null!;
 let engine = makeEngine(model);
 function rebuildEngine() { engine = makeEngine(model); }
 
-// Selection: anchor + focus (row/col). The visible rectangle is selRange().
+// Column-header bounds stay full-height even when filters move the active editing cell.
 let anchor = { r: 0, c: 0 };
+let fullColumnSelection = false;
 let extraRanges: Range[] = [];
 function selRange() {
-  return { r1: Math.min(anchor.r, focus.r), c1: Math.min(anchor.c, focus.c), r2: Math.max(anchor.r, focus.r), c2: Math.max(anchor.c, focus.c) };
+  return { r1: fullColumnSelection ? 0 : Math.min(anchor.r, focus.r), c1: Math.min(anchor.c, focus.c), r2: fullColumnSelection ? curSheet().rows - 1 : Math.max(anchor.r, focus.r), c2: Math.max(anchor.c, focus.c) };
 }
 function selectionRanges() { return [...extraRanges, selRange()]; }
 function addCurrentRangeToSelection() {
@@ -1506,6 +1507,9 @@ interface PendingCellOp {
   value: string | null;
   fmt: CellFmt | null;
   baseVersion: number;
+  // Present only for a cut source deletion: never rebase its expected baseVersion. -1 until a
+  // source broadcast arrives; its revision prevents a delayed reply restoring an older source.
+  cutSourceRevision?: number;
 }
 // Pending local ops keyed to flush together.
 const pendingCellOps = new Map<string, PendingCellOp>(); // "sheetId!REF" -> { sheetId, ref, value, fmt }
@@ -1521,8 +1525,12 @@ let resyncBeforeSave = false;
 // Set when that check reloaded the sheet, so the status line says so once the save settles.
 let reloadedAfterFailure = false;
 
-function queueCellOp(sheetId: string, ref: string, value: string | null, fmt: CellFmt | null, baseVersion: number) { pendingCellOps.set(sheetId + "!" + ref, { sheetId, ref, value, fmt, baseVersion });
-scheduleSave(); }
+function queueCellOp(sheetId: string, ref: string, value: string | null, fmt: CellFmt | null, baseVersion: number, conditionalDelete = false) {
+  const op: PendingCellOp = { sheetId, ref, value, fmt, baseVersion };
+  if (conditionalDelete) op.cutSourceRevision = -1;
+  pendingCellOps.set(sheetId + "!" + ref, op);
+  scheduleSave();
+}
 // Structure is saved as a whole-workbook snapshot, so `ackedStructure` (what the server last held)
 // lets a remote update be merged with the local changes still pending.
 let ackedStructure: Structure | null = null;
@@ -1588,12 +1596,15 @@ function scheduleSave(): void {
 // would silently overwrite a collaborator's changes. After an ambiguous failure, reload before
 // retrying wholesale payloads; discard layout-bound edits if that revision moved.
 async function sendPendingOperation(): Promise<SaveOutcome> {
+  const recoveringCutDeletes = resyncBeforeSave
+    ? [...pendingCellOps].filter(([, op]) => op.cutSourceRevision !== undefined) : null;
+  const recoveredDocument = recoveringCutDeletes?.length ? await gadget.getDocument() : null;
   if (resyncBeforeSave && wholesaleBaseRevision === null) {
-    // Nothing wholesale is pending, and a stale cell op is rejected on its own version.
+    // Explicit cell edits can retry by version; ambiguous cut deletions are cancelled below.
     resyncBeforeSave = false;
   } else if (resyncBeforeSave) {
     // Rejecting here leaves the flag set; the scheduler counts a failure and tries again.
-    const doc = await gadget.getDocument();
+    const doc = recoveredDocument ?? await gadget.getDocument();
     resyncBeforeSave = false;
     if (doc.revision !== wholesaleBaseRevision) {
       pendingStructure = null;
@@ -1611,7 +1622,28 @@ async function sendPendingOperation(): Promise<SaveOutcome> {
       reloadedAfterFailure = true;
     }
   }
+  if (recoveredDocument && recoveringCutDeletes) {
+    // A deletion may have committed before its reply was lost, then a peer recreated the source
+    // with the same cell version. Without an acknowledgement, cancel rather than risk a retry.
+    for (const [key, op] of recoveringCutDeletes) {
+      if (pendingCellOps.get(key) !== op) continue; // a newer local intent is not the failed cut
+      pendingCellOps.delete(key);
+      if (op.cutSourceRevision! > recoveredDocument.revision) continue;
+      const cells = model.cells[op.sheetId] || (model.cells[op.sheetId] = {});
+      const authoritative = recoveredDocument.cells[op.sheetId]?.[op.ref];
+      if (authoritative) cells[op.ref] = { ...authoritative };
+      else delete cells[op.ref];
+    }
+    model.revision = Math.max(model.revision, recoveredDocument.revision);
+    rebuildEngine(); renderGrid();
+  }
+  // A peer source update cancels the conditional deletion, even after an ambiguous failure.
+  // Delete/recreate may reuse a cell version, so its original baseVersion alone is not enough.
+  for (const [key, op] of pendingCellOps) {
+    if (op.cutSourceRevision !== undefined && op.cutSourceRevision >= 0) pendingCellOps.delete(key);
+  }
   const sentCellOps = [...pendingCellOps];
+  const sentIntents = new Map(sentCellOps);
   const sentStructure = pendingStructure;
   const sentReplacements = [...pendingReplacements];
   if (!sentCellOps.length && !sentStructure && !sentReplacements.length) return "saved";
@@ -1689,10 +1721,16 @@ async function sendPendingOperation(): Promise<SaveOutcome> {
   if ((pendingStructure !== null || pendingReplacements.size) && wholesaleBaseRevision === sentRevision
       && result.type === "operation" && result.revision === sentRevision + 1) wholesaleBaseRevision = result.revision;
   // An acknowledgment advances versions but must not overwrite an intent typed while in flight.
+  let cutDeletionCancelled = false;
   for (const up of result.upserts || []) {
     const cells = model.cells[up.sheetId] || (model.cells[up.sheetId] = {});
-    const pending = pendingCellOps.get(up.sheetId + "!" + up.ref);
-    if (!pending) cells[up.ref] = { ...up.cell };
+    const key = up.sheetId + "!" + up.ref;
+    const pending = pendingCellOps.get(key);
+    if (pending?.cutSourceRevision !== undefined && pending.baseVersion !== up.cell.version) {
+      pendingCellOps.delete(key);
+      cutDeletionCancelled = true;
+      if (pending.cutSourceRevision <= result.revision) cells[up.ref] = { ...up.cell };
+    } else if (!pending) cells[up.ref] = { ...up.cell };
     else {
       pending.baseVersion = up.cell.version;
       if (pending.value === null && pending.fmt === null) delete cells[up.ref];
@@ -1701,8 +1739,16 @@ async function sendPendingOperation(): Promise<SaveOutcome> {
   }
   for (const del of result.deletes || []) {
     const cells = model.cells[del.sheetId] || (model.cells[del.sheetId] = {});
-    const pending = pendingCellOps.get(del.sheetId + "!" + del.ref);
-    if (!pending) delete cells[del.ref];
+    const key = del.sheetId + "!" + del.ref;
+    const pending = pendingCellOps.get(key);
+    const cutSourceRevision = pending?.cutSourceRevision ?? sentIntents.get(key)?.cutSourceRevision;
+    if (pending?.cutSourceRevision !== undefined) {
+      pendingCellOps.delete(key);
+      cutDeletionCancelled = true;
+      if (pending.cutSourceRevision <= result.revision) delete cells[del.ref];
+    } else if (!pending) {
+      if (cutSourceRevision === undefined || cutSourceRevision <= result.revision) delete cells[del.ref];
+    }
     else {
       pending.baseVersion = 0;
       if (pending.value === null && pending.fmt === null) delete cells[del.ref];
@@ -1710,21 +1756,27 @@ async function sendPendingOperation(): Promise<SaveOutcome> {
     }
   }
   const conflicts = result.status === "conflict" && result.conflicts ? result.conflicts : [];
-  // Rebase the rejected intent, not the visible cell, onto the authoritative version.
-  const intents = new Map(cellOps.map((op) => [op.sheetId + "!" + op.ref, op]));
+  // Rebase explicit edits/deletes, but cancel a cut deletion whose expected source changed.
   for (const cf of conflicts) {
     const key = cf.sheetId + "!" + cf.ref;
-    const intent = pendingCellOps.get(key) || intents.get(key);
+    const intent = pendingCellOps.get(key) || sentIntents.get(key);
     const cells = model.cells[cf.sheetId] || (model.cells[cf.sheetId] = {});
     if (!intent) { cells[cf.ref] = { ...cf.cell }; continue; }
+    if (intent.cutSourceRevision !== undefined) {
+      if (intent.baseVersion !== cf.cell.version) {
+        if (pendingCellOps.get(key) === intent) pendingCellOps.delete(key);
+        if (intent.cutSourceRevision <= result.revision) cells[cf.ref] = { ...cf.cell };
+      } else delete cells[cf.ref]; // a newer cut queued against this version remains conditional
+      continue;
+    }
     const rebased = { ...intent, baseVersion: cf.cell.version };
     pendingCellOps.set(key, rebased);
     if (rebased.value === null && rebased.fmt === null) delete cells[cf.ref];
     else cells[cf.ref] = { value: rebased.value ?? "", fmt: rebased.fmt, version: cf.cell.version };
   }
   rebuildEngine();
-  // Own broadcasts are ignored; conflicts and reloads need a render after rebasing.
-  if (reloadedAfterFailure || conflicts.length) renderGrid();
+  // Own broadcasts are ignored; conflicts, cancelled cuts and reloads need a render.
+  if (reloadedAfterFailure || conflicts.length || cutDeletionCancelled) renderGrid();
   return conflicts.length ? "conflict" : "saved";
 }
 
@@ -2901,8 +2953,10 @@ function reconcileFilteredSelection() {
     if (!rowPassesFilter(row)) row = nextVisibleRow(row, -1);
   }
   if (editing && !rowPassesFilter(editing.r, editing.sheetId)) cancelEdit();
-  const position = { r: row, c: focus.c };
-  setSelection(position, position);
+  if (fullColumnSelection || (anchor.r === 0 && focus.r === curSheet().rows - 1)) {
+    fullColumnSelection = true; focus = { r: row, c: focus.c }; updateSelectionUI(); presence.schedule();
+  }
+  else { const position = { r: row, c: focus.c }; setSelection(position, position); }
   armEditorCapture(false);
 }
 function hasCellData(row: number, column: number) { const value = cellRaw(rcToRef(row, column));
@@ -3528,13 +3582,14 @@ if (!rowPassesFilter(p.r)) {
   const next = nextVisibleRow(p.r, direction);
   p.r = rowPassesFilter(next) ? next : nextVisibleRow(p.r, -direction);
 }
+if (!extend || p.r !== focus.r) fullColumnSelection = false;
 focus = { r: p.r, c: p.c };
 if (!extend) { anchor = { r: p.r, c: p.c }; if (!preserveExtra) extraRanges = []; }
 updateSelectionUI();
 scrollActiveIntoView();
 armEditorCapture(false);
 presence.schedule(); }
-function setSelection(a: RC, f: RC, preserveExtra = false) { if (!preserveExtra) extraRanges = []; anchor = { ...a }; focus = { ...f }; updateSelectionUI(); presence.schedule(); }
+function setSelection(a: RC, f: RC, preserveExtra = false) { fullColumnSelection = false; if (!preserveExtra) extraRanges = []; anchor = { ...a }; focus = { ...f }; updateSelectionUI(); presence.schedule(); }
 
 function updateSelectionUI(): void {
   const rng = selRange();
@@ -4270,8 +4325,9 @@ gridTable.addEventListener("mousedown", (e) => {
     const additive = e.ctrlKey || e.metaKey;
     prepareHeaderSelection(additive);
     const startColumn = e.shiftKey ? anchor.c : c;
+    fullColumnSelection = !!sh.filter;
     anchor = { r: 0, c: startColumn };
-    focus = { r: sh.rows - 1, c };
+    focus = { r: nextVisibleRow(sh.rows, -1), c };
     updateSelectionUI(); presence.schedule();
     mouseSelecting = "col"; e.preventDefault(); return;
   }
@@ -4282,6 +4338,7 @@ gridTable.addEventListener("mousedown", (e) => {
     const additive = e.ctrlKey || e.metaKey;
     prepareHeaderSelection(additive);
     const startRow = e.shiftKey ? anchor.r : r;
+    fullColumnSelection = false;
     anchor = { r: startRow, c: 0 };
     focus = { r, c: sh.cols - 1 };
     updateSelectionUI(); presence.schedule();
@@ -4292,7 +4349,7 @@ gridTable.addEventListener("mousedown", (e) => {
     const r = +td.dataset.r!!, c = +td.dataset.c!!;
     if (editing && !commitEdit("none")) return;
     if (e.ctrlKey || e.metaKey) { addCurrentRangeToSelection(); moveActive(r, c, false, true); }
-    else if (e.shiftKey) { focus = { r, c }; updateSelectionUI(); presence.schedule(); }
+    else if (e.shiftKey) { fullColumnSelection = false; focus = { r, c }; updateSelectionUI(); presence.schedule(); }
     else moveActive(r, c);
     mouseSelecting = "cell";
     gridScroll.focus();
@@ -4305,10 +4362,11 @@ gridTable.addEventListener("mousemove", (e) => {
   const td = e.target.closest<HTMLTableCellElement>("td.cell") || e.target.closest("th");
   let r: number, c: number;
   if (td && td.classList.contains("cell")) { r = +td.dataset.r!!; c = +td.dataset.c!!; }
+  else if (td && mouseSelecting === "col" && td.classList.contains("colhead")) { r = 0; c = +td.dataset.col!; }
   else return;
   if (mouseSelecting === "formula" && formulaPick) { updatePickedFormulaRange(formulaPick.r1, formulaPick.c1, r, c, false); return; }
   const sh = curSheet();
-  if (mouseSelecting === "col") { focus = { r: sh.rows - 1, c }; anchor = { r: 0, c: anchor.c }; }
+  if (mouseSelecting === "col") { focus = { r: nextVisibleRow(sh.rows, -1), c }; anchor = { r: 0, c: anchor.c }; }
   else if (mouseSelecting === "row") { focus = { r, c: sh.cols - 1 }; anchor = { r: anchor.r, c: 0 }; }
   else { focus = { r, c }; }
   updateSelectionUI();
@@ -4667,11 +4725,11 @@ function remapCutFormula(value: string, formulaSourceSheetId: string, formulaTar
 // A cut source is only removed while it still holds what was cut; an edit made in between wins.
 function cutSourceUnchanged(sheetId: string, snapshot: ClipboardCell) { const current = model.cells[sheetId]?.[snapshot.sourceRef];
 return (current?.value ?? null) === snapshot.value && JSON.stringify(current?.fmt ?? null) === JSON.stringify(snapshot.fmt ?? null); }
-function clearStoredCell(sheetId: string, ref: string) { const cells = model.cells[sheetId] || (model.cells[sheetId] = {});
+function clearStoredCell(sheetId: string, ref: string, conditionalDelete = false) { const cells = model.cells[sheetId] || (model.cells[sheetId] = {});
 const existing = cells[ref]; if (!existing) return;
 recordCell(sheetId, ref);
 const baseVersion = existing.version || 0;
-delete cells[ref]; queueCellOp(sheetId, ref, null, null, baseVersion); }
+delete cells[ref]; queueCellOp(sheetId, ref, null, null, baseVersion, conditionalDelete); }
 function pasteText(text: string, { keepFormatting = true, token = null }: { keepFormatting?: boolean; token?: string | null } = {}) { const normalized = text.replace(/\r/g, "");
 invalidateMissingCutSource();
 // Text equality identifies a copy; a cut (which deletes its source) needs the token.
@@ -4770,7 +4828,7 @@ for (const target of targetRanges) {
 if (moving && useSnapshot && formulaUpdates) {
   // Clear only unchanged sources that were actually pasted, never an overlapping destination.
   for (const sourceRef of moves.keys()) {
-    if (unchangedSources.has(sourceRef) && !destinationRefs.has(useSnapshot.sheetId + "!" + sourceRef)) clearStoredCell(useSnapshot.sheetId, sourceRef);
+    if (unchangedSources.has(sourceRef) && !destinationRefs.has(useSnapshot.sheetId + "!" + sourceRef)) clearStoredCell(useSnapshot.sheetId, sourceRef, true);
   }
   // Apply reference rewrites checked against the original workbook before changing any cells.
   for (const { sheetId, ref, value } of formulaUpdates) {
@@ -5049,7 +5107,7 @@ function renderTabs(): void {
 function switchSheet(id: string) { if (editing && !commitEdit("none")) return;
 activeSheetId = id;
 if (model.sheets[id]?.pivot) refreshPivot(id);
-anchor = { r: 0, c: 0 }; focus = { r: 0, c: 0 }; extraRanges = [];
+anchor = { r: 0, c: 0 }; focus = { r: 0, c: 0 }; extraRanges = []; fullColumnSelection = false;
 selectedChartId = null; selectedPivotSheetId = null; sidebarView = "home";
 renderTabs(); renderGrid(); updateSelectionUI(); renderChartPanel();
 presence.schedule(); }
@@ -5157,9 +5215,20 @@ function applyRemoteOperation(event: OperationEvent): void {
   for (const up of event.upserts || []) {
     const cells = model.cells[up.sheetId] || (model.cells[up.sheetId] = {});
     cells[up.ref] = { ...up.cell };
+    const pending = pendingCellOps.get(up.sheetId + "!" + up.ref);
+    if (pending?.cutSourceRevision !== undefined) pending.cutSourceRevision = event.revision;
   }
-  for (const del of event.deletes || []) { const cells = model.cells[del.sheetId]; if (cells) delete cells[del.ref]; }
-  if (event.replacedCells) for (const [sid, cells] of Object.entries(event.replacedCells)) model.cells[sid] = cells;
+  for (const del of event.deletes || []) {
+    const cells = model.cells[del.sheetId]; if (cells) delete cells[del.ref];
+    const pending = pendingCellOps.get(del.sheetId + "!" + del.ref);
+    if (pending?.cutSourceRevision !== undefined) pending.cutSourceRevision = event.revision;
+  }
+  if (event.replacedCells) for (const [sid, cells] of Object.entries(event.replacedCells)) {
+    model.cells[sid] = cells;
+    for (const pending of pendingCellOps.values()) {
+      if (pending.sheetId === sid && pending.cutSourceRevision !== undefined) pending.cutSourceRevision = event.revision;
+    }
+  }
   applyingRemote = false;
   rebuildEngine();
   if (!model.sheets[activeSheetId]) { if (editing) cancelEdit(); activeSheetId = model.sheetOrder[0]; }
