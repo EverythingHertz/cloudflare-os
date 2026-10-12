@@ -224,13 +224,15 @@ describe("publishing", () => {
     expect(await t.run([["getPost", "~1"], ["getInfo"]])).toMatchObject({ id: posts[0].id });
   });
 
-  it("binds the post a lost answer hid, though X kept its link's parentheses", async () => {
+  it.each([
+    ["kept its link's parentheses", "https://en.wikipedia.org/wiki/Primer_(film)", "https://en.wikipedia.org/wiki/Primer_(film)"],
+    ["read a query after a bare domain as its link's", "example.com?q=one", "http://example.com?q=one"],
+  ])("binds the post a lost answer hid, though X %s", async (_how, link, expanded) => {
     const t = await setup();
-    const link = "https://en.wikipedia.org/wiki/Primer_(film)";
     await t.run([["createPost", { text: `Read ${link}` }]]);
     // X makes the post as its own parser reads the link, whole, then the answer is lost.
     t.x.on("POST", /^\/2\/tweets$/, () => {
-      t.x.post(ALICE, "Read https://t.co/primer", { entities: { urls: [{ url: "https://t.co/primer", expanded_url: link }] } });
+      t.x.post(ALICE, "Read https://t.co/link", { entities: { urls: [{ url: "https://t.co/link", expanded_url: expanded }] } });
       return new Response("upstream error", { status: 503 });
     });
     const [{ actionId }] = await t.submitted();
@@ -629,6 +631,40 @@ describe("Lists", () => {
     const [{ actionId }] = await t.submitted();
     unwrap(await t.apply(actionId));
     expect(reserved).toBe(100);
+  });
+
+  it("won't record a change X answered with errors in place of its result", async () => {
+    const t = await setup();
+    t.x.lists.set("5", { id: "5", name: "Old", description: "", private: false, owner_id: ALICE.id });
+    await t.run([["getList", "5"], ["update", { name: "New" }]]);
+    let failing = true;
+    t.x.on("PUT", /^\/2\/lists\/5$/, () => {
+      if (!failing) return undefined;
+      failing = false;
+      return json({ errors: [{ title: "Internal Error", detail: "Something went wrong.", type: "about:blank" }] });
+    });
+    const [{ actionId }] = await t.submitted();
+    expect(failure(await t.apply(actionId))).toMatch(/Something went wrong/);
+    expect(t.x.lists.get("5")).toMatchObject({ name: "Old" });
+    unwrap(await t.apply(actionId));
+    expect(t.x.lists.get("5")).toMatchObject({ name: "New" });
+  });
+
+  it("won't report a revert X answered with errors in place of its result", async () => {
+    const t = await setup();
+    await t.run([["getUser", "bob"], ["follow"]]);
+    const [{ actionId }] = await t.submitted();
+    unwrap(await t.apply(actionId));
+    let failing = true;
+    t.x.on("DELETE", /\/following\//, () => {
+      if (!failing) return undefined;
+      failing = false;
+      return json({ errors: [{ title: "Internal Error", detail: "Something went wrong.", type: "about:blank" }] });
+    });
+    expect(failure(await t.revert(actionId))).toMatch(/Something went wrong/);
+    expect([...t.x.following]).toEqual([`${ALICE.id}:${BOB.id}`]);
+    unwrap(await t.revert(actionId));
+    expect(t.x.following.size).toBe(0);
   });
 
   it("restores a List's original details though the change's first answer was lost", async () => {
