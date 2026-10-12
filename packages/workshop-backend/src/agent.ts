@@ -60,6 +60,9 @@ export interface AgentStepChange {
   /** The tool call's edit, exactly as it will be recorded (and broadcast) as a row. */
   change: CodeChange;
 
+  /** This edit came from the replica acceptance, rather than an ordinary buffered tool call. */
+  replica?: true;
+
   /**
    * Present on the step's first write to an unpinned gadget with committed code: the head the
    * edit is anchored to. The barrier validates it against the gadget's *current* head and
@@ -2882,6 +2885,7 @@ async function runAgentPass(
     if (revision !== undefined && revision !== workspaceRevision) return false;
     for (let {workpieceId, entries, pin} of prepared) {
       appendAgentEdit(workpieceId, {[workpieceId]: entries}, pin);
+      stepBuffer.changes.at(-1)!.replica = true;
       for (let [path, fileChange] of entries) {
         if (!("remove" in fileChange)) markFileRead(workpieceId, path);
       }
