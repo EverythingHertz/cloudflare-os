@@ -336,6 +336,23 @@ describe("GitHubApi redirects", () => {
   });
 });
 
+describe("GitHubApi.listRepoWebhooks", () => {
+  it("lists every page of a repository's webhooks", async () => {
+    const pages: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      pages.push(url.searchParams.get("page") ?? "");
+      const count = url.searchParams.get("page") === "1" ? 100 : 1;
+      const offset = url.searchParams.get("page") === "1" ? 0 : 100;
+      return Response.json(Array.from({ length: count }, (_, i) => ({ id: offset + i, config: { url: "https://x.test/" } })));
+    }));
+
+    const webhooks = await new GitHubApi(async () => "test-token").listRepoWebhooks(7);
+    expect(webhooks).toHaveLength(101);
+    expect(pages).toEqual(["1", "2"]);
+  });
+});
+
 describe("revokeOAuthToken", () => {
   it("revokes only the given token, never the whole grant", async () => {
     // `/applications/{id}/grant` would revoke every token the user holds for the app, taking a

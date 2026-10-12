@@ -1,4 +1,4 @@
-import { isCredentialsExpired, type RefreshCredentials } from "@gadgets/gatekeeper-kit/credentials";
+import { CredentialsExpiredError, isCredentialsExpired, type RefreshCredentials } from "@gadgets/gatekeeper-kit/credentials";
 import {
   isInvalidGrant, mergeOAuthTokens, OAuthClient, oauthRefresh,
 } from "@gadgets/gatekeeper-kit/oauth-client";
@@ -193,6 +193,11 @@ function webhookBody({ url, secret, events }: GitHubRepoWebhookConfig) {
 
 /** Bounds one read of a webhook's delivery log, at 100 attempts a page. */
 const MAX_DELIVERY_PAGES = 10;
+/**
+ * Bounds one listing of a repository's webhooks, at 100 a page: far beyond the 20 per event that
+ * GitHub allows a repository, for any likely number of events.
+ */
+const MAX_WEBHOOK_PAGES = 20;
 
 /** The `cursor` of the page a `Link` header names as the next, if any. */
 function nextCursor(headers: Headers): string | undefined {
@@ -275,8 +280,9 @@ export class GitHubApiError extends Error {
   details?: unknown;
   isAuthError: boolean;
   /**
-   * Whether GitHub refused the request for a rate limit, primary or secondary: with a 429, or a 403
-   * that its rate-limit headers mark as one, rather than for want of permission.
+   * Whether GitHub refused the request for a rate limit, primary or secondary, rather than for want
+   * of permission: with a 429, or a 403 that its rate-limit headers mark as one, or whose message
+   * does, as GitHub's docs say a secondary limit's may be told by alone.
    */
   rateLimited: boolean;
 
@@ -286,8 +292,8 @@ export class GitHubApiError extends Error {
     this.status = status;
     this.details = details;
     this.isAuthError = status === 401;
-    this.rateLimited = status === 429 ||
-      (status === 403 && (headers?.get("x-ratelimit-remaining") === "0" || headers?.has("retry-after") === true));
+    this.rateLimited = status === 429 || (status === 403 && (headers?.get("x-ratelimit-remaining") === "0" ||
+      headers?.has("retry-after") === true || /\bsecondary rate limit\b/i.test(message)));
   }
 }
 
@@ -686,14 +692,17 @@ export class GitHubApi {
   // A repository's webhooks are addressed by its id, as `/repositories/<id>` is where GitHub
   // redirects a renamed repository's old path: a name a rename freed can name another repository.
 
-  /**
-   * The repository's webhooks, first page only: a repository may hold at most 20 webhooks for
-   * any one event. GitHub answers only a repository admin.
-   */
+  /** The repository's webhooks, every page of them. GitHub answers only a repository admin. */
   async listRepoWebhooks(repoId: number): Promise<GitHubRepoWebhookResponse[]> {
-    return (await this.#request<GitHubRepoWebhookResponse[]>(
-      "GET", `/repositories/${repoId}/hooks`, { query: { per_page: 100 } },
-    )).data;
+    const webhooks: GitHubRepoWebhookResponse[] = [];
+    // A short page is the last.
+    for (let page = 1; page <= MAX_WEBHOOK_PAGES; page++) {
+      const { data } = await this.#request<GitHubRepoWebhookResponse[]>(
+        "GET", `/repositories/${repoId}/hooks`, { query: { per_page: 100, page } });
+      webhooks.push(...data);
+      if (data.length < 100) return webhooks;
+    }
+    throw new Error(`Repository ${repoId} has more webhooks than can be listed.`);
   }
 
   /** Adds an active webhook to the repository. GitHub allows only a repository admin to. */
@@ -1602,7 +1611,13 @@ export async function withAccountApi<T>(
         throw error;
       }
       const verdict = await account.reportTokenRejected(presented);
-      if (verdict === "expired") throw new Error(CREDENTIALS_EXPIRED_MESSAGE, { cause: error });
+      if (verdict === "expired") {
+        // Shaped like the known expiry above: the marked error as its cause is how callers tell an
+        // expiry from a token renewed mid-request.
+        // oxlint-disable-next-line eslint/preserve-caught-error -- kept as the marked error's cause.
+        throw new Error(CREDENTIALS_EXPIRED_MESSAGE,
+          { cause: new CredentialsExpiredError(CREDENTIALS_EXPIRED_MESSAGE, { cause: error }) });
+      }
       if (verdict !== "superseded") throw error;
       if (replays > 0) continue;
       throw new Error("GitHub credentials were renewed during this request. Please retry it.",
