@@ -2937,10 +2937,12 @@ async function runAgentPass(
       pendingAddedBindings = [];
       let worktreeCommits = pendingWorktreeCommits;
       pendingWorktreeCommits = [];
+      let blueprintMerges = pendingBlueprintMerges;
+      pendingBlueprintMerges = [];
       await persistStep(async () => {
         if (await hooks.commitAgentStep(chatId, author, [], {
           changes, createdGadgets, createdWorktrees, addedBindings, worktreeCommits,
-          replicaCommit,
+          blueprintMerges, replicaCommit,
         })) ++nextChangeId;
       });
       return true;
