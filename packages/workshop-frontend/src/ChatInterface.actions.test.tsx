@@ -443,7 +443,7 @@ describe('scheduled task card placement', () => {
     return [...document.querySelectorAll('*')].indexOf(el)
   }
   const textElement = (text: string) =>
-    [...document.querySelectorAll('*')].reverse().find(el => el.textContent?.includes(text))
+    [...document.querySelectorAll('*')].toReversed().find(el => el.textContent?.includes(text))
   const hasHookCard = () => document.body.textContent?.includes('Hook: Motivational quote')
 
   it('renders the card exactly once', async () => {
