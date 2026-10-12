@@ -1549,16 +1549,17 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
    * Mint a single-use ticket for a user selected on behalf of a gatekeeper app,
    * redeemable through that gatekeeper app's exchange capability (see
    * GatekeeperUserSelectionExchangeImpl). Returns null if the selected user is
-   * this user or does not exist.
+   * this user or does not exist. Self-selection uses stable DO identity because
+   * ctx.id.name may be absent after a cold start through idFromString().
    */
   async createGatekeeperUserSelection(
       appAccountId: number, selectedUserId: string,
   ): Promise<GatekeeperUserSelection | null> {
     let app = await this.#uiAccountRecord(appAccountId);
     if (!app) throw new Error("No such app.");
-    if (selectedUserId === this.ctx.id.name) return null;
-    let selectedProfile = await this.ctx.exports.UserDurableObject.getByName(selectedUserId)
-        .whoamiIfExists();
+    let selectedId = this.ctx.exports.UserDurableObject.idFromName(selectedUserId);
+    if (this.ctx.id.equals(selectedId)) return null;
+    let selectedProfile = await this.ctx.exports.UserDurableObject.get(selectedId).whoamiIfExists();
     if (!selectedProfile) return null;
     let profile = { displayName: selectedProfile.name };
     let { secret, hash: ticketHash } = await newSecretToken();
