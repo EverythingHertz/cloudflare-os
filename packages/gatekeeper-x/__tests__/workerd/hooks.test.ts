@@ -272,6 +272,8 @@ describe("subscribing", () => {
     // A revocation forgets the subscription, though the hook still watches...
     const router = env.X_ACTIVITY_ROUTER.getByName(ALICE.id);
     for (const [id, subscription] of x.subscriptions) if (subscription.by === ALICE.id) x.subscriptions.delete(id);
+    // Each revocation here comes a clock tick after what it should forget: equal times would keep it.
+    await new Promise(resolve => setTimeout(resolve, 20));
     await router.revoked(Date.now());
     // ...and another hook's new subscription is made with its answer lost, and not listed at first.
     x.loseAnswer("POST", /^\/2\/activity\/subscriptions$/, request => JSON.parse(request.body!).event_type === "post.mention.create");
@@ -294,6 +296,7 @@ describe("subscribing", () => {
     const alarming = runDurableObjectAlarm(router);
     await vi.waitFor(() => expect(held).toBe(true));
     for (const [id, subscription] of x.subscriptions) if (subscription.by === ALICE.id) x.subscriptions.delete(id);
+    await new Promise(resolve => setTimeout(resolve, 20));
     const revoking = router.revoked(Date.now());
     await new Promise(resolve => setTimeout(resolve, 20));
     release();
@@ -522,6 +525,8 @@ describe("accounts going away", () => {
     // X deletes what the token made and says so before answering the subscription it was making:
     // long enough for the revocation to land, were it not held behind that subscription.
     const router = env.X_ACTIVITY_ROUTER.getByName(ALICE.id);
+    // A clock tick after the subscription was asked for: equal times would keep it.
+    await new Promise(resolve => setTimeout(resolve, 20));
     const revoking = router.revoked(Date.now());
     await new Promise(resolve => setTimeout(resolve, 100));
     release();
