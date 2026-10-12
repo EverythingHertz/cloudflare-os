@@ -1691,6 +1691,31 @@ it("deletes a webhook GitLab refused once with a 401 the account's token doesn't
   expect(gitlab.webhooks.size).toBe(0);
 });
 
+it("keeps a disconnecting account connected, with its token, while GitLab refuses the token for deleting a webhook and can't renew it", async () => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+
+  // With GitLab's token endpoint down, nothing confirms the token dead.
+  gitlab.failDeletesWith = 401;
+  gitlab.gitlab
+    .on("GET", /^\/api\/v4\/user$/, () => json({ message: "401 Unauthorized" }, { status: 401 }))
+    .on("POST", /^\/oauth\/token$/, () => new Response("upstream down", { status: 502 }));
+  expect(await triage.hooks.revokeAccount(account)).toEqual({
+    error: "GitLab failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
+  });
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/token$/)).toBeGreaterThan(0);
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBe(0);
+
+  gitlab.failDeletesWith = undefined;
+  await unwrap(await triage.hooks.revokeAccount(account));
+  expect(gitlab.webhooks.size).toBe(0);
+  expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
+});
+
 it("lets a disconnect finish at once without a webhook its account's dead token can't delete", async () => {
   const gitlab = new FakeGitLabHooks();
   gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
