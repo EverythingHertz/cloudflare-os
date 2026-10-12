@@ -570,7 +570,18 @@ export class GitLabHookDriver extends DurableObject<Env> {
    */
   async #settled(account: string, step: (api: GitLabApi) => Promise<unknown>): Promise<boolean> {
     try {
-      await this.#api(account, step);
+      await this.#api(account, async api => {
+        try {
+          await step(api);
+        } catch (error) {
+          if (!(error instanceof GitLabApiError && error.status === 401)) throw error;
+          // GitLab answers a token a refresh has just replaced with 401 too, which a read of the
+          // user alone tells from a refusal: withAccountApi() adjudicates that read's 401. Should
+          // the current token pass, the step is tried again with it.
+          await api.getCurrentUser();
+          await step(api);
+        }
+      });
     } catch (error) {
       if (retryable(error)) {
         logger.warn("failed to delete a GitLab webhook, which is tried again", { event: "hooks.webhook.delete.failed", error });

@@ -4,7 +4,7 @@
 
 import { stripTrailingSlashes, type SupportedResource } from "@gadgets/workshop-shared/gatekeeper";
 import type { PreviewOAuthEnv } from "@gadgets/gatekeeper-kit/preview-oauth";
-import { isCredentialsExpired, type RejectionVerdict } from "@gadgets/gatekeeper-kit/credentials";
+import { CredentialsExpiredError, isCredentialsExpired, type RejectionVerdict } from "@gadgets/gatekeeper-kit/credentials";
 import { DEFAULT_INSTANCE_URL, GitLabApi, GitLabApiError, type GitLabInstance } from "./gitlab-api";
 
 /**
@@ -172,7 +172,12 @@ export async function withAccountApi<T>(
       if (isCredentialsExpired(error)) throw new Error(RECONNECT_MESSAGE, { cause: error });
       if (!(error instanceof GitLabApiError && error.isAuthError) || presented === undefined) throw error;
       const verdict = await account.reportTokenRejected(presented);
-      if (verdict === "expired") throw new Error(RECONNECT_MESSAGE, { cause: error });
+      if (verdict === "expired") {
+        // Shaped like the known expiry above: the marked error as its cause is how callers tell an
+        // expiry from a token renewed mid-request.
+        // oxlint-disable-next-line eslint/preserve-caught-error -- kept as the marked error's cause.
+        throw new Error(RECONNECT_MESSAGE, { cause: new CredentialsExpiredError(RECONNECT_MESSAGE, { cause: error }) });
+      }
       if (verdict !== "superseded") throw error;
       if (replays > 0) continue;
       throw new Error("GitLab credentials were renewed during this request. Please retry it.", { cause: error });

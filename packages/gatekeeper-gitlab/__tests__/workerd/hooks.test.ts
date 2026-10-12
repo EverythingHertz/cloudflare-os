@@ -234,6 +234,8 @@ class FakeGitLabHooks {
   /** While set, a webhook DELETE fails with this status; with `deleteDespiteFailure`, once it has deleted the webhook, as when its answer is lost. */
   failDeletesWith: number | undefined;
   deleteDespiteFailure = false;
+  /** Whether only the next webhook DELETE fails with `failDeletesWith`. */
+  failDeletesOnce = false;
   /** While set, adding a webhook fails with this status. */
   failCreatesWith: number | undefined;
   /** While set, adding a webhook stalls, counted in `stalledCreates`, polled as `stallDeletes` is. */
@@ -352,7 +354,11 @@ class FakeGitLabHooks {
           this.webhooks.delete(webhook.id);
           this.deleted.push(webhook.id);
         }
-        if (this.failDeletesWith !== undefined) return json({ message: "Server Error" }, { status: this.failDeletesWith });
+        if (this.failDeletesWith !== undefined) {
+          const status = this.failDeletesWith;
+          if (this.failDeletesOnce) this.failDeletesWith = undefined;
+          return json({ message: "Failed" }, { status });
+        }
         return new Response(null, { status: 204 });
       });
     this.gitlab.install();
@@ -1660,6 +1666,39 @@ it.each<[string, number, boolean]>([
   await unwrap(await triage.hooks.revokeAccount(account));
   expect(gitlab.webhooks.has(webhook.id)).toBe(false);
   expect(gitlab.gitlab.count("POST", /^\/oauth\/revoke$/)).toBeGreaterThan(0);
+});
+
+it("deletes a webhook GitLab refused once with a 401 the account's token doesn't bear out, as after a refresh", async () => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+
+  // As GitLab answers a token its refresh has just replaced.
+  gitlab.failDeletesWith = 401;
+  gitlab.failDeletesOnce = true;
+  await unwrap(await triage.hooks.revokeAccount(account));
+  expect(gitlab.webhooks.size).toBe(0);
+});
+
+it("lets a disconnect finish at once without a webhook its account's dead token can't delete", async () => {
+  const gitlab = new FakeGitLabHooks();
+  gitlab.gitlab.on("POST", /^\/oauth\/revoke$/, () => json({}));
+  const account = await connectAccount();
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+
+  // The grant revoked on GitLab: every request refused, and a refresh too.
+  gitlab.failDeletesWith = 401;
+  gitlab.gitlab
+    .on("GET", /^\/api\/v4\/user$/, () => json({ message: "401 Unauthorized" }, { status: 401 }))
+    .on("POST", /^\/oauth\/token$/, () => json({ error: "invalid_grant" }, { status: 400 }));
+  await unwrap(await triage.hooks.revokeAccount(account));
+  // Left for the project's Maintainers.
+  expect(gitlab.webhooks.size).toBe(1);
 });
 
 it("lets a disconnect finish without a webhook the account can no longer delete", async () => {
