@@ -34,7 +34,7 @@ const AUXILIARY_COMPLETIONS: AuxiliaryCompletion[] = [
   },
   {
     kind: "workspace-logo",
-    promptPrefix: "Draw a small logo for a workspace.",
+    promptPrefix: "You design app icons. Draw the icon for a workspace.",
     response: '<svg viewBox="0 0 64 64"><circle cx="32" cy="32" r="24" fill="#f60"/></svg>',
   },
 ];
