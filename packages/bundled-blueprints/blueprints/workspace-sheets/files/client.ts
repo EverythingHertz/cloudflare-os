@@ -4444,10 +4444,14 @@ function moveWithinSelection(dir: number, mode: "h" | "v"): void {
   focus = { r, c }; updateSelectionUI(); scrollActiveIntoView(); presence.schedule();
 }
 function deleteSelectionContents() {
-  const seen = new Set();
+  const refs = new Set<string>();
+  // Resolve visibility before clearing cells that other filter predicates may reference.
+  for (const range of selectionRanges()) for (let row = range.r1; row <= range.r2; row++) {
+    if (!rowPassesFilter(row)) continue;
+    for (let col = range.c1; col <= range.c2; col++) refs.add(rcToRef(row, col));
+  }
   beginBatch();
-  for (const range of selectionRanges()) for (let row = range.r1; row <= range.r2; row++) for (let col = range.c1; col <= range.c2; col++) {
-    const ref = rcToRef(row, col); if (seen.has(ref)) continue; seen.add(ref);
+  for (const ref of refs) {
     const cell = getCell(ref);
     if (cell) { recordCell(activeSheetId, ref); if (cell.fmt) { setCellValue(ref, null); } else { const baseVersion = cell.version || 0; delete curCells()[ref]; queueCellOp(activeSheetId, ref, null, null, baseVersion); } }
   }

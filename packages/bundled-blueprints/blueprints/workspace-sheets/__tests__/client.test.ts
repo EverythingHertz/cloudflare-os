@@ -100,6 +100,52 @@ const startDrag = () => {
 };
 
 describe("Sheets client regressions", () => {
+  it("clears only visible selected records and preserves hidden data through undo and redo", async () => {
+    initial.cells.sheet.A2.value = "keep";
+    initial.cells.sheet.A3.value = "drop";
+    initial.cells.sheet.A4 = { value: "keep", fmt: null, version: 1 };
+    initial.sheets.sheet.filter = { ...filter({ 0: ["s:keep"] }), endRow: 3, rowOrder: [1, 2, 3] };
+    await mount();
+    select("A2");
+    const grid = element(".grid-scroll");
+    grid.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true, cancelable: true }));
+    expect(element<HTMLInputElement>("input.namebox").value).toBe("A2:A4");
+    key(grid, "Delete");
+    await frame();
+    expect(["A2", "A3", "A4"].map(ref => cell(ref).textContent)).toEqual(["", "drop", ""]);
+    grid.dispatchEvent(new KeyboardEvent("keydown", { key: "z", ctrlKey: true, bubbles: true, cancelable: true }));
+    await frame();
+    expect(["A2", "A3", "A4"].map(ref => cell(ref).textContent)).toEqual(["keep", "drop", "keep"]);
+    grid.dispatchEvent(new KeyboardEvent("keydown", { key: "y", ctrlKey: true, bubbles: true, cancelable: true }));
+    await frame();
+    expect(["A2", "A3", "A4"].map(ref => cell(ref).textContent)).toEqual(["", "drop", ""]);
+  });
+
+  it("resolves filtered selection visibility before clearing its formula dependencies", async () => {
+    initial.cells.sheet.A2.value = "keep";
+    initial.cells.sheet.A3.value = "Hidden record";
+    initial.cells.sheet.A4 = { value: "keep", fmt: null, version: 1 };
+    initial.cells.sheet.B2.value = "keep";
+    initial.cells.sheet.B3.value = '=IF(A2="keep","drop","keep")';
+    initial.cells.sheet.B4 = { value: "keep", fmt: null, version: 1 };
+    initial.sheets.sheet.filter = { ...filter({ 1: ["s:keep"] }), endRow: 3, rowOrder: [1, 2, 3] };
+    await mount();
+    select("A2");
+    const grid = element(".grid-scroll");
+    grid.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", shiftKey: true, bubbles: true, cancelable: true }));
+    expect(cell("A3").parentElement!.style.display).toBe("none");
+    // The peer update invalidates formula caches; Delete can arrive before the queued paint.
+    subscriber.operation({ type: "operation", senderId: "peer", revision: 1, deletes: [], replacedSheets: [], lastModified: 1,
+      structure: { title: initial.title, sheetOrder: initial.sheetOrder, sheets: structuredClone(initial.sheets) },
+      upserts: [{ sheetId: "sheet", ref: "C1", cell: { value: "Peer change", fmt: null, version: 1 } }],
+    });
+    key(grid, "Delete");
+    await frame();
+    expect(["A2", "A3", "A4"].map(ref => cell(ref).textContent)).toEqual(["", "Hidden record", ""]);
+    expect(cell("B3").textContent).toBe("keep");
+    expect(cell("A3").parentElement!.style.display).toBe("");
+  });
+
   it("retargets Delete synchronously when a peer filter hides the active cell", async () => {
     await mount();
     select("A2");
