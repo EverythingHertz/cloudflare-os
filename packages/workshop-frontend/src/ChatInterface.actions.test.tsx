@@ -75,7 +75,7 @@ function withChatApi(
       subscriber = next
       return { [Symbol.dispose]: () => {} }
     },
-    viewChat: async () => ({ [Symbol.dispose]: () => {} }),
+    viewChat: () => ({ [Symbol.dispose]: () => {} }),
   })
   return {
     getChatMessage,
