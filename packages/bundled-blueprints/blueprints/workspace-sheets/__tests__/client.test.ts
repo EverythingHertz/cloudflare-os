@@ -1,7 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MutationQueue, SubscriberRegistry } from "@gadgets/bundled-blueprints/libraries/sync/server";
-import { Gadget } from "../files/server.ts";
 import type { CollaboratorInfo, GadgetStub, SheetChart, SheetFilter, SheetMeta, SheetsDocument, SubscriberCallbacks } from "../files/lib/protocol.ts";
+
+// The real server is checked under Workers globals by its own type programs. This DOM test
+// loads it at runtime and uses its shared RPC type, without pulling Worker sources into lib.dom.
+const { Gadget } = await vi.importActual<{ Gadget: { prototype: GadgetStub } }>("../files/server.ts");
 
 // oxlint-disable-next-line typescript/no-extraneous-class -- the host's RpcTarget is a marker base class.
 class RpcTarget {}
@@ -111,7 +114,7 @@ const serverHost = (deliverOperations = true) => {
   delete initial.cells.sheet.B1;
   const { cells, ...meta } = structuredClone(initial);
   const stored = new Map<string, unknown>([["meta", meta], ...Object.entries(cells).map(([id, values]) => ["cells:" + id, values] as [string, unknown])]);
-  const server: Gadget = Object.assign(Object.create(Gadget.prototype), {
+  const server: GadgetStub = Object.assign(Object.create(Gadget.prototype), {
     ctx: { storage: {
       get: async (name: string) => structuredClone(stored.get(name)),
       put: async (name: string, value: unknown) => { stored.set(name, structuredClone(value)); },
@@ -141,7 +144,7 @@ const serverHost = (deliverOperations = true) => {
   vi.stubGlobal("gadget", host);
   return { server, host };
 };
-const sourceUpdate = (server: Gadget, value: string | null, baseVersion: number) => server.applyOperation({
+const sourceUpdate = (server: GadgetStub, value: string | null, baseVersion: number) => server.applyOperation({
   senderId: "peer", cellOps: [{ sheetId: "sheet", ref: "A1", value, fmt: null, baseVersion }],
 });
 const acknowledgementGate = () => {
@@ -520,6 +523,7 @@ describe("Sheets client regressions", () => {
     pointer(element('th.colhead[data-col="1"]'), "mousedown", 0, 0);
     pointer(window, "mouseup", 0, 0);
     subscriber.operation({ type: "operation", senderId: "peer", revision: 1, deletes: [], replacedSheets: [], lastModified: 1,
+      structure: { title: initial.title, sheetOrder: initial.sheetOrder, sheets: structuredClone(initial.sheets) },
       upserts: [{ sheetId: "sheet", ref: "A3", cell: { value: "drop", fmt: null, version: 2 } }],
     });
     expect(element<HTMLTableCellElement>("td.cell.active").dataset.ref).toBe("B2");
