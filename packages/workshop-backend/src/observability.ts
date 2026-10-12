@@ -7,10 +7,14 @@ export type WorkshopObservabilityFields = {
   agentName: string;
   autoProvisioned: boolean;
   blueprintId: string;
+  cacheReadTokens: number;
+  cacheWarmStop: "budget" | "failed" | "missed" | "stopped" | "unviewed";
+  cacheWriteTokens: number;
   callbackInitiated: boolean;
   chatId: number;
   claimedType: string;
   commitCount: number;
+  costUsd: number;
   credentialKind: "workshop" | "cloudflare-access";
   durableObjectId: string;
   durationMs: number;
@@ -29,6 +33,7 @@ export type WorkshopObservabilityFields = {
   operation: string;
   outcome: "ok" | "error" | "usage_limit" | "no_email" | "signups_disabled";
   path: string;
+  pingCount: number;
   recordedType: string;
   resourceTitle: string;
   sequence: number;

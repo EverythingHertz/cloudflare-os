@@ -50,7 +50,11 @@ import { GitImpl } from "./git-binding";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
-import { chatChangeStatuses, foldCompactedCode } from "./agent-compaction";
+import {
+  chatChangeStatuses, foldCompactedCode, getModelTokenLimits, shouldCompactChat,
+} from "./agent-compaction";
+import type { CachedRequest } from "./ai-models";
+import { ChatCacheWarmer } from "./chat-cache-warming";
 import { ambientGatekeeperMode } from "./provisioning-policy";
 import {
   blueprintContentKey, deleteBlueprintContent, readBlueprintRelease, sanitizeBlueprintOutput,
@@ -687,6 +691,7 @@ class OverseerImpl implements AgentHooks {
   // Per-chat in-memory state for running agents.
   #liveChats = new Map<number, LiveChatContext>();
   #chatSubscribers: Set<RpcStub<AiChatSubscriber>> = new Set();
+  readonly cacheWarmer = new ChatCacheWarmer();
 
   #autoApprovalDrainer: AutoApprovalDrainer;
 
@@ -865,6 +870,7 @@ class OverseerImpl implements AgentHooks {
   // (Undelivered calls to the agent live in storage -- `pendingAgentCalls` -- not here; deleteChat
   // removes them itself.)
   destroyLiveChat(chatId: number) {
+    this.cacheWarmer.stop(chatId);
     let ctx = this.#liveChats.get(chatId);
     if (!ctx) return;
 
@@ -888,6 +894,8 @@ class OverseerImpl implements AgentHooks {
   #registerRunningAgent(chatId: number) {
     this.#runningAgents.add(chatId);
     this.#updateAlarm();
+    // The turn's own requests keep the cache warm, and its end warms its last request instead.
+    this.cacheWarmer.stop(chatId);
   }
 
   // Tear down all bookkeeping for a finished agent turn: remove it from the in-memory registry,
@@ -6571,6 +6579,8 @@ class OverseerImpl implements AgentHooks {
     // reflects the spend this turn just incurred, rather than waiting for the cache TTL to lapse.
     let byokOwnerStub: DurableObjectStub<UserDurableObject> | undefined;
     let finished = false;
+    // The turn's last model request, kept warm while the chat is viewed (see ChatCacheWarmer).
+    let lastRequest: CachedRequest | undefined;
     let startedAt = Date.now();
     const turnLogger = this.logger.with({
       operation: "agent.run",
@@ -6643,6 +6653,7 @@ class OverseerImpl implements AgentHooks {
         await runAgent(
             this, chosenModel, chatId, aiModel.profile, controller.signal, initiator, aiModel.config);
         finished = true;
+        lastRequest = chosenModel.lastRequest;
         turnLogger.debug("agent run finished", {
           event: "agent.run.finished", outcome: "ok",
           durationMs: Date.now() - startedAt,
@@ -6713,6 +6724,12 @@ class OverseerImpl implements AgentHooks {
       // stale records of this agent linger. If pending calls below restart the agent, it'll
       // re-register everything consistently.
       this.#unregisterRunningAgent(chatId);
+
+      // A next turn that compacts first reads none of the cached request.
+      if (finished && lastRequest && meta?.totalTokens !== undefined &&
+          !shouldCompactChat(meta.totalTokens, getModelTokenLimits(aiModel.config).inputBudget)) {
+        this.cacheWarmer.start(chatId, lastRequest, meta.totalTokens);
+      }
 
       if (finished && meta) {
         // Classified here, past the turn's last await, so a decision made as it ended counts.
@@ -11500,6 +11517,17 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     }));
   }
 
+  async viewChat(chatId: number): Promise<RpcStub<{}>> {
+    this.impl.getChatMetaOrThrow(chatId);
+    let leave = this.impl.cacheWarmer.view(chatId);
+    // @ts-expect-error Bugs in native RPC types make this not work currently.
+    return this.#subscriptionLease(new NativeRpcStub<{}>({
+      [Symbol.dispose]() {
+        leave();
+      }
+    }));
+  }
+
   async newChat(initialMessage: string | SlashCommandRequest, chosenModelId: string | null,
                 capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
                 formats?: MessageFormatRef[]): Promise<number> {
@@ -12153,6 +12181,7 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
       _subscriber: RpcStub<AiChatSubscriber>, _startAfter?: Date): Promise<RpcStub<{}>> {
     this.#deny();
   }
+  async viewChat(_chatId: number): Promise<RpcStub<{}>> { this.#deny(); }
   async newChat(_initialMessage: string | SlashCommandRequest, _modelId: string | null,
                  _capsules?: CapsuleSpecifier[], _attachments?: ChatAttachmentHandle[]): Promise<number> {
     this.#deny();
