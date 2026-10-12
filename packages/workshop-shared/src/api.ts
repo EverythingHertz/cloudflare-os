@@ -24,7 +24,7 @@
 // Gadget a stub pointing to the Gadget's server-side Durable Object interface.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, GatekeeperUserSelection, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
 import type { CodeChange } from "./code-change.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
 
@@ -889,6 +889,22 @@ export interface AuthenticatedApi extends RpcTarget {
    * in a sandboxed iframe and exposes `ui` to it over a MessagePort RPC session.
    */
   getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null>;
+
+  /**
+   * Mint a selection ticket for a person picked in the Workshop person picker, on behalf of the
+   * gatekeeper app that opened it. `vendorId` is the `id` passed to `getGatekeeperApp()`;
+   * `selectedUserId` is a `UserDirectoryRecord.id` from `searchUsers()`. Returns null if the person
+   * is the caller or no longer exists. An unavailable selecting app throws. A person's vendor
+   * account count does not affect selection: the exchange returns zero, one, or multiple eligible
+   * accounts at redemption, and the gatekeeper decides how to handle them. The ticket is redeemable
+   * once, for a bounded time, by the app's account alone (see GatekeeperUserSelectionExchange), and
+   * the profile snapshot is the person's current display name. Minting has no side effect on the
+   * gatekeeper and carries no app-specific context: the Workshop delivers the result to the app's
+   * iframe, which decides what to do with it.
+   */
+  createGatekeeperUserSelection(
+      vendorId: string, selectedUserId: string,
+  ): Promise<GatekeeperUserSelection | null>;
 
   // --- Deployment admin ---
 
