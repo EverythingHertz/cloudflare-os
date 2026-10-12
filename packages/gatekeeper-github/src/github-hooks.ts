@@ -645,10 +645,14 @@ const delivered = ({ status_code }: GitHubWebhookDeliveryResponse) => status_cod
 
 /**
  * Whether a request GitHub failed may succeed if made again: GitHub erred or limited it, or never
- * answered, rather than refusing it, and the account's token still works.
+ * answered, rather than refusing it, and the account's token is not known to be dead. A 401 is no
+ * refusal here: withAccountApi() reports a confirmed expiry as such, so a bare 401 is one it could
+ * not adjudicate, as while GitHub fails to renew the token.
  */
 function retryable(error: unknown): boolean {
-  if (error instanceof GitHubApiError) return error.status >= 500 || error.rateLimited;
+  if (error instanceof GitHubApiError) {
+    return error.status >= 500 || error.status === 401 || error.rateLimited;
+  }
   // A confirmed expiry, which withAccountApi() wraps.
   return !isCredentialsExpired((error as { cause?: unknown } | undefined)?.cause);
 }

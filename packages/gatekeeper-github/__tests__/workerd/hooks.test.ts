@@ -155,6 +155,8 @@ class FakeGitHub {
   nameReusedBy: typeof repository | undefined;
   /** While set, GitHub agrees to this many more redeliveries, then refuses the rest with a 500. */
   redeliveriesAllowed: number | undefined;
+  /** While set, GitHub's answer to a token refresh, which none is otherwise expected to ask for. */
+  respondToken: (() => Response) | undefined;
   #nextId = 100;
 
   constructor() {
@@ -177,6 +179,7 @@ class FakeGitHub {
     if (pathname === "/applications/test-client/token" && method === "DELETE") {
       return new Response(null, { status: 204 });
     }
+    if (pathname === "/login/oauth/access_token" && this.respondToken) return this.respondToken();
     const target = this.#target(pathname);
     if (!target) throw new Error(`test: unexpected fetch ${method} ${request.url}`);
     const { repo, key: name, rest } = target;
@@ -1511,6 +1514,33 @@ it.each<[string, (github: FakeGitHub) => void]>([
   github.failDeletesWith = undefined;
   await unwrap(triage.hooks.revokeAccount(account));
   expect(github.webhooks.has(webhook.id)).toBe(false);
+  expect(github.requests).toContain("DELETE /applications/test-client/token");
+});
+
+it("keeps a disconnecting account connected, with its token, while GitHub refuses the token for deleting a webhook and can't renew it", async () => {
+  const github = new FakeGitHub();
+  const account = await connectAccount();
+  // Renewable, as a GitHub App's user token is.
+  const userAccount = env.USER_ACCOUNT.get(env.USER_ACCOUNT.idFromString(account));
+  const stageId = await runInDurableObject(userAccount, (_instance, state) => stageCredentials(state.storage.kv,
+    { accessToken: "test-token", refreshToken: "ghr_1", scopes: ["repo", "admin:repo_hook", "read:user"] }, Date.now()));
+  await userAccount.commitReconnect(stageId);
+  const triage = binding(account);
+  await triage.subscribe();
+  await triage.enable();
+
+  // With GitHub's token endpoint down, nothing confirms the token dead.
+  github.failDeletesWith = 401;
+  github.respondToken = () => new Response("unavailable", { status: 503 });
+  expect(await triage.hooks.revokeAccount(account)).toEqual({
+    error: "GitHub failed to delete some of this account's webhooks, so it is still connected. Disconnect it again to finish.",
+  });
+  expect(github.requests).toContain("POST /login/oauth/access_token");
+  expect(github.requests).not.toContain("DELETE /applications/test-client/token");
+
+  github.failDeletesWith = undefined;
+  await unwrap(triage.hooks.revokeAccount(account));
+  expect(github.webhooks.size).toBe(0);
   expect(github.requests).toContain("DELETE /applications/test-client/token");
 });
 
