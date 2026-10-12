@@ -153,6 +153,8 @@ export interface GatekeeperUserSelectionExchange extends WorkerEntrypoint {
  * The capability a gatekeeper's management UI passes to the Workshop host's `selectUsers()` to
  * receive picker selections. Called once for each person the user picks, while the picker is
  * still open.
+ * The host's `selectUsers()` rejects when the user stops waiting or the frame is torn down.
+ * Cancellation is not a rollback: a receiver may already have acted on a delivered selection.
  */
 export interface GatekeeperUserSelectionReceiver extends RpcTarget {
   /**

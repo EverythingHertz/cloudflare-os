@@ -4,9 +4,10 @@ import { Check, X } from '@phosphor-icons/react'
 import type { RpcStub } from 'capnweb'
 import type { AuthenticatedApi, UserDirectoryRecord } from '@gadgets/workshop-shared/api'
 import type { GatekeeperUserSelection } from '@gadgets/workshop-shared/gatekeeper'
-import { WorkshopIconButton } from './components/WorkshopControls'
-import { PersonAvatar } from './components/PersonAvatar'
-import { UserSearchCombobox } from './UserSearchCombobox'
+import { WorkshopIconButton } from '../../components/WorkshopControls'
+import { PersonAvatar } from '../../components/PersonAvatar'
+import { UserSearchCombobox } from '../user-directory/UserSearchCombobox'
+import { useServerConfig } from '../../ServerConfigContext'
 
 type Props = {
   authenticatedApi: RpcStub<AuthenticatedApi>
@@ -19,11 +20,16 @@ type Props = {
   onSelected: (selection: GatekeeperUserSelection) => Promise<void>
   /** Called once, when the user closes the picker and no pick is still being delivered. */
   onClose: () => void
+  /** Abandons outstanding work; already-delivered selections cannot be undone. */
+  onCancel: () => void
 }
 
 // A person the app has accepted, shown with the display name the Workshop snapshotted for them at
 // minting time (not the directory result they were picked from).
 type PickedPerson = { id: string; name: string }
+
+// searchUsers adds the caller to the directory's maximum of 1,000 exclusions.
+const MAX_PICKED_PEOPLE = 999
 
 /**
  * Trusted Workshop-owned person picker shown over a sandboxed gatekeeper app. For each person the
@@ -37,6 +43,7 @@ export default function GatekeeperUserPickerDialog({
   gatekeeperId,
   onSelected,
   onClose,
+  onCancel,
 }: Props) {
   const [query, setQuery] = useState('')
   const [picked, setPicked] = useState<PickedPerson[]>([])
@@ -45,10 +52,20 @@ export default function GatekeeperUserPickerDialog({
   const [pending, setPending] = useState<string[]>([])
   // The same ids, readable synchronously: two clicks in one tick must not mint two tickets.
   const reserved = useRef(new Set<string>())
+  const accepted = useRef(new Set<string>())
+  const active = useRef(true)
+  const closeRequested = useRef(false)
+  const closeCompleted = useRef(false)
+  const searchEnabled = useServerConfig()?.userSearchEnabled ?? false
   const [closing, setClosing] = useState(false)
   // Set when a pick fails; cleared on the next keystroke.
   const [notice, setNotice] = useState<string | null>(null)
   const [overlayContainer, setOverlayContainer] = useState<HTMLElement | null>(null)
+
+  useEffect(() => {
+    active.current = true
+    return () => { active.current = false }
+  }, [])
 
   // Keep both Kumo backdrops and the popup above a gatekeeper's presenting iframe.
   useEffect(() => {
@@ -61,28 +78,41 @@ export default function GatekeeperUserPickerDialog({
   }, [])
 
   useEffect(() => {
-    if (closing && pending.length === 0) onClose()
+    if (closing && pending.length === 0 && active.current && !closeCompleted.current) {
+      closeCompleted.current = true
+      onClose()
+    }
   }, [closing, onClose, pending.length])
 
   const excludeIds = useMemo(() => [...picked.map(({ id }) => id), ...pending], [picked, pending])
   const search = useCallback(
     (value: string) => authenticatedApi.searchUsers(value, excludeIds), [authenticatedApi, excludeIds])
+  const atLimit = picked.length + pending.length >= MAX_PICKED_PEOPLE
 
   const pick = (user: UserDirectoryRecord) => {
-    if (reserved.current.has(user.id) || excludeIds.includes(user.id)) return
+    if (!active.current || closeRequested.current || accepted.current.has(user.id) ||
+      reserved.current.has(user.id)) return
+    if (accepted.current.size + reserved.current.size >= MAX_PICKED_PEOPLE) {
+      setNotice('You can select up to 999 people at once. Close and reopen the picker to continue.')
+      return
+    }
     reserved.current.add(user.id)
     setPending((current) => [...current, user.id])
     setQuery('')
     authenticatedApi.createGatekeeperUserSelection(gatekeeperId, user.id).then(
       async (selection) => {
+        if (!active.current) return
         if (!selection) {
           setNotice(`${user.name} can no longer be selected. Try searching again.`)
           return
         }
         await onSelected(selection)
+        if (!active.current) return
+        accepted.current.add(user.id)
         setPicked((current) => [...current, { id: user.id, name: selection.profile.displayName }])
       },
     ).catch((error: unknown) => {
+      if (!active.current) return
       console.error('Failed to deliver picked user:', error)
       // The app's own message, when it threw one, is meant for the user.
       setNotice(error instanceof Error && error.message
@@ -90,11 +120,20 @@ export default function GatekeeperUserPickerDialog({
         : `Couldn't select ${user.name}. Try again.`)
     }).finally(() => {
       reserved.current.delete(user.id)
-      setPending((current) => current.filter((id) => id !== user.id))
+      if (active.current) setPending((current) => current.filter((id) => id !== user.id))
     })
   }
 
-  const close = () => setClosing(true)
+  const close = () => {
+    closeRequested.current = true
+    setClosing(true)
+  }
+  const cancel = () => {
+    if (!active.current) return
+    active.current = false
+    closeRequested.current = true
+    onCancel()
+  }
 
   if (!overlayContainer) return null
 
@@ -131,14 +170,31 @@ export default function GatekeeperUserPickerDialog({
               authenticatedApi={authenticatedApi}
               value={query}
               selected={false}
-              disabled={closing}
+              disabled={closing || atLimit}
+              searchEnabled={searchEnabled}
               inputName="gatekeeper-share-people-search"
               search={search}
               onValueChange={(value) => { setQuery(value); setNotice(null) }}
               onSelect={pick}
-              onSubmit={() => {}}
+              onSubmit={() => {
+                const id = query.trim()
+                if (id) pick({ id, name: id })
+              }}
             />
           </div>
+          {atLimit && (
+            <p role="status" className="mt-2 text-[12px] text-kumo-subtle">
+              You can select up to 999 people at once. Close and reopen the picker to continue.
+            </p>
+          )}
+          {closing && pending.length > 0 && (
+            <div className="mt-3 text-[12px] text-kumo-subtle">
+              <p>Waiting for this service. Closing cannot undo selections it already accepted.</p>
+              <button type="button" onClick={cancel} className="mt-2 underline">
+                Stop waiting and close
+              </button>
+            </div>
+          )}
           {notice && (
             <p role="status" className="mt-2 px-3 text-[12px] text-kumo-danger">{notice}</p>
           )}

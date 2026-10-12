@@ -3,13 +3,15 @@ import {
   useEffect,
   useId,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react'
 import type { RpcStub } from 'capnweb'
 import type { AuthenticatedApi, UserDirectoryRecord } from '@gadgets/workshop-shared/api'
-import { PersonAvatar } from './components/PersonAvatar'
-import { isImeComposing } from './keyboardEvent'
+import { PersonAvatar } from '../../components/PersonAvatar'
+import { isImeComposing } from '../../keyboardEvent'
+import { useUserDirectorySearch } from './useUserDirectorySearch'
 
 /** Observable state of the current debounced directory search. */
 export type UserSearchState = {
@@ -18,8 +20,6 @@ export type UserSearchState = {
   resultCount: number
 }
 
-const EMPTY_SEARCH: UserSearchState = { status: 'ready', query: '', resultCount: 0 }
-
 type Props = {
   /** Used only to render each result's avatar. */
   authenticatedApi: RpcStub<AuthenticatedApi>
@@ -27,11 +27,13 @@ type Props = {
   /** True once the caller has accepted a result; hides the listbox until the text changes. */
   selected: boolean
   disabled?: boolean
+  /** Disable directory lookup and accept only a typed exact identifier. */
+  searchEnabled?: boolean
   inputName: string
   search: (query: string) => Promise<UserDirectoryRecord[]>
   onValueChange: (value: string) => void
   onSelect: (user: UserDirectoryRecord) => void
-  /** Enter with no highlighted result. */
+  /** Enter with a nonempty query and no highlighted result, once search has settled. */
   onSubmit: () => void
   onSearchStateChange?: (state: UserSearchState) => void
 }
@@ -42,6 +44,7 @@ export function UserSearchCombobox({
   value,
   selected,
   disabled = false,
+  searchEnabled = true,
   inputName,
   search,
   onValueChange,
@@ -49,82 +52,98 @@ export function UserSearchCombobox({
   onSubmit,
   onSearchStateChange,
 }: Props) {
-  const [searchState, setSearchState] = useState<UserSearchState>(EMPTY_SEARCH)
-  const [results, setResults] = useState<UserDirectoryRecord[]>([])
+  const query = value.trim()
+  const searching = searchEnabled && !disabled && !selected && query !== ''
+  const directory = useUserDirectorySearch({ query, enabled: searching, search })
+  const [dismissed, setDismissed] = useState(false)
   const [activeIndex, setActiveIndex] = useState(0)
   const listboxId = useId()
   const activeOptionRef = useRef<HTMLButtonElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
 
-  const query = value.trim()
-  const open = !selected && query !== ''
+  const open = searching && directory.current && !dismissed
+  const results = directory.results
+  const directOption = directory.settled && results.length > 0
+  const optionCount = results.length + (directOption ? 1 : 0)
+  const searchState = useMemo<UserSearchState>(() => ({
+    status: directory.status,
+    query: directory.query,
+    resultCount: results.length,
+  }), [directory.query, directory.status, results.length])
 
   useEffect(() => {
-    const update = (state: UserSearchState, users: UserDirectoryRecord[]) => {
-      setResults(users)
-      setSearchState(state)
-      onSearchStateChange?.(state)
-    }
-    if (disabled || !open) {
-      update(EMPTY_SEARCH, [])
-      return
-    }
-    let cancelled = false
-    update({ status: 'loading', query, resultCount: 0 }, [])
+    onSearchStateChange?.(searchState)
+  }, [onSearchStateChange, searchState])
+
+  useEffect(() => {
     setActiveIndex(0)
-    // Debounced: every keystroke from every user would otherwise hit the one directory DO.
-    const timer = window.setTimeout(() => {
-      search(query).then(
-        (users) => {
-          if (!cancelled) update({ status: 'ready', query, resultCount: users.length }, users)
-        },
-        (error) => {
-          if (cancelled) return
-          console.error('Failed to search user directory:', error)
-          update({ status: 'failed', query, resultCount: 0 }, [])
-        },
-      )
-    }, 200)
-    return () => {
-      cancelled = true
-      window.clearTimeout(timer)
-    }
-  }, [disabled, onSearchStateChange, open, query, search])
+    setDismissed(false)
+  }, [query, search, searching])
+
+  const selectCurrentUser = (user: UserDirectoryRecord) => {
+    if (open && inputRef.current?.value.trim() === query && results.includes(user)) onSelect(user)
+  }
+
+  const submitCurrentIdentifier = () => {
+    if (!disabled && !selected && query !== '' && inputRef.current?.value.trim() === query &&
+      (!searchEnabled || directory.settled)) onSubmit()
+  }
 
   useLayoutEffect(() => {
     if (open) activeOptionRef.current?.scrollIntoView({ block: 'nearest' })
   }, [activeIndex, open, results])
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    if (isImeComposing(event)) return
+    if (disabled || isImeComposing(event)) return
+    const inputCurrent = event.currentTarget.value.trim() === query
     if (event.key === 'Enter') {
       event.preventDefault()
+      if (!inputCurrent || query === '') return
       const user = open ? results[activeIndex] : undefined
-      if (user) onSelect(user)
-      else onSubmit()
+      if (user) selectCurrentUser(user)
+      else submitCurrentIdentifier()
       return
     }
-    if (open && results.length > 0 && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+    if (event.key === 'Escape' && open) {
       event.preventDefault()
-      const direction = event.key === 'ArrowDown' ? 1 : -1
-      setActiveIndex(current => (current + direction + results.length) % results.length)
+      event.stopPropagation()
+      setDismissed(true)
+      return
+    }
+    if (inputCurrent && searching && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) {
+      event.preventDefault()
+      if (!open) {
+        setDismissed(false)
+        return
+      }
+      if (optionCount > 0) {
+        const direction = event.key === 'ArrowDown' ? 1 : -1
+        setActiveIndex(current => (current + direction + optionCount) % optionCount)
+      }
     }
   }
 
   return (
     <div className="relative min-w-0 flex-1">
       <input
+        ref={inputRef}
         type="search"
-        role="combobox"
-        placeholder="Search by name or email"
-        aria-label="Search people"
-        aria-autocomplete="list"
-        aria-expanded={open}
+        role={searchEnabled ? 'combobox' : undefined}
+        placeholder={searchEnabled ? 'Search by name or email' : 'Username or email'}
+        aria-label={searchEnabled ? 'Search people' : 'Username or email'}
+        aria-autocomplete={searchEnabled ? 'list' : undefined}
+        aria-expanded={searchEnabled ? open : undefined}
         aria-controls={open ? listboxId : undefined}
-        aria-activedescendant={open && results[activeIndex]
+        aria-activedescendant={open && activeIndex < optionCount
           ? `${listboxId}-option-${activeIndex}`
           : undefined}
         value={value}
-        onChange={(event) => onValueChange(event.target.value)}
+        onChange={(event) => {
+          setDismissed(false)
+          onValueChange(event.target.value)
+        }}
+        onFocus={() => setDismissed(false)}
+        onBlur={() => setDismissed(true)}
         onKeyDown={handleKeyDown}
         name={inputName}
         autoComplete="off"
@@ -139,6 +158,11 @@ export function UserSearchCombobox({
         className="h-9 w-full min-w-0 appearance-none border-0 bg-transparent p-0 text-[14px] leading-5 tracking-[-0.25px] text-kumo-default outline-none placeholder:text-kumo-inactive disabled:cursor-not-allowed [&::-webkit-search-cancel-button]:hidden"
         disabled={disabled}
       />
+      {!searchEnabled && !disabled && !selected && query !== '' && (
+        <button type="button" onClick={submitCurrentIdentifier} className="mt-2 text-[13px] underline">
+          Select {query}
+        </button>
+      )}
       {open && (
         <div
           id={listboxId}
@@ -165,7 +189,7 @@ export function UserSearchCombobox({
               aria-selected={index === activeIndex}
               onMouseEnter={() => setActiveIndex(index)}
               onMouseDown={(event) => event.preventDefault()}
-              onClick={() => onSelect(user)}
+              onClick={() => selectCurrentUser(user)}
               className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left ${
                 index === activeIndex ? 'bg-kumo-tint' : 'hover:bg-kumo-tint/70'
               }`}
@@ -181,6 +205,21 @@ export function UserSearchCombobox({
               </span>
             </button>
           ))}
+          {directOption && (
+            <button
+              ref={activeIndex === results.length ? activeOptionRef : undefined}
+              id={`${listboxId}-option-${results.length}`}
+              type="button"
+              role="option"
+              aria-selected={activeIndex === results.length}
+              onMouseEnter={() => setActiveIndex(results.length)}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={submitCurrentIdentifier}
+              className="w-full rounded-xl px-3 py-2 text-left text-[13px] hover:bg-kumo-tint/70"
+            >
+              Select exact username or email: {query}
+            </button>
+          )}
         </div>
       )}
     </div>

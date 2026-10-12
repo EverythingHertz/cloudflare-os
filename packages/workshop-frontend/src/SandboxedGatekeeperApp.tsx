@@ -21,7 +21,7 @@ import {
   parseGatekeeperAppWorkspaceTarget,
   type GatekeeperAppWorkspaceTarget,
 } from './gatekeeperAppNavigation'
-import GatekeeperUserPickerDialog from './GatekeeperUserPickerDialog'
+import GatekeeperUserPickerDialog from './features/gatekeeper-sharing/GatekeeperUserPickerDialog'
 
 // The content-pane rect, in viewport coordinates, that the app pins its page to while the iframe
 // is full-viewport.
@@ -39,8 +39,17 @@ type OpenTarget = (target: GatekeeperAppWorkspaceTarget) => void
 // can no longer see. Deliberately a lookup, not an enumeration: the app learns nothing new.
 type ResolveWorkspaceTitles = (ids: string[]) => Promise<(string | null)[]>
 type OpenPrompt = (prompt: string) => void
+// Opening throws synchronously if refused; returning transfers receiver ownership to the picker.
 type OpenUserPicker = (receiver: RpcStub<GatekeeperUserSelectionReceiver>) => Promise<void>
-type CloseUserPicker = () => void
+type CancelUserPicker = () => void
+
+type UserPicker = {
+  receiver: RpcStub<GatekeeperUserSelectionReceiver>
+  resolve: () => void
+  reject: (error: Error) => void
+}
+
+const USER_PICKER_CANCELLED = 'Person selection cancelled. A delivery may already have been accepted.'
 
 type OverlayState = 'full' | null
 
@@ -92,7 +101,7 @@ class GatekeeperAppHostImpl extends RpcTarget {
   readonly #openPrompt: OpenPrompt
   readonly #resolveWorkspaceTitles: ResolveWorkspaceTitles
   readonly #openUserPicker: OpenUserPicker
-  readonly #closeUserPicker: CloseUserPicker
+  readonly #cancelUserPicker: CancelUserPicker
   #presenting = false
   #theme: GatekeeperAppTheme
   #themeReceiver: RpcStub<GatekeeperAppThemeReceiver> | null = null
@@ -109,7 +118,7 @@ class GatekeeperAppHostImpl extends RpcTarget {
     openPrompt: OpenPrompt,
     resolveWorkspaceTitles: ResolveWorkspaceTitles,
     openUserPicker: OpenUserPicker,
-    closeUserPicker: CloseUserPicker,
+    cancelUserPicker: CancelUserPicker,
   ) {
     super()
     this.#theme = theme
@@ -127,7 +136,7 @@ class GatekeeperAppHostImpl extends RpcTarget {
     this.#openPrompt = openPrompt
     this.#resolveWorkspaceTitles = resolveWorkspaceTitles
     this.#openUserPicker = openUserPicker
-    this.#closeUserPicker = closeUserPicker
+    this.#cancelUserPicker = cancelUserPicker
   }
 
   get ui(): RpcStub<RpcTarget> {
@@ -158,19 +167,23 @@ class GatekeeperAppHostImpl extends RpcTarget {
   // (AuthenticatedApi.createGatekeeperUserSelection) and delivers it to `receiver.selected()` — to
   // the iframe, not to the gatekeeper's server. The app decides what a selection is for: it can send
   // the ticket to its backend at once, or hold it in form state and submit it later, while it is
-  // valid. The promise resolves when the picker closes and every delivery has settled; it stays
-  // pending for as long as the picker is open (no timeout). Only one picker can be open at a time.
+  // valid. The promise resolves when the picker closes and every delivery has settled, or rejects
+  // immediately on cancellation (including frame teardown). Cancellation cannot undo a delivery
+  // the app may already have accepted. Otherwise it stays pending while open (no timeout).
+  // Only one picker can be open at a time.
   selectUsers(receiver: RpcStub<GatekeeperUserSelectionReceiver>): Promise<void> {
     if (typeof receiver?.dup !== 'function') {
       return Promise.reject(new TypeError('selectUsers requires a receiver capability.'))
     }
-    // The argument stub is disposed when this call returns, so the picker keeps its own dup, which
-    // it releases when it closes. Nothing keeps it if the picker cannot open.
+    // The argument stub is disposed when this call returns. Opening transfers this dup to the
+    // picker, which releases it on close or cancellation; only an opening failure releases it here.
     const retained = receiver.dup()
-    return this.#openUserPicker(retained).catch((error: unknown) => {
+    try {
+      return this.#openUserPicker(retained)
+    } catch (error) {
       retained[Symbol.dispose]()
-      throw error
-    })
+      return Promise.reject(error)
+    }
   }
 
   // The app calls this once to learn the current theme and register a receiver for later changes.
@@ -227,7 +240,7 @@ class GatekeeperAppHostImpl extends RpcTarget {
   // Cancel the rate limiter's pending resume timer once this host is no longer in use.
   dispose() {
     this.#disposeRateLimiter()
-    this.#closeUserPicker()
+    this.#cancelUserPicker()
     this.#themeReceiver?.[Symbol.dispose]?.()
     this.#themeReceiver = null
     if (this.#frameId !== null) {
@@ -261,16 +274,11 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
   const connectedRef = useRef(false)
   const invalidatedRef = useRef(false)
   const [overlay, setOverlay] = useState<OverlayState>(null)
-  // The open picker, if any: the app's receiver (the host's own dup, released on close) and the
-  // resolver of the `selectUsers()` promise it holds pending. State drives rendering; the ref lets
-  // the host's callbacks reach it without a render.
-  const [userPicker, setUserPicker] = useState<{
-    receiver: RpcStub<GatekeeperUserSelectionReceiver>
-  } | null>(null)
-  const openPickerRef = useRef<{
-    receiver: RpcStub<GatekeeperUserSelectionReceiver>
-    resolve: () => void
-  } | null>(null)
+  // The open picker owns the receiver dup and settles `selectUsers()` on close or cancellation.
+  // State drives rendering; the ref lets callbacks check identity before settling, so late
+  // callbacks from a cancelled picker cannot close a newly opened picker.
+  const [userPicker, setUserPicker] = useState<UserPicker | null>(null)
+  const openPickerRef = useRef<UserPicker | null>(null)
   const overlayRef = useRef<OverlayState>(null)
   // Push the Workshop's resolved light/dark mode and deployment accent whenever either changes.
   const { resolvedThemeMode } = useTheme()
@@ -339,24 +347,34 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
   }, [navigate])
   const openUserPicker = useCallback<OpenUserPicker>((receiver) => {
     if (openPickerRef.current) {
-      return Promise.reject(new Error('A person picker is already open.'))
+      throw new Error('A person picker is already open.')
     }
     // Promise.withResolvers is not in this package's ES2023 TypeScript lib.
     let resolve!: () => void
-    const promise = new Promise<void>((resolver) => { resolve = resolver })
-    openPickerRef.current = { receiver, resolve }
-    setUserPicker({ receiver })
+    let reject!: (error: Error) => void
+    const promise = new Promise<void>((resolver, rejecter) => {
+      resolve = resolver
+      reject = rejecter
+    })
+    const open = { receiver, resolve, reject }
+    openPickerRef.current = open
+    setUserPicker(open)
     return promise
   }, [])
-  // Called once the picker has no delivery in flight, so the receiver is not invoked after this.
-  const closeUserPicker = useCallback(() => {
-    const open = openPickerRef.current
-    if (!open) return
+  // Normal closing waits for deliveries; cancellation releases ownership immediately even if
+  // a receiver never settles. Neither path may dispose or settle the same picker twice.
+  const finishUserPicker = useCallback((open: UserPicker, cancelled: boolean) => {
+    if (openPickerRef.current !== open) return
     openPickerRef.current = null
     setUserPicker(null)
     open.receiver[Symbol.dispose]()
-    open.resolve()
+    if (cancelled) open.reject(new Error(USER_PICKER_CANCELLED))
+    else open.resolve()
   }, [])
+  const cancelUserPicker = useCallback<CancelUserPicker>(() => {
+    const open = openPickerRef.current
+    if (open) finishUserPicker(open, true)
+  }, [finishUserPicker])
   // The gatekeeper-defined capability remains opaque; this host only relays it through `ui`.
   const capabilityRef = useRef<unknown>(null)
   capabilityRef.current = frame.ui
@@ -389,7 +407,7 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
         openPrompt,
         resolveWorkspaceTitles,
         openUserPicker,
-        closeUserPicker,
+        cancelUserPicker,
       )
       hostRef.current = host
       sessionRef.current = newMessagePortRpcSession(port, host)
@@ -422,7 +440,7 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
     }
     // Re-establish the session if either the HTML or the `ui` capability changes, so a new frame
     // carrying a fresh stub (even with identical HTML) never keeps talking through the stale one.
-  }, [frame.iframeHtml, frame.ui, gatekeeperVendorId, closeUserPicker, openPrompt, openTarget,
+  }, [frame.iframeHtml, frame.ui, gatekeeperVendorId, cancelUserPicker, openPrompt, openTarget,
       openUserPicker, present, resolveWorkspaceTitles, setOverlayPhase])
 
   return (
@@ -441,8 +459,14 @@ export default function SandboxedGatekeeperApp({ frame, gatekeeperVendorId }: {
         <GatekeeperUserPickerDialog
           authenticatedApi={authenticatedApi}
           gatekeeperId={gatekeeperVendorId}
-          onSelected={(selection) => userPicker.receiver.selected(selection)}
-          onClose={closeUserPicker}
+          onSelected={(selection) => {
+            if (openPickerRef.current !== userPicker) {
+              return Promise.reject(new Error(USER_PICKER_CANCELLED))
+            }
+            return userPicker.receiver.selected(selection)
+          }}
+          onClose={() => finishUserPicker(userPicker, false)}
+          onCancel={() => finishUserPicker(userPicker, true)}
         />
       )}
     </>

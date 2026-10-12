@@ -13,7 +13,7 @@ import GatekeeperUserPickerDialog from "./GatekeeperUserPickerDialog";
 
 const captured = vi.hoisted(() => ({ props: null as unknown }));
 
-vi.mock("./UserSearchCombobox", () => ({
+vi.mock("../user-directory/UserSearchCombobox", () => ({
   UserSearchCombobox: (props: unknown) => {
     captured.props = props;
     return null;
@@ -26,16 +26,18 @@ vi.mock("@cloudflare/kumo", () => {
   return { Dialog };
 });
 
-vi.mock("./components/WorkshopControls", () => ({
+vi.mock("../../components/WorkshopControls", () => ({
   WorkshopIconButton: ({ children, ...props }: { children?: ReactNode }) =>
     <button type="button" {...props}>{children}</button>,
 }));
 
-vi.mock("./components/PersonAvatar", () => ({ PersonAvatar: () => null }));
+vi.mock("../../components/PersonAvatar", () => ({ PersonAvatar: () => null }));
 
 type CapturedProps = {
   search(query: string): Promise<UserDirectoryRecord[]>;
   onSelect(user: UserDirectoryRecord): void;
+  onValueChange(value: string): void;
+  onSubmit(): void;
 };
 
 const ALICE: UserDirectoryRecord = { id: "alice@example.com", name: "Alice" };
@@ -82,6 +84,7 @@ describe("GatekeeperUserPickerDialog", () => {
     const createSelection = vi.fn<Mint>(mint);
     const onSelected = vi.fn<Deliver>(deliver);
     const onClose = vi.fn<() => void>();
+    const onCancel = vi.fn<() => void>();
 
     container = document.createElement("div");
     document.body.append(container);
@@ -94,9 +97,10 @@ describe("GatekeeperUserPickerDialog", () => {
         gatekeeperId="context"
         onSelected={onSelected}
         onClose={onClose}
+        onCancel={onCancel}
       />,
     ));
-    return { searchUsers, createSelection, onSelected, onClose, props: () => captured.props as CapturedProps };
+    return { searchUsers, createSelection, onSelected, onClose, onCancel, props: () => captured.props as CapturedProps };
   }
 
   const added = () => container!.querySelector('[aria-label="Added people"]')?.textContent ?? "";
@@ -209,4 +213,48 @@ describe("GatekeeperUserPickerDialog", () => {
     await act(async () => { deliveries.get(selectionFor(ALICE).ticket)!.resolve(); });
     expect(added()).toBe("CarolAlice");
   });
+  it("selects a trimmed exact identifier and displays the backend snapshot", async () => {
+    const { props } = await mount(mintFor);
+    await act(async () => props().onValueChange(`  ${ALICE.id}  `));
+    await act(async () => props().onSubmit());
+    expect(added()).toBe("Alice");
+    await act(async () => props().onValueChange("missing@example.com"));
+    await act(async () => props().onSubmit());
+    expect(notice()).toContain("can no longer be selected");
+    expect(added()).toBe("Alice");
+  });
+
+  it("cancels a stalled mint without delivering its late ticket or completing normally", async () => {
+    const minting = deferred<GatekeeperUserSelection | null>();
+    const { props, onSelected, onClose, onCancel } = await mount(() => minting.promise);
+    await act(async () => props().onSelect(ALICE));
+    await act(async () => closeButton().click());
+    const stop = Array.from(container!.querySelectorAll("button"))
+      .find(button => button.textContent === "Stop waiting and close")!;
+    expect(container!.textContent).toContain("cannot undo selections");
+    await act(async () => stop.click());
+    expect(onCancel).toHaveBeenCalledOnce();
+    await act(async () => { minting.resolve(selectionFor(ALICE)); await minting.promise; });
+    expect(onSelected).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(added()).not.toContain("Alice");
+  });
+
+  it("bounds concurrent picks at 999 and frees a slot after a failed mint", async () => {
+    const minting = deferred<GatekeeperUserSelection | null>();
+    const { props, createSelection } = await mount(() => minting.promise);
+    await act(async () => {
+      for (let index = 0; index < 1000; index++) {
+        props().onSelect({ id: `person-${index}`, name: `Person ${index}` });
+      }
+    });
+    expect(createSelection).toHaveBeenCalledTimes(999);
+    expect(container!.querySelectorAll('li[role="status"]')).toHaveLength(999);
+    expect(container!.textContent).toContain("Close and reopen the picker to continue");
+    await act(async () => { minting.resolve(null); await minting.promise; });
+    await act(async () => props().onSelect(ALICE));
+    expect(createSelection).toHaveBeenLastCalledWith("context", ALICE.id);
+    expect(createSelection).toHaveBeenCalledTimes(1000);
+  });
+
 });

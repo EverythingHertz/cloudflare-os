@@ -28,12 +28,16 @@ import SandboxedGatekeeperApp from "./SandboxedGatekeeperApp";
 type PickerProps = {
   onSelected(selection: GatekeeperUserSelection): Promise<void>;
   onClose(): void;
+  onCancel(): void;
 };
 const picker = vi.hoisted(() => ({ props: null as PickerProps | null }));
-vi.mock("./GatekeeperUserPickerDialog", () => ({
+vi.mock("./features/gatekeeper-sharing/GatekeeperUserPickerDialog", () => ({
   default: (props: PickerProps) => {
     picker.props = props;
-    return <button type="button" aria-label="Close person picker" onClick={props.onClose} />;
+    return <>
+      <button type="button" aria-label="Close person picker" onClick={props.onClose} />
+      <button type="button" aria-label="Cancel person picker" onClick={props.onCancel} />
+    </>;
   },
 }));
 
@@ -89,6 +93,7 @@ class TestReceiver extends RpcTarget implements GatekeeperUserSelectionReceiver 
   received: GatekeeperUserSelection[] = [];
   backend: Promise<void> = Promise.resolve();
   disposed = false;
+  disposeCount = 0;
 
   async selected(selection: GatekeeperUserSelection): Promise<void> {
     this.received.push(selection);
@@ -98,6 +103,7 @@ class TestReceiver extends RpcTarget implements GatekeeperUserSelectionReceiver 
 
   [Symbol.dispose](): void {
     this.disposed = true;
+    this.disposeCount++;
   }
 }
 
@@ -180,7 +186,9 @@ describe("SandboxedGatekeeperApp navigation", () => {
       await tick();
     });
     expect(picker.props).not.toBeNull();
-    await expect(host!.selectUsers(new TestReceiver())).rejects.toThrow("A person picker is already open.");
+    const refusedReceiver = new TestReceiver();
+    await expect(host!.selectUsers(refusedReceiver)).rejects.toThrow("A person picker is already open.");
+    await vi.waitFor(() => expect(refusedReceiver.disposeCount).toBe(1));
     await expect(host!.selectUsers("collection-1")).rejects.toThrow(TypeError);
 
     // The receiver decides when a selection counts as taken: it awaits its own backend call, and
@@ -223,19 +231,83 @@ describe("SandboxedGatekeeperApp navigation", () => {
     await expect(secondPick).resolves.toBeUndefined();
   });
 
-  it("releases the receiver and picker when the host unmounts", async () => {
+  it("cancels a stalled delivery and ignores its late callbacks after reopening", async () => {
     await mountApp();
     const receiver = new TestReceiver();
+    let releaseBackend!: () => void;
+    receiver.backend = new Promise<void>((resolve) => { releaseBackend = resolve; });
     let pendingPick!: Promise<void>;
     await act(async () => {
       pendingPick = host!.selectUsers(receiver);
       await tick();
     });
+    const oldPicker = picker.props!;
+    const outcome = pendingPick.then(() => undefined, (error: unknown) => error);
+    const delivery = oldPicker.onSelected(ALICE);
+    // Disposal need not retract a call already accepted by the app.
+    const deliveryOutcome = delivery.catch(() => {});
+    await vi.waitFor(() => expect(receiver.received).toEqual([ALICE]));
+    expect(await settled(delivery)).toBe(false);
+
+    const cancelPicker = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Cancel person picker"]',
+    );
+    if (!cancelPicker) throw new Error("Missing person picker cancel button");
+    await act(async () => cancelPicker.click());
+    const error = await outcome;
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/cancelled.*delivery may already have been accepted/i);
+    expect(document.querySelector('button[aria-label="Cancel person picker"]')).toBeNull();
+    await vi.waitFor(() => expect(receiver.disposeCount).toBe(1));
+
+    const again = new TestReceiver();
+    let secondPick!: Promise<void>;
+    await act(async () => {
+      secondPick = host!.selectUsers(again);
+      await tick();
+    });
+    const newPicker = picker.props!;
+    await act(async () => {
+      oldPicker.onClose();
+      oldPicker.onCancel();
+    });
+    await expect(oldPicker.onSelected(ALICE)).rejects.toThrow("Person selection cancelled.");
+    releaseBackend();
+    await deliveryOutcome;
+    expect(await settled(secondPick)).toBe(false);
+    expect(again.disposeCount).toBe(0);
+    expect(receiver.disposeCount).toBe(1);
+    await expect(newPicker.onSelected(ALICE)).resolves.toBeUndefined();
+    expect(again.received).toEqual([ALICE]);
+    await act(async () => newPicker.onClose());
+    await expect(secondPick).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(again.disposeCount).toBe(1));
+  });
+
+  it("releases a stalled receiver and picker when the host unmounts", async () => {
+    await mountApp();
+    const receiver = new TestReceiver();
+    let releaseBackend!: () => void;
+    receiver.backend = new Promise<void>((resolve) => { releaseBackend = resolve; });
+    let pendingPick!: Promise<void>;
+    await act(async () => {
+      pendingPick = host!.selectUsers(receiver);
+      await tick();
+    });
+    const oldPicker = picker.props!;
+    const delivery = oldPicker.onSelected(ALICE).catch(() => {});
+    await vi.waitFor(() => expect(receiver.received).toEqual([ALICE]));
     // The client keeps its side of the session, so it observes the host releasing the receiver.
-    pendingPick.catch(() => {});
+    const outcome = pendingPick.then(() => undefined, (error: unknown) => error);
     await act(async () => root!.unmount());
     root = undefined;
-    await vi.waitFor(() => expect(receiver.disposed).toBe(true));
+    expect(await outcome).toBeInstanceOf(Error);
+    await vi.waitFor(() => expect(receiver.disposeCount).toBe(1));
+    oldPicker.onClose();
+    oldPicker.onCancel();
+    releaseBackend();
+    await delivery;
+    expect(receiver.disposeCount).toBe(1);
     expect(document.querySelector('button[aria-label="Close person picker"]')).toBeNull();
   });
 
