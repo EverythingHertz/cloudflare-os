@@ -62,7 +62,7 @@ One per X user, named by the user's ID.
 |---|---|---|
 | `sub:<event type>` | `{ id, deleting?, at? }` | The subscription X delivers this user's `post.mention.create`, `post.reply.create` or `post.create` events through, and when this router made or adopted it. Forgotten for the private two when X reports an `oauth.revoke` from after `at`, since X deleted them; one made since is kept, though X delivers the revocation again or late. Once nothing watches it, kept until X confirms deleting it: `deleting` marks one X failed to delete, deleted again from the alarm every 15 minutes, or before a new watcher subscribes afresh. |
 | `watch:<event type>:<account id>` | `true` | An account whose driver watches for the event; the last to go ends the subscription. |
-| `unconfirmed:<event type>` | `{ userId }` | A subscription request whose outcome X never reported. X may have made it, so the alarm looks for it 15 minutes later: one X has is recorded under `sub:`, and ended there unless a hook watches it. |
+| `unconfirmed:<event type>` | `{ userId }` | A subscription request whose outcome X never reported, or reported only as an internal error. X may have made it, so the alarm looks for it 15 minutes later: one X has is recorded under `sub:`, and ended there unless a hook watches it. |
 
 ## XWebhookRegistry
 

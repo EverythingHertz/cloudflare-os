@@ -224,6 +224,29 @@ describe("subscribing", () => {
     expect(subscriptionsOf(x).map(([type]) => type)).toEqual(["oauth.revoke"]);
   });
 
+  it("adopts a subscription X made though it answered with only an internal error, and ends it", async () => {
+    const x = new FakeX().install();
+    const account = await seedAccount(x);
+    const hook = binding({ userObjectId: account, resourceKind: "profile", username: "bob" });
+    await hook.subscribe([["subscribePosts"]]);
+    let failing = true;
+    x.on("POST", /^\/2\/activity\/subscriptions$/, request => {
+      const { event_type: eventType, filter } = JSON.parse(request.body!) as { event_type: string; filter: { user_id?: string } };
+      if (!failing || eventType !== "post.create") return undefined;
+      failing = false;
+      // X makes the subscription, then reports an internal error in its place, as its schema allows.
+      const id = x.id();
+      x.subscriptions.set(id, { subscription_id: id, event_type: eventType, filter, by: "app" });
+      return json({ errors: [{
+        type: "https://api.x.com/2/problems/internal-error", title: "Internal Error", detail: "Something went wrong.",
+      }] });
+    });
+    await hook.enable();
+    expect(subscriptionsOf(x)).toContainEqual(["post.create", BOB.id, "app"]);
+    await hook.disable();
+    expect(subscriptionsOf(x).map(([type]) => type)).toEqual(["oauth.revoke"]);
+  });
+
   it.each([
     ["fails", () => json({ title: "Service Unavailable" }, { status: 503 })],
     ["answers without deleting", () => json({ data: { deleted: false } })],
@@ -490,18 +513,22 @@ describe("accounts going away", () => {
     expect(x.subscriptions.size).toBe(0);
   });
 
-  it("subscribes to revocations again after X answered with errors in place of the subscription", async () => {
+  it.each([
+    ["errors in place of the subscription", { errors: [{ title: "Internal Error", detail: "Something went wrong.", type: "about:blank" }] },
+      /Something went wrong/],
+    ["no subscription ID", { data: {} }, /without returning its ID/],
+  ])("subscribes to revocations again after X answered with %s", async (_label, answer, refusal) => {
     const x = new FakeX().install();
     let erroring = true;
     x.on("POST", /^\/2\/activity\/subscriptions$/, request => {
       if (!erroring || JSON.parse(request.body!).event_type !== "oauth.revoke") return undefined;
       erroring = false;
-      return json({ errors: [{ title: "Internal Error", detail: "Something went wrong.", type: "about:blank" }] });
+      return json(answer);
     });
     const account = await seedAccount(x);
     const mentions = binding({ userObjectId: account, resourceKind: "account" });
     await mentions.subscribe([["subscribeMentions"]]);
-    expect(failure(await mentions.tryEnable())).toMatch(/Something went wrong/);
+    expect(failure(await mentions.tryEnable())).toMatch(refusal);
     await mentions.enable();
     expect(subscriptionsOf(x).map(([type]) => type)).toEqual(["oauth.revoke", "post.mention.create"]);
   });

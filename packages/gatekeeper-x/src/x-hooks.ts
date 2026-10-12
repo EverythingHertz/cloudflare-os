@@ -29,7 +29,7 @@ import type {
 } from "@gadgets/workshop-shared/gatekeeper";
 import { obsContext } from "./observability";
 import type { XPostHook } from "./types";
-import { XApi, XApiError, isOutcomeUnknown, requireData } from "./x-api";
+import { XApi, XApiError, isOutcomeUnknown, requireData, requireResult, type XEnvelope } from "./x-api";
 import { accountSource } from "./x-credentials";
 import { SIGNATURE_HEADER, VENDOR_ID, webhookUrl, type Env } from "./x-env";
 
@@ -434,7 +434,7 @@ export class XActivityRouter extends DurableObject<Env> {
           return new XApi(creds.accessToken).post<SubscriptionResponse>("/2/activity/subscriptions", body);
         })
         : await appApi(this.env).post<SubscriptionResponse>("/2/activity/subscriptions", body);
-      return { id: subscriptionIdOf(requireData(created, "subscription")), at };
+      return { id: subscriptionIdOf(created), at };
     } catch (error) {
       // Refused as one X already has, or perhaps made with the answer lost: either way, X's is adopted.
       if (!isDuplicate(error) && !isOutcomeUnknown(error)) throw error;
@@ -515,9 +515,15 @@ export function isDuplicate(error: unknown): boolean {
 
 type SubscriptionResponse = { subscription?: { subscription_id?: string } };
 
-function subscriptionIdOf(data: SubscriptionResponse): string {
-  const id = data.subscription?.subscription_id;
-  if (!id) throw new XApiError(502, "X created the subscription without returning its ID.");
+/**
+ * The ID of the subscription a creation made, with an error X reported in its place classified as a
+ * write's is (`requireResult`). X's schema lets a 200 hold only an internal error, which can come
+ * with the subscription made all the same, so that and an answer without the ID leave the outcome
+ * unknown, rather than refuse the subscription for good.
+ */
+function subscriptionIdOf(envelope: XEnvelope<SubscriptionResponse>): string {
+  const id = requireResult(envelope).data?.subscription?.subscription_id;
+  if (!id) throw new XApiError(502, "X accepted the subscription without returning its ID.");
   return id;
 }
 
@@ -619,10 +625,11 @@ export class XWebhookRegistry extends DurableObject<Env> {
   async #subscribeToRevocations(webhookId: string): Promise<void> {
     if (this.ctx.storage.kv.get("revokeSubscribed")) return;
     try {
-      // X can answer 200 with errors in place of the subscription, which would make none.
-      requireData(await appApi(this.env).post<SubscriptionResponse>("/2/activity/subscriptions", {
+      // Only an answer naming the subscription counts. If X made one all the same, asking again is
+      // refused as a duplicate, which does.
+      subscriptionIdOf(await appApi(this.env).post<SubscriptionResponse>("/2/activity/subscriptions", {
         event_type: "oauth.revoke", filter: {}, webhook_id: webhookId, tag: TAG,
-      }), "subscription");
+      }));
     } catch (error) {
       if (!isDuplicate(error)) throw error;
     }
