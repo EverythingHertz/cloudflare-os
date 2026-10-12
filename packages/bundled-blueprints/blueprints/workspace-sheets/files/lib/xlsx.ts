@@ -855,14 +855,14 @@ function formulaFunctionAt(formula: string, offset: number): FormulaRewrite | nu
   return parenthesis > end ? {end: parenthesis, text: formula.slice(offset, end)} : null;
 }
 
-// Mirrors the grid's tokenizer: inside a string a doubled quote, or a backslash before the quote,
-// is a literal quote. Emits the Excel form (double quotes, doubled inside) or null when unterminated.
+// Mirrors the grid: doubled quotes escape text; only single-quoted text accepts backslash escapes.
+// Emits Excel's double-quoted, doubled-inside form, or null when unterminated.
 function stringLiteralAt(formula: string, offset: number): FormulaRewrite | null {
   const quote = formula[offset];
   let text = "";
   for (let i = offset + 1; i < formula.length; ++i) {
     const character = formula[i];
-    const escaped = formula[i + 1] === quote && (character === quote || character === "\\");
+    const escaped = formula[i + 1] === quote && (character === quote || quote === "'" && character === "\\");
     if (escaped) {
       text += quote;
       ++i;

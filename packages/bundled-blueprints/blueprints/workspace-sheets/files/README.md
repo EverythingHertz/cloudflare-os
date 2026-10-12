@@ -37,7 +37,7 @@ A lightweight, persistent spreadsheet Gadget with a familiar grid interface, for
   - `=VLOOKUP(E2,A2:C20,3,FALSE)` (`TRUE` and `FALSE` are accepted as logical values without parentheses)
   - `=COUNTIF(A2:A20,'Complete')` (single-quoted text is accepted in addition to double quotes)
   - `=Sheet2!A1*2`
-- Within quoted formula text, doubled quotes or a backslash before the matching quote denote a literal quote. Other backslashes, including pairs, remain literal. Row and column edits preserve literal backslashes next to quotes. Quoted sheet names accept escaped apostrophes, such as `='Owner\'s Sheet'!A1`; XLSX export converts them to Excel's doubled-apostrophe spelling without turning the formula into text.
+- Double-quoted formula text uses Excel-style doubled quotes (`""`) to embed a quote; backslashes always remain literal, including before the closing quote. For example, `="C:\"&A1` keeps its existing meaning. Backslash-double-quote escapes are intentionally unsupported so persisted workbook calculations do not change. Single-quoted text accepts doubled apostrophes or `\'`; quoted sheet names accept the same apostrophe escapes, such as `='Owner\'s Sheet'!A1`. XLSX export converts those single-quoted forms to Excel spelling.
 - Ranges accept whitespace around `:` (for example `=SUM(A1 : B1)`). Quoted sheet prefixes keep literal backslashes, such as `='C:\Data'!A1`; copying, editing, and cutting cells preserve the referenced sheet.
 - Use the name box to jump to a cell or range such as `D12` or `A1:C8`.
 - Use the filter toolbar button to detect the current data table automatically. The app identifies the likely header row (including tables below a title row) and adds dropdowns only to columns containing data. Selecting a range first explicitly sets the filter range and its top row as the header.
@@ -339,8 +339,8 @@ commas, a leading `$` or a trailing `%`. Everything else is text; date-looking t
 
 Formulas are written without cached results and the workbook requests a full recalculation on open,
 so Excel evaluates them itself. To keep them valid there, the exporter rewrites cross-sheet
-references to the exported worksheet names, converts single-quoted and backslash-escaped string
-literals (`'Complete'`, `"say \"hi\""`) to Excel's double-quote form, prefixes OOXML "future
+references to the exported worksheet names, converts single-quoted string literals and their
+apostrophe escapes (`'Complete'`, `'it\'s'`) to Excel's double-quote form, prefixes OOXML "future
 functions" (`IFS`, `CONCAT`, ...) with `_xlfn.`, renames `ERRORTYPE()` to `ERROR.TYPE()`, and drops
 whitespace between a function name and its `(`. A formula that is empty, structurally unbalanced
 (unterminated string or quoted name, mismatched parentheses or brackets — the grid's parser tolerates

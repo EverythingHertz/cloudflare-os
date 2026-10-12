@@ -3556,7 +3556,7 @@ function activeFormulaCall(text: string, cursor: number) { const stack: FormulaC
 for (let index = 1; index < cursor; index++) {
   const char = text[index];
   if (quote) {
-    if (char === "\\" && text[index + 1] === quote) { index++; continue; }
+    if (quote === "'" && char === "\\" && text[index + 1] === quote) { index++; continue; }
     if (char === quote) { if (text[index + 1] === quote) { index++; continue; } quote = null; }
     continue;
   }
@@ -3810,7 +3810,7 @@ function activeFormulaArgumentSpans(value: string, cursor: number) { const opens
 for (let index = 1; index < cursor; index++) {
   const char = value[index];
   if (quote) {
-    if (char === "\\" && value[index + 1] === quote) { index++; continue; }
+    if (quote === "'" && char === "\\" && value[index + 1] === quote) { index++; continue; }
     if (char === quote) { if (value[index + 1] === quote) { index++; continue; } quote = null; }
     continue;
   }
@@ -3823,7 +3823,7 @@ const open = opens[opens.length - 1], spans: TextBounds[] = []; let start = open
 for (let index = start; index <= value.length; index++) {
   const char = value[index];
   if (quote) {
-    if (char === "\\" && value[index + 1] === quote) { index++; continue; }
+    if (quote === "'" && char === "\\" && value[index + 1] === quote) { index++; continue; }
     if (char === quote) { if (value[index + 1] === quote) { index++; continue; } quote = null; }
     continue;
   }
@@ -4015,7 +4015,7 @@ let depth = 0, quote = null;
 for (let index = 1; index < value.length; index++) {
   const char = value[index];
   if (quote) {
-    if (char === "\\" && value[index + 1] === quote) { index++; continue; }
+    if (quote === "'" && char === "\\" && value[index + 1] === quote) { index++; continue; }
     if (char === quote) { if (value[index + 1] === quote) { index++; continue; } quote = null; }
     continue;
   }

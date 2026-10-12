@@ -629,10 +629,10 @@ describe("Workspace Sheets XLSX", () => {
     })).toThrow("XLSX fill count exceeds Excel's limit of 256");
   });
 
-  it("converts the grid's single-quoted and backslash-escaped string literals to Excel's form", async () => {
+  it("converts single-quoted escapes and doubled double quotes to Excel's form", async () => {
     const cells = {
       A1: cell("=COUNTIF(A2:A20,'Complete')"),
-      A2: cell("='It''s'&'say \"hi\"'&\"a\\\"b\"&\"c\"\"d\""),
+      A2: cell("='It''s'&'say \"hi\"'&\"a\"\"b\"&\"c\"\"d\""),
       A3: cell("='It''s'!A1&'x'"),
       A4: cell("='Jan':'It''s'!A1"),
       A5: cell("=Table1[[A'[B]]&'q'"),
@@ -640,6 +640,7 @@ describe("Workspace Sheets XLSX", () => {
       A7: cell("='esc\\'"),
       A8: cell("=\"tail\\\""),
       A9: cell("='don\\'!t'"),
+      A10: cell(String.raw`="C:\"&A1`),
     };
     const {entries} = await readZip(exportXlsx({
       sheetOrder: ["sheet", "its"],
@@ -653,7 +654,9 @@ describe("Workspace Sheets XLSX", () => {
     expect(cellXml(worksheet, "A3")).toContain("<f>'It''s'!A1&amp;\"x\"</f>");
     expect(cellXml(worksheet, "A4")).toContain("<f>'Jan':'It''s'!A1</f>");
     expect(cellXml(worksheet, "A5")).toContain("<f>Table1[[A'[B]]&amp;\"q\"</f>");
-    for (const reference of ["A6", "A7", "A8"]) expect(cellXml(worksheet, reference)).toContain('t="inlineStr"');
+    for (const reference of ["A6", "A7"]) expect(cellXml(worksheet, reference)).toContain('t="inlineStr"');
+    expect(cellXml(worksheet, "A8")).toContain(String.raw`<f>"tail\"</f>`);
+    expect(cellXml(worksheet, "A10")).toContain(String.raw`<f>"C:\"&amp;A1</f>`);
     // An escaped quote followed by `!` is still inside the string, not a sheet name's closing quote.
     expect(cellXml(worksheet, "A9")).toContain("<f>\"don'!t\"</f>");
   });

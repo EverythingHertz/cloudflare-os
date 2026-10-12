@@ -12,7 +12,7 @@ describe("the formula tokenizer", () => {
   });
 
   it("distinguishes single-quoted text from escaped sheet names", () => {
-    expect(tokenize(String.raw`'it''s' & 'it\'s' & "a\"b" & 'Owner''s Sheet'!A1 & 'Owner\'s Sheet'!B2`)).toEqual([
+    expect(tokenize(String.raw`'it''s' & 'it\'s' & "a""b" & 'Owner''s Sheet'!A1 & 'Owner\'s Sheet'!B2`)).toEqual([
       { t: "str", v: "it's" }, { t: "op", v: "&" }, { t: "str", v: "it's" },
       { t: "op", v: "&" }, { t: "str", v: 'a"b' }, { t: "op", v: "&" },
       { t: "word", v: "'Owner''s Sheet'!A1" }, { t: "op", v: "&" }, { t: "word", v: "'Owner''s Sheet'!B2" },
@@ -85,11 +85,19 @@ describe("the formula parser", () => {
     String.raw`'a\"b'`,
     String.raw`'a\\"b'`,
     String.raw`'a\""b'`,
-    String.raw`"a\\\"b"`,
+    String.raw`"a\\""b"`,
     String.raw`'both \'quotes\' and \"slashes'`,
   ])("preserves literal backslashes next to quotes when rewriting %s", (literal) => {
     const ast = parseFormula(`IF(A1>0,${literal},"fallback")`);
     expect(parseFormula(serializeAst(ast))).toEqual(ast);
+  });
+
+  it("preserves persisted double-quoted literals ending in backslashes", () => {
+    const formula = String.raw`"C:\"&A1`;
+    const ast = parseFormula(formula);
+    expect(ast).toEqual({ k: "bin", op: "&", a: { k: "str", v: "C:\\" }, b: { k: "ref", ref: "A1" } });
+    expect(serializeAst(ast)).toBe(formula);
+    expect(parseFormula(String.raw`"C:\\"`)).toEqual({ k: "str", v: "C:\\\\" });
   });
 
   it("sees through grouping parentheses on request", () => {
@@ -116,6 +124,13 @@ describe("formula references in editing and copied cells", () => {
     expect([...formulaReferences(formula)].map((reference) => reference.text)).toEqual(["D4", "ZZ50000"]);
     expect(formulaCursorInQuote('="A1"', 3)).toBe(true);
     expect(formulaCursorInQuote('="A1"+B2', 7)).toBe(false);
+  });
+
+  it("keeps references editable after a literal trailing backslash", () => {
+    const formula = String.raw`="C:\"&A1`;
+    expect(formulaCursorInQuote(formula, formula.indexOf("A1"))).toBe(false);
+    expect([...formulaReferences(formula)].map((reference) => reference.text)).toEqual(["A1"]);
+    expect(shiftFormulaReferences(formula, 1, 1)).toBe(String.raw`="C:\"&B2`);
   });
 
   it("identifies qualified references and whole ranges without treating prefixes as endpoints", () => {

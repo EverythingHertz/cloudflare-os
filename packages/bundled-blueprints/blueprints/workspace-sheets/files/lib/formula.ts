@@ -49,7 +49,7 @@ export function tokenize(src: string): Token[] {
       let j = i + 1, str = "";
       while (j < n) {
         if (src[j] === quote) { if (src[j + 1] === quote) { str += quote; j += 2; continue; } j++; break; }
-        if (src[j] === "\\" && src[j + 1] === quote) { str += quote; j += 2; continue; }
+        if (quote === "'" && src[j] === "\\" && src[j + 1] === quote) { str += quote; j += 2; continue; }
         str += src[j++];
       }
       tokens.push({ t: "str", v: str }); i = j; continue;
@@ -190,7 +190,7 @@ export function unwrapParens(node: Ast): Ast {
 export function serializeAst(node: Ast): string {
   switch (node.k) {
     case "num": return String(node.v);
-    case "str": return '"' + node.v.replace(/"/g, '\\"') + '"';
+    case "str": return '"' + node.v.replace(/"/g, '""') + '"';
     case "bool": return node.v ? "TRUE" : "FALSE";
     case "ref": return node.ref;
     case "range": return node.a + ":" + node.b;
@@ -217,7 +217,7 @@ export function formulaCursorInQuote(value: string, cursor: number): boolean {
   for (let index = 1; index < cursor; index++) {
     const char = value[index];
     if (quote) {
-      if (char === "\\" && value[index + 1] === quote) { index++; continue; }
+      if (quote === "'" && char === "\\" && value[index + 1] === quote) { index++; continue; }
       if (char === quote) { if (value[index + 1] === quote) { index++; continue; } quote = null; }
     } else if (char === '"' || char === "'") quote = char;
   }
@@ -231,7 +231,7 @@ export function* formulaReferences(value: string, endpoints = false): Generator<
     while (cursor < match.index) {
       const char = value[cursor++];
       if (quote) {
-        if (char === "\\" && value[cursor] === quote) { cursor++; continue; }
+        if (quote === "'" && char === "\\" && value[cursor] === quote) { cursor++; continue; }
         if (char === quote) { if (value[cursor] === quote) cursor++; else quote = null; }
       } else if (char === '"' || char === "'") quote = char;
     }
