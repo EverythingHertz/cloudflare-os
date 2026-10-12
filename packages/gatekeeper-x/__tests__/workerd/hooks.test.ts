@@ -536,6 +536,23 @@ describe("accounts going away", () => {
       expect(state.storage.kv.get("sub:post.mention.create")).toBeUndefined());
   });
 
+  it("judges a revocation by when the user revoked, not when X sent word of it", async () => {
+    const { x, hook } = await watchingMentions();
+    // The user revokes, and X deletes what the token made...
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const revokedAt = new Date().toISOString();
+    for (const [id, subscription] of x.subscriptions) if (subscription.by === ALICE.id) x.subscriptions.delete(id);
+    // ...then reconnects, and the hook subscribes afresh, before X sends word of the revocation.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await hook.disable();
+    await hook.enable();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(await x.deliver("oauth.revoke", undefined, { user_id: ALICE.id, date_time: revokedAt })).toBe(200);
+    // The new subscription is still recorded, so disabling the hook ends it at X.
+    await hook.disable();
+    expect(subscriptionsOf(x).map(([type]) => type)).toEqual(["oauth.revoke"]);
+  });
+
   it("keeps a subscription made after a revocation that X delivers again", async () => {
     const { x, hook } = await watchingMentions();
     const revocation = { id: "revoke-1", createdAt: new Date(Date.now() - 1000).toISOString() };

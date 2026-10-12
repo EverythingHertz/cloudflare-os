@@ -702,7 +702,7 @@ export async function handleWebhookRequest(request: Request, env: Env, exports: 
 /** One event of a delivery, as routing needs it. */
 type Delivery =
   | { type: "post"; eventType: string; event: XActivityEvent; at: number }
-  /** `at`: when X says the user revoked this app, NaN when it doesn't say. */
+  /** `at`: when X says the user revoked this app (`payload.date_time`), NaN when it doesn't say. */
   | { type: "revoke"; userId: string; at: number };
 
 const KINDS_BY_EVENT_TYPE = new Map(Object.entries(EVENT_TYPES).map(([kind, type]) => [type, kind as XHookKind]));
@@ -714,9 +714,13 @@ export function parseDelivery(item: unknown): Delivery | undefined {
     item as Record<string, unknown>;
   if (typeof eventType !== "string" || typeof payload !== "object" || payload === null) return undefined;
   if (eventType === "oauth.revoke") {
-    const userId = (payload as ActivityJson).user_id;
+    const { user_id: userId, date_time: revokedAt } = payload as ActivityJson;
     if (typeof userId !== "string") return undefined;
-    return { type: "revoke", userId, at: typeof createdAt === "string" ? Date.parse(createdAt) : Number.NaN };
+    // When the user revoked, which X dates apart from the event, perhaps sent long after: a
+    // subscription made in between is the new grant's. The event's own time stands in for one X omits.
+    const at = [revokedAt, createdAt].map(time => typeof time === "string" ? Date.parse(time) : Number.NaN)
+      .find(time => !Number.isNaN(time)) ?? Number.NaN;
+    return { type: "revoke", userId, at };
   }
   const kind = KINDS_BY_EVENT_TYPE.get(eventType);
   const userId = (filter as ActivityJson | undefined)?.user_id;
