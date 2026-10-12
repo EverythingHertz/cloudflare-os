@@ -591,6 +591,9 @@ type Value = Scalar | CellError | Matrix | HyperlinkValue;
 
 const isMatrix = (v: Value): v is Matrix => typeof v === "object" && v !== null && "matrix" in v;
 
+// Type-sensitive functions see the label; value-returning functions retain the link metadata.
+function primitiveValue(value: Value): Value { return value instanceof HyperlinkValue ? value.label : value; }
+
 // ===========================================================================
 // Number coercion + formatting
 // ===========================================================================
@@ -1101,7 +1104,7 @@ const FUNCTIONS: Record<string, FormulaFn> = (() => {
   F.UNICHAR = (a, c, H) => String.fromCodePoint(H.toNum(H.scalar(a[0], c)));
   F.CODE = (a, c, H) => { const t = H.toStr(H.scalar(a[0], c)); return t ? t.charCodeAt(0) : ERR.VALUE(); };
   F.UNICODE = (a, c, H) => { const t = H.toStr(H.scalar(a[0], c)); return t ? t.codePointAt(0) : ERR.VALUE(); };
-  F.T = (a, c, H) => { const v = H.scalar(a[0], c); return typeof v === "string" ? v : ""; };
+  F.T = (a, c, H) => { const v = primitiveValue(H.scalar(a[0], c)); return typeof v === "string" ? v : ""; };
   F.VALUE = (a, c, H) => H.toNum(H.scalar(a[0], c));
   F.TEXT = (a, c, H) => { const v = H.toNum(H.scalar(a[0], c)); const f = H.toStr(H.scalar(a[1], c)); return applyTextFormat(v, f); };
   F.HYPERLINK = (a, c, H) => {
@@ -1229,17 +1232,17 @@ const FUNCTIONS: Record<string, FormulaFn> = (() => {
   F.DATEDIF = (a, c, H) => { const s1 = serialToDate(H.toNum(s(a, c, H, 0))); const s2 = serialToDate(H.toNum(s(a, c, H, 1))); const unit = H.toStr(H.scalar(a[2], c)).toUpperCase(); const days = (s2.getTime() - s1.getTime()) / 86400000; if (unit === "D") return Math.round(days); if (unit === "M") return (s2.getUTCFullYear() - s1.getUTCFullYear()) * 12 + (s2.getUTCMonth() - s1.getUTCMonth()); if (unit === "Y") return s2.getUTCFullYear() - s1.getUTCFullYear(); return ERR.NUM(); };
 
   // ---- Information ----
-  F.ISBLANK = (a, c, H) => { const v = H.scalar(a[0], c); return v == null || v === ""; };
-  F.ISNUMBER = (a, c, H) => typeof H.scalar(a[0], c) === "number";
-  F.ISTEXT = (a, c, H) => typeof H.scalar(a[0], c) === "string";
-  F.ISNONTEXT = (a, c, H) => typeof H.scalar(a[0], c) !== "string";
-  F.ISLOGICAL = (a, c, H) => typeof H.scalar(a[0], c) === "boolean";
+  F.ISBLANK = (a, c, H) => { const v = primitiveValue(H.scalar(a[0], c)); return v == null || v === ""; };
+  F.ISNUMBER = (a, c, H) => typeof primitiveValue(H.scalar(a[0], c)) === "number";
+  F.ISTEXT = (a, c, H) => typeof primitiveValue(H.scalar(a[0], c)) === "string";
+  F.ISNONTEXT = (a, c, H) => typeof primitiveValue(H.scalar(a[0], c)) !== "string";
+  F.ISLOGICAL = (a, c, H) => typeof primitiveValue(H.scalar(a[0], c)) === "boolean";
   F.ISERROR = (a, c, H) => isErr(H.scalar(a[0], c));
   F.ISERR = (a, c, H) => { const v = H.scalar(a[0], c); return isErr(v) && v.value !== "#N/A"; };
   F.ISNA = (a, c, H) => { const v = H.scalar(a[0], c); return isErr(v) && v.value === "#N/A"; };
   F.ISEVEN = (a, c, H) => Math.trunc(H.toNum(H.scalar(a[0], c))) % 2 === 0;
   F.ISODD = (a, c, H) => Math.abs(Math.trunc(H.toNum(H.scalar(a[0], c))) % 2) === 1;
-  F.N = (a, c, H) => { const v = H.scalar(a[0], c); if (typeof v === "number") return v; if (typeof v === "boolean") return v ? 1 : 0; return 0; };
+  F.N = (a, c, H) => { const v = primitiveValue(H.scalar(a[0], c)); if (typeof v === "number") return v; if (typeof v === "boolean") return v ? 1 : 0; return 0; };
   F.NA = () => ERR.NA();
   F.ERRORTYPE = (a, c, H) => { const v = H.scalar(a[0], c); if (!isErr(v)) return ERR.NA(); const map: Record<string, number> = { "#NULL!": 1, "#DIV/0!": 2, "#VALUE!": 3, "#REF!": 4, "#NAME?": 5, "#NUM!": 6, "#N/A": 7 }; return map[v.value] || ERR.NA(); };
 
@@ -2769,18 +2772,32 @@ setChartPanelCollapsed(false); renderChartPanel(); }
 function startChartDrag(chart: SheetChart, card: HTMLElement, event: PointerEvent) { if (event.button !== 0 || (event.target instanceof Element && event.target.closest("button"))) return;
 event.preventDefault(); event.stopPropagation();
 selectChart(chart, card);
+const sheetId = activeSheetId, chartId = chart.id;
 const startClientX = event.clientX, startClientY = event.clientY;
 const startX = chart.x ?? 96, startY = chart.y ?? 44;
 const bounds = chartPositionBounds(curSheet());
 let nextX = startX, nextY = startY;
+let dragCard: HTMLElement | null = card;
 const move = (moveEvent: PointerEvent) => {
   nextX = clampChartCoordinate(startX + moveEvent.clientX - startClientX, bounds.minX, bounds.maxX, 96);
   nextY = clampChartCoordinate(startY + moveEvent.clientY - startClientY, bounds.minY, bounds.maxY, 44);
-  card.style.left = nextX + "px"; card.style.top = nextY + "px";
+  if (activeSheetId !== sheetId) return;
+  if (!dragCard?.isConnected) {
+    dragCard = null;
+    for (const candidate of chartLayer.children) if (candidate instanceof HTMLElement && candidate.dataset.chartId === chartId) { dragCard = candidate; break; }
+  }
+  if (dragCard) { dragCard.style.left = nextX + "px"; dragCard.style.top = nextY + "px"; }
 };
 const up = () => {
   window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); window.removeEventListener("pointercancel", up);
-  if (nextX !== startX || nextY !== startY) { chart.x = nextX; chart.y = nextY; queueStructure(); renderCharts(); }
+  if (nextX === startX && nextY === startY) return;
+  // Peer updates replace metadata and cards. Commit only the position to the live chart.
+  const sheet = model.sheets[sheetId], liveChart = sheet?.charts?.find((candidate) => candidate.id === chartId);
+  if (!liveChart) return;
+  const liveBounds = chartPositionBounds(sheet);
+  liveChart.x = clampChartCoordinate(nextX, liveBounds.minX, liveBounds.maxX, 96);
+  liveChart.y = clampChartCoordinate(nextY, liveBounds.minY, liveBounds.maxY, 44);
+  queueStructure(); renderCharts();
 };
 window.addEventListener("pointermove", move); window.addEventListener("pointerup", up); window.addEventListener("pointercancel", up); }
 function chartClipboardSvg(chart: SheetChart) { const data = chartData(chart);
@@ -2875,6 +2892,19 @@ function nextVisibleRow(row: number, step: number) { const sheet = curSheet();
 if (!sheet?.filter) return Math.max(0, Math.min(sheet.rows - 1, row + step));
 for (let candidate = row + step; candidate >= 0 && candidate < sheet.rows; candidate += step) if (rowPassesFilter(candidate)) return candidate;
 return row; }
+// Reconcile synchronously, before the next paint or keystroke can target a hidden cell.
+function reconcileFilteredSelection() {
+  if (rowPassesFilter(focus.r) && rowPassesFilter(anchor.r) && (!editing || rowPassesFilter(editing.r, editing.sheetId))) return;
+  let row = focus.r;
+  if (!rowPassesFilter(row)) {
+    row = nextVisibleRow(row, 1);
+    if (!rowPassesFilter(row)) row = nextVisibleRow(row, -1);
+  }
+  if (editing && !rowPassesFilter(editing.r, editing.sheetId)) cancelEdit();
+  const position = { r: row, c: focus.c };
+  setSelection(position, position);
+  armEditorCapture(false);
+}
 function hasCellData(row: number, column: number) { const value = cellRaw(rcToRef(row, column));
 return value != null && value !== ""; }
 function detectFilterRange(): SheetFilter | null {
@@ -3104,6 +3134,7 @@ showCtx(menu, rect.left, rect.bottom + 4); }
 // ===========================================================================
 let renderScheduled = false;
 function renderGrid(): void {
+  reconcileFilteredSelection();
   if (renderScheduled) return;
   renderScheduled = true;
   requestAnimationFrame(() => { renderScheduled = false; doRenderGrid(); });

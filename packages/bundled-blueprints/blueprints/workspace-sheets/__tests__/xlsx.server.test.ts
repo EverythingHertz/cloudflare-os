@@ -1185,7 +1185,7 @@ describe("Workspace Sheets document snapshots", () => {
     const result = await fixture.applyOperation({senderId: "test", structure: {
       sheetOrder: ["sheet"],
       sheets: {sheet: sheet("Sheet", {rows: 400, cols: 80, charts: [{id: "scrolled", range: "A1:B2", x: 6040, y: 6040}]})},
-    }, cellOps: [{sheetId: "sheet", ref: "B2", value: "1", baseVersion: 0}]});
+    }, cellOps: [{sheetId: "sheet", ref: "B2", value: "1", fmt: null, baseVersion: 0}]});
     expect(result.status).toBe("applied");
     const saved = await fixture.getDocument();
     expect(saved.sheets.sheet.charts?.[0]).toMatchObject({x: 6040, y: 6040});
@@ -1226,7 +1226,7 @@ describe("Workspace Sheets document snapshots", () => {
       {x: 6040, y: 6040}, {x: 7607, y: 8349}, {x: 48, y: 28}, {x: 96, y: 44}, {x: 6040, y: 6041},
     ]);
     await fixture.applyOperation({senderId: "test", structure: {sheetOrder: ["sheet"], sheets: {sheet: incoming}},
-      cellOps: [{sheetId: "sheet", ref: "B2", value: "1", baseVersion: 0}],
+      cellOps: [{sheetId: "sheet", ref: "B2", value: "1", fmt: null, baseVersion: 0}],
     });
     const restarted = inMemoryGadget(registryOf(), structuredClone(stored));
     const reloaded = await restarted.getDocument();
@@ -1252,7 +1252,7 @@ describe("Workspace Sheets document snapshots", () => {
     ]});
     expect(chartPositionBounds(incoming)).toEqual({minX: 48, maxX: 51, minY: 28, maxY: 29});
     await fixture.applyOperation({structure: {sheetOrder: ["sheet"], sheets: {sheet: incoming}},
-      cellOps: [{sheetId: "sheet", ref: "A1", value: "1", baseVersion: 0}],
+      cellOps: [{sheetId: "sheet", ref: "A1", value: "1", fmt: null, baseVersion: 0}],
     });
     const restarted = inMemoryGadget(registryOf(), structuredClone(stored));
     expect((await restarted.getDocument()).sheets.sheet.charts?.map(chart => ({x: chart.x, y: chart.y}))).toEqual([
