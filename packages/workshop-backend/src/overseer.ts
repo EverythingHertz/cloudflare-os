@@ -50,9 +50,7 @@ import { GitImpl } from "./git-binding";
 import { scanWorkpieceForGrep, type GrepScan } from "./grep";
 import WORKTREE_BINDING_TYPES from "./worktree-binding.txt";
 import { deploymentOutputForBlueprint, FormatOffer, listFormatOffers, readAdminConfig } from "./admin-config";
-import {
-  chatChangeStatuses, foldCompactedCode, getModelTokenLimits, shouldCompactChat,
-} from "./agent-compaction";
+import { chatChangeStatuses, foldCompactedCode } from "./agent-compaction";
 import type { CachedRequest } from "./ai-models";
 import { ChatCacheWarmer } from "./chat-cache-warming";
 import { ambientGatekeeperMode } from "./provisioning-policy";
@@ -6650,10 +6648,9 @@ class OverseerImpl implements AgentHooks {
         let controller = liveChat.cancelController;
         controller.signal.throwIfAborted();
 
-        await runAgent(
+        lastRequest = await runAgent(
             this, chosenModel, chatId, aiModel.profile, controller.signal, initiator, aiModel.config);
         finished = true;
-        lastRequest = chosenModel.lastRequest;
         turnLogger.debug("agent run finished", {
           event: "agent.run.finished", outcome: "ok",
           durationMs: Date.now() - startedAt,
@@ -6725,11 +6722,8 @@ class OverseerImpl implements AgentHooks {
       // re-register everything consistently.
       this.#unregisterRunningAgent(chatId);
 
-      // A next turn that compacts first reads none of the cached request.
-      if (finished && lastRequest && meta?.totalTokens !== undefined &&
-          !shouldCompactChat(meta.totalTokens, getModelTokenLimits(aiModel.config).inputBudget)) {
-        this.cacheWarmer.start(chatId, lastRequest, meta.totalTokens);
-      }
+      // Without `meta`, the chat was deleted while the turn was ending.
+      if (lastRequest && meta) this.cacheWarmer.start(chatId, lastRequest);
 
       if (finished && meta) {
         // Classified here, past the turn's last await, so a decision made as it ended counts.
